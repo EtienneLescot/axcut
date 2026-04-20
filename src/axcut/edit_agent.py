@@ -25,16 +25,23 @@ Rules:
 - Keep the AXCUT_TRANSCRIPT v1 header.
 - Keep the same source_video, duration, and language metadata as the source transcript.
 - Set kind=\"cleaned\".
+- Optimize for a tight, fluent spoken result rather than literal faithfulness.
 - You may omit words or split/regroup segments to create the intended cut.
 - Every kept WORD must come from the source transcript exactly as-is.
-- Do not invent, paraphrase, rename, reorder, or retime any kept words.
-- If you keep a word, preserve its id, start, end, and text exactly.
+- Do not invent, paraphrase, rename, or reorder kept words.
+- Keep WORD ids exact. The engine will reconstruct WORD text and timestamps from the source ids.
+- The transcript may include explicit SILENCE lines representing pauses longer than 500 ms.
+- You may keep or remove SILENCE lines to preserve or cut specific pauses.
 - Every kept WORD must belong to exactly one SEGMENT.
 - Each SEGMENT must contain at least one WORD.
 - SEGMENT text must equal the exact concatenation of its WORD texts separated by single spaces.
 - SEGMENT start must equal the first kept word start.
 - SEGMENT end must equal the last kept word end.
 - You may create new segment ids, but they must be unique and each WORD segment field must match its containing SEGMENT id.
+- Remove filler words, verbal tics, hesitations, false starts, repeated words, repeated short phrases, and weak restart fragments aggressively whenever meaning still holds.
+- Prefer removing micro-disfluencies such as 'uh', 'um', 'hum', 'hmm', 'ah', 'er', 'you know', 'like', 'so', and similar spoken clutter.
+- When a tiny awkward pause or floating beat is caused by nearby filler or hesitation, prefer cutting that local fragment to tighten rhythm.
+- When in doubt between keeping a hesitant fragment and removing it, prefer removal if the remaining wording still sounds natural and complete.
 - If the user wants pauses removed, express that by splitting segments so unwanted gaps are not inside a kept segment.
 - Validation feedback is structural only. Fix format and consistency issues precisely.
 """
@@ -131,6 +138,11 @@ def _serialize_source_dsl(transcript: Transcript) -> str:
         ),
     ]
     for segment in transcript.segments:
+        if segment.kind == "silence":
+            lines.append(
+                f"SILENCE id={segment.id} start={segment.start:.3f} end={segment.end:.3f} duration_ms={segment.duration_ms}"
+            )
+            continue
         lines.append(
             f"SEGMENT id={segment.id} start={segment.start:.3f} end={segment.end:.3f} "
             f"text={json.dumps(segment.text, ensure_ascii=False)}"
@@ -166,8 +178,53 @@ def _parse_and_validate_candidate(
         candidate = read_transcript_text(candidate_text, origin="llm_cleaned")
     except ValueError as exc:
         return None, [str(exc)]
-    issues = _validate_cleaned_transcript(candidate, source)
-    return candidate, issues
+    normalized = _normalize_cleaned_transcript(candidate, source)
+    issues = _validate_cleaned_transcript(normalized, source)
+    return normalized, issues
+
+
+def _normalize_cleaned_transcript(
+    candidate: Transcript, source: Transcript
+) -> Transcript:
+    source_word_map = {word.id: word for word in source.all_words()}
+    normalized_segments: list[Segment] = []
+
+    for segment in candidate.segments:
+        if segment.kind == "silence":
+            normalized_segments.append(segment)
+            continue
+        normalized_words = []
+        for word in segment.words:
+            source_word = source_word_map.get(word.id)
+            if source_word is None:
+                normalized_words.append(word)
+                continue
+            normalized_words.append(
+                source_word.model_copy(update={"segment_id": segment.id})
+            )
+
+        if not normalized_words:
+            normalized_segments.append(segment)
+            continue
+
+        normalized_segments.append(
+            Segment(
+                id=segment.id,
+                start=normalized_words[0].start,
+                end=normalized_words[-1].end,
+                text=" ".join(word.text for word in normalized_words).strip(),
+                words=normalized_words,
+            )
+        )
+
+    return Transcript(
+        source_video=source.source_video,
+        duration=source.duration,
+        language=source.language,
+        kind="cleaned",
+        edit_prompt=candidate.edit_prompt,
+        segments=normalized_segments,
+    )
 
 
 def _validate_cleaned_transcript(
@@ -192,6 +249,9 @@ def _validate_cleaned_transcript(
 
     for segment in candidate.segments:
         issues.extend(_validate_segment_shape(segment, seen_segment_ids))
+        if segment.kind == "silence":
+            issues.extend(_validate_silence_segment(segment))
+            continue
         for word in segment.words:
             if word.id in seen_word_ids:
                 issues.append(
@@ -211,11 +271,6 @@ def _validate_cleaned_transcript(
                 issues.append(
                     f"WORD {word.id} must reference its containing segment id {segment.id}."
                 )
-            if word.start != source_word.start or word.end != source_word.end:
-                issues.append(f"WORD {word.id} must keep the exact source timestamps.")
-            if word.text != source_word.text:
-                issues.append(f"WORD {word.id} must keep the exact source text.")
-
         issues.extend(_validate_segment_content(segment))
 
     if kept_word_ids:
@@ -236,9 +291,26 @@ def _validate_segment_shape(segment: Segment, seen_segment_ids: set[str]) -> lis
         issues.append(f"SEGMENT id {segment.id} is duplicated.")
     else:
         seen_segment_ids.add(segment.id)
+    if segment.kind == "silence":
+        if segment.words:
+            issues.append(
+                f"SILENCE {segment.id or '[missing id]'} must not contain WORD entries."
+            )
+        return issues
     if not segment.words:
         issues.append(
             f"SEGMENT {segment.id or '[missing id]'} must contain at least one WORD."
+        )
+    return issues
+
+
+def _validate_silence_segment(segment: Segment) -> list[str]:
+    issues: list[str] = []
+    if segment.text:
+        issues.append(f"SILENCE {segment.id} text must be empty.")
+    if segment.end < segment.start:
+        issues.append(
+            f"SILENCE {segment.id} end must be greater than or equal to start."
         )
     return issues
 

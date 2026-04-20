@@ -15,10 +15,15 @@ class WordToken(BaseModel):
 
 class Segment(BaseModel):
     id: str
+    kind: Literal["speech", "silence"] = "speech"
     start: float
     end: float
     text: str
     words: list[WordToken] = Field(default_factory=list)
+
+    @property
+    def duration_ms(self) -> int:
+        return max(0, round((self.end - self.start) * 1000))
 
 
 class Transcript(BaseModel):
@@ -47,7 +52,9 @@ class FollowUpQuestion(BaseModel):
 
 
 class EditSuggestion(BaseModel):
-    category: Literal["cut_candidate", "style", "delivery", "topic_focus", "clarification"]
+    category: Literal[
+        "cut_candidate", "style", "delivery", "topic_focus", "clarification"
+    ]
     suggestion: str
     reason: str
     start_word_id: str | None = None

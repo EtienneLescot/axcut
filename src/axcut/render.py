@@ -19,16 +19,30 @@ def compute_keep_intervals_from_cleaned(
 
     source_word_ids = {word.id for word in source.all_words()}
     intervals: list[KeepInterval] = []
-    for segment in cleaned.segments:
-        if not segment.words:
+    current_start: float | None = None
+    current_end: float | None = None
+    for index, segment in enumerate(cleaned.segments):
+        if segment.kind == "silence":
+            if current_start is None:
+                current_start = segment.start
+            current_end = segment.end
             continue
         if any(word.id not in source_word_ids for word in segment.words):
             raise RuntimeError(
                 f"Cleaned segment {segment.id} contains unknown word ids."
             )
-        intervals.append(
-            KeepInterval(start=segment.words[0].start, end=segment.words[-1].end)
+        if current_start is None:
+            current_start = segment.words[0].start
+        current_end = segment.words[-1].end
+        next_segment = (
+            cleaned.segments[index + 1] if index + 1 < len(cleaned.segments) else None
         )
+        if next_segment is None or next_segment.kind == "speech":
+            intervals.append(KeepInterval(start=current_start, end=current_end))
+            current_start = None
+            current_end = None
+    if current_start is not None and current_end is not None:
+        intervals.append(KeepInterval(start=current_start, end=current_end))
     return _merge_intervals(intervals)
 
 

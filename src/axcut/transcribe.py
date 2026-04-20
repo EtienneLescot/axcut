@@ -11,6 +11,9 @@ from huggingface_hub import snapshot_download
 from axcut.models import Segment, Transcript, WordToken
 
 
+SILENCE_GAP_THRESHOLD_SEC = 0.5
+
+
 MODEL_REPOS = {
     "tiny": "Systran/faster-whisper-tiny",
     "base": "Systran/faster-whisper-base",
@@ -57,6 +60,7 @@ def transcribe_video(
     segments: list[Segment] = []
     word_counter = 1
     segment_counter = 1
+    silence_counter = 1
 
     for item in segments_iter:
         segment_id = f"s{segment_counter:04d}"
@@ -78,15 +82,30 @@ def transcribe_video(
         if not words:
             continue
 
-        segments.append(
-            Segment(
-                id=segment_id,
-                start=float(words[0].start),
-                end=float(words[-1].end),
-                text=" ".join(word.text for word in words).strip(),
-                words=words,
-            )
+        segment = Segment(
+            id=segment_id,
+            kind="speech",
+            start=float(words[0].start),
+            end=float(words[-1].end),
+            text=" ".join(word.text for word in words).strip(),
+            words=words,
         )
+        if segments:
+            gap_start = segments[-1].end
+            gap_end = segment.start
+            if gap_end - gap_start > SILENCE_GAP_THRESHOLD_SEC:
+                segments.append(
+                    Segment(
+                        id=f"z{silence_counter:04d}",
+                        kind="silence",
+                        start=gap_start,
+                        end=gap_end,
+                        text="",
+                        words=[],
+                    )
+                )
+                silence_counter += 1
+        segments.append(segment)
         segment_counter += 1
 
     if not segments:

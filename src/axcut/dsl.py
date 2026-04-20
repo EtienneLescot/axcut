@@ -33,6 +33,19 @@ def write_transcript(path: Path, transcript: Transcript) -> None:
     lines.append("META " + " ".join(meta_bits))
 
     for segment in transcript.segments:
+        if segment.kind == "silence":
+            lines.append(
+                "SILENCE "
+                + " ".join(
+                    [
+                        f"id={segment.id}",
+                        f"start={segment.start:.3f}",
+                        f"end={segment.end:.3f}",
+                        f"duration_ms={segment.duration_ms}",
+                    ]
+                )
+            )
+            continue
         lines.append(
             "SEGMENT "
             + " ".join(
@@ -81,10 +94,27 @@ def read_transcript_text(content: str, *, origin: str = "<memory>") -> Transcrip
             data = _parse_kv(line)
             current_segment = Segment(
                 id=data["id"],
+                kind="speech",
                 start=float(data["start"]),
                 end=float(data["end"]),
                 text=data["text"],
                 words=[],
+            )
+            continue
+
+        if line.startswith("SILENCE "):
+            if current_segment is not None:
+                raise ValueError("SILENCE encountered inside SEGMENT block")
+            data = _parse_kv(line)
+            segments.append(
+                Segment(
+                    id=data["id"],
+                    kind="silence",
+                    start=float(data["start"]),
+                    end=float(data["end"]),
+                    text="",
+                    words=[],
+                )
             )
             continue
 
