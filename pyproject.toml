@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "axcut"
+version = "0.1.0"
+description = "Minimal transcript-to-video-cut POC using Whisper, a DSL, LangChain, and FFmpeg."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "faster-whisper>=1.1.1,<2.0.0",
+  "huggingface-hub>=1.0.0,<2.0.0",
+  "langchain>=0.3.27,<0.4.0",
+  "langchain-openai>=0.3.33,<0.4.0",
+  "pydantic>=2.11.0,<3.0.0",
+  "python-dotenv>=1.1.1,<2.0.0",
+]
+
+[project.scripts]
+axcut = "axcut.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/axcut"]

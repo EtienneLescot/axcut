@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+artifacts/
+*.pyc
+node_modules/
+dist-ui/
+.axcut-ui/
