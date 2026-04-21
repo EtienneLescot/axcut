@@ -5,6 +5,12 @@ artifacts/
 node_modules/
 dist-ui/
 .axcut-ui/
+.axcut-data/
+dist/
+apps/*/dist/
+apps/*/dist-ts/
+packages/*/dist/
+*.tsbuildinfo
 .env
 2026-03-10 09-10-39.mp4
 2026-03-26 12-04-12.mp4

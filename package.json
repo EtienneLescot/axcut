@@ -1,24 +1,19 @@
 {
-  "name": "axcut-ui",
+  "name": "axcut",
   "private": true,
   "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
-    "ui": "tsx ui/main.tsx",
-    "build:ui": "tsc -p tsconfig.json",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
-  },
-  "dependencies": {
-    "@inkjs/ui": "^2.0.0",
-    "@yagr/agent": "file:../yagr",
-    "ai": "^4.3.19",
-    "ink": "^6.8.0",
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "dev:server": "npm run dev --workspace @axcut/server",
+    "dev:web": "npm run dev --workspace @axcut/web",
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
   },
   "devDependencies": {
-    "@types/node": "^22.13.1",
-    "@types/react": "^19.0.10",
-    "tsx": "^4.19.3",
-    "typescript": "^5.8.2"
+    "tsx": "^4.20.6",
+    "typescript": "^5.8.3"
   }
 }
