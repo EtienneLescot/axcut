@@ -71,7 +71,7 @@ function collectWordRefs(
     return [];
   }
   return transcript.words
-    .filter((word) => word.endSec >= startSec && word.startSec <= endSec)
+    .filter((word) => word.endSec > startSec && word.startSec < endSec)
     .map((word) => word.id);
 }
 
@@ -112,7 +112,11 @@ export function resolveWordRange(
   };
 }
 
-export function applyTimelineOperation(document: AxcutDocument, operation: AxcutOperation): AxcutDocument {
+export function applyTimelineOperation(
+  document: AxcutDocument,
+  operation: AxcutOperation,
+  origin: 'system' | 'agent' | 'user' = operation.type === 'replace_timeline' ? 'agent' : 'user',
+): AxcutDocument {
   const assetId = document.project.primaryAssetId ?? document.assets[0]?.id;
   if (!assetId) {
     throw new Error('Cannot update timeline without a primary asset.');
@@ -146,7 +150,7 @@ export function applyTimelineOperation(document: AxcutDocument, operation: Axcut
     timeline: {
       ...document.timeline,
       clips: buildTimelineFromIntervals(assetId, nextIntervals, {
-        origin: operation.type === 'replace_timeline' ? 'agent' : 'user',
+        origin,
         reason: operation.reason,
         transcript: document.transcript,
       }),

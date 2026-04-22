@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "npm run build --workspace @axcut/schema && tsc -p tsconfig.json && vite build",
-    "typecheck": "npm run build --workspace @axcut/schema && tsc --noEmit -p tsconfig.json"
+    "typecheck": "npm run build --workspace @axcut/schema && tsc --noEmit -p tsconfig.json",
+    "test": "npm run build --workspace @axcut/schema && tsx --test src/**/*.test.ts"
   },
   "dependencies": {
     "@axcut/schema": "0.1.0",

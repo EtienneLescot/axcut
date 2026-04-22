@@ -33,6 +33,11 @@ button {
   cursor: pointer;
 }
 
+button.secondary-button {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
 button:disabled {
   opacity: 0.6;
   cursor: not-allowed;
@@ -149,6 +154,10 @@ textarea {
   min-height: 520px;
 }
 
+.preview-summary {
+  margin: 0.75rem 0 0;
+}
+
 .video {
   width: 100%;
   max-height: 480px;
@@ -172,6 +181,10 @@ textarea {
   flex-wrap: wrap;
 }
 
+.timeline.interactive {
+  align-items: stretch;
+}
+
 .timeline-clip {
   min-height: 44px;
   border-radius: 10px;
@@ -181,6 +194,112 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: center;
+  border: 0;
+}
+
+.timeline-clip.active {
+  outline: 2px solid rgba(255, 255, 255, 0.8);
+}
+
+.preview-controls {
+  display: grid;
+  grid-template-columns: auto auto auto 1fr;
+  gap: 0.75rem;
+  align-items: center;
+  margin-top: 1rem;
+}
+
+.timeline-slider {
+  width: 100%;
+}
+
+.preview-readout {
+  min-width: 120px;
+}
+
+.preview-meta {
+  margin-top: 0.75rem;
+}
+
+.transcript-panel {
+  min-height: 420px;
+}
+
+.transcript-toolbar {
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.toolbar-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.selection-summary {
+  margin: 1rem 0;
+  padding: 0.8rem;
+  border-radius: 12px;
+  background: rgba(91, 116, 255, 0.12);
+}
+
+.suggestion-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.suggestion-card {
+  padding: 0.85rem;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.suggestion-card.approved {
+  border-color: rgba(16, 185, 129, 0.45);
+}
+
+.suggestion-card.rejected {
+  border-color: rgba(244, 63, 94, 0.45);
+}
+
+.suggestion-header {
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.suggestion-status {
+  text-transform: capitalize;
+  color: #cbd5e1;
+}
+
+.word-stream {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.word-chip {
+  padding: 0.35rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.06);
+  font-size: 0.9rem;
+}
+
+.word-chip.kept {
+  background: rgba(16, 185, 129, 0.18);
+}
+
+.word-chip.dropped {
+  background: rgba(244, 63, 94, 0.14);
+  color: #fecdd3;
+}
+
+.word-chip.selected {
+  outline: 2px solid rgba(91, 116, 255, 0.95);
 }
 
 progress {
@@ -193,6 +312,10 @@ progress {
   }
 
   .columns {
+    grid-template-columns: 1fr;
+  }
+
+  .preview-controls {
     grid-template-columns: 1fr;
   }
 }

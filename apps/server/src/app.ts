@@ -5,9 +5,11 @@ import path from 'node:path';
 import { applyOperationInputSchema, exportInputSchema } from '@axcut/schema';
 import cors from '@fastify/cors';
 import Fastify from 'fastify';
+import { ZodError } from 'zod';
 
 import { streamFile } from './lib/media-stream.js';
 import { databasePath, projectArtifactsRoot } from './lib/paths.js';
+import { AxcutAgentRuntime } from './services/axcut-agent-runtime.js';
 import { ChatService } from './services/chat-service.js';
 import { DatabaseService } from './services/database.js';
 import { DocumentService } from './services/document-service.js';
@@ -42,7 +44,32 @@ export async function createServer() {
   const documents = new DocumentService(db);
   const worker = new PythonWorker();
   const jobs = new JobService(db, documents, worker, events);
-  const chat = new ChatService(db, documents, worker, events);
+  const agentRuntime = new AxcutAgentRuntime(documents, worker, events);
+  const chat = new ChatService(db, documents, agentRuntime, events);
+
+  fastify.setErrorHandler((error, _request, reply) => {
+    const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof ZodError) {
+      reply.code(400).send({
+        error: 'Validation error',
+        issues: error.issues,
+      });
+      return;
+    }
+
+    if (
+      message.includes('Asset path must point')
+      || message.includes('Unsupported asset type')
+      || message.includes('Cannot update timeline')
+      || message.includes('No asset available')
+      || message.includes('Unknown transcript word id')
+    ) {
+      reply.code(400).send({ error: message });
+      return;
+    }
+
+    reply.code(500).send({ error: message || 'Internal server error' });
+  });
 
   fastify.get('/api/session', async () => ({ token: sessionToken }));
 

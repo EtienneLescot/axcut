@@ -6,6 +6,7 @@ const currentDir = path.dirname(fileURLToPath(import.meta.url));
 export const repoRoot = path.resolve(currentDir, '../../../../');
 export const dataRoot = path.join(repoRoot, '.axcut-data');
 export const projectsRoot = path.join(dataRoot, 'projects');
+export const agentSessionsRoot = path.join(dataRoot, 'deepagent-sessions');
 export const databasePath = path.join(dataRoot, 'metadata.sqlite');
 
 export function projectRoot(projectId: string): string {

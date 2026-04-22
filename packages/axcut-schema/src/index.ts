@@ -88,30 +88,12 @@ export const timelineSchema = z.object({
   captionRanges: z.array(rangeSchema).default([]),
 });
 
-export const suggestionSchema = z.object({
-  id: z.string().min(1),
-  status: z.enum(['pending', 'approved', 'rejected']).default('pending'),
-  category: z.enum(['cut_candidate', 'style', 'delivery', 'topic_focus', 'clarification']).default('cut_candidate'),
-  suggestion: z.string().min(1),
-  reason: z.string().default(''),
-  startWordId: z.string().optional(),
-  endWordId: z.string().optional(),
-});
-
 export const pendingQuestionSchema = z.object({
   id: z.string().min(1),
   question: z.string().min(1),
   reason: z.string().default(''),
   startWordId: z.string().optional(),
   endWordId: z.string().optional(),
-});
-
-export const agentStateSchema = z.object({
-  baseIntent: z.string().optional(),
-  pendingQuestions: z.array(pendingQuestionSchema).default([]),
-  suggestions: z.array(suggestionSchema).default([]),
-  lastAppliedOperations: z.array(z.string()).default([]),
-  lastReasoningSummary: z.string().optional(),
 });
 
 export const previewSchema = z.object({
@@ -124,7 +106,7 @@ export const exportStateSchema = z.object({
   lastJobId: z.string().nullable().default(null),
 });
 
-export const operationSchema = z.discriminatedUnion('type', [
+export const timelineOperationSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('replace_timeline'),
     reason: z.string().default(''),
@@ -145,6 +127,41 @@ export const operationSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('restore_full_timeline'),
     reason: z.string().default(''),
+  }),
+]);
+
+export const suggestionSchema = z.object({
+  id: z.string().min(1),
+  status: z.enum(['pending', 'approved', 'rejected']).default('pending'),
+  category: z.enum(['cut_candidate', 'style', 'delivery', 'topic_focus', 'clarification']).default('cut_candidate'),
+  suggestion: z.string().min(1),
+  reason: z.string().default(''),
+  startWordId: z.string().optional(),
+  endWordId: z.string().optional(),
+  startSec: z.number().nonnegative().optional(),
+  endSec: z.number().nonnegative().optional(),
+  proposedOperation: timelineOperationSchema.optional(),
+});
+
+export const agentStateSchema = z.object({
+  baseIntent: z.string().optional(),
+  pendingQuestions: z.array(pendingQuestionSchema).default([]),
+  suggestions: z.array(suggestionSchema).default([]),
+  lastAppliedOperations: z.array(z.string()).default([]),
+  lastReasoningSummary: z.string().optional(),
+});
+
+export const operationSchema = z.discriminatedUnion('type', [
+  timelineOperationSchema,
+  z.object({
+    type: z.literal('approve_suggestion'),
+    reason: z.string().default(''),
+    suggestionId: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal('reject_suggestion'),
+    reason: z.string().default(''),
+    suggestionId: z.string().min(1),
   }),
 ]);
 
@@ -204,7 +221,9 @@ export type AxcutTranscript = z.infer<typeof transcriptSchema>;
 export type AxcutAsset = z.infer<typeof assetSchema>;
 export type AxcutClip = z.infer<typeof clipSchema>;
 export type AxcutTimeline = z.infer<typeof timelineSchema>;
+export type AxcutSuggestion = z.infer<typeof suggestionSchema>;
 export type AxcutAgentState = z.infer<typeof agentStateSchema>;
+export type AxcutTimelineOperation = z.infer<typeof timelineOperationSchema>;
 export type AxcutOperation = z.infer<typeof operationSchema>;
 export type AxcutRevision = z.infer<typeof revisionSchema>;
 export type AxcutDocument = z.infer<typeof documentSchema>;

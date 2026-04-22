@@ -9,12 +9,14 @@ import {
   type AxcutAsset,
   type AxcutDocument,
   type AxcutOperation,
-  type AxcutRevision,
+  type AxcutSuggestion,
   type AxcutTranscript,
 } from '@axcut/schema';
 
+import { applyDocumentOperation, replaceSuggestions } from '../lib/document-operations.js';
+import { appendRevision, refreshProjectUpdatedAt } from '../lib/document-history.js';
 import { createId } from '../lib/ids.js';
-import { applyTimelineOperation, buildTimelineFromIntervals, normalizeIntervals } from '../lib/timeline.js';
+import { buildTimelineFromIntervals, normalizeIntervals } from '../lib/timeline.js';
 import { projectArtifactsRoot, projectDocumentPath, projectRoot } from '../lib/paths.js';
 import type { DatabaseService } from './database.js';
 
@@ -99,13 +101,17 @@ export class DocumentService {
 
   applyOperation(projectId: string, operation: AxcutOperation, summary: string, author: 'user' | 'agent' | 'system'): { document: AxcutDocument; revisionId: string } {
     const current = this.readDocument(projectId);
-    const next = this.refreshUpdatedAt(this.appendRevision(applyTimelineOperation(current, operation), {
+    const next = refreshProjectUpdatedAt(appendRevision(applyDocumentOperation(current, operation, author), {
       author,
       summary,
       operations: [operation],
-    }));
+    }, () => createId('rev')));
     this.writeDocument(next, summary);
     return { document: next, revisionId: next.history.revisions.at(-1)?.id ?? '' };
+  }
+
+  setSuggestions(projectId: string, suggestions: AxcutSuggestion[], summary: string): AxcutDocument {
+    return this.mutateDocument(projectId, summary, (current) => replaceSuggestions(current, suggestions, summary));
   }
 
   replaceTimeline(projectId: string, intervals: Array<{ startSec: number; endSec: number }>, summary: string, author: 'agent' | 'user' | 'system'): { document: AxcutDocument; revisionId: string } {
@@ -116,7 +122,7 @@ export class DocumentService {
     }
     const asset = current.assets.find((item) => item.id === assetId);
     const normalized = normalizeIntervals(asset?.durationSec ?? 0, intervals);
-    const next = this.refreshUpdatedAt(this.appendRevision(
+    const next = refreshProjectUpdatedAt(appendRevision(
       {
         ...current,
         timeline: {
@@ -130,6 +136,7 @@ export class DocumentService {
         },
         agent: {
           ...current.agent,
+          suggestions: [],
           lastReasoningSummary: summary,
           lastAppliedOperations: ['replace_timeline'],
         },
@@ -143,6 +150,7 @@ export class DocumentService {
         summary,
         operations: [{ type: 'replace_timeline', reason: summary, intervals: normalized }],
       },
+      () => createId('rev'),
     ));
     this.writeDocument(next, summary);
     return { document: next, revisionId: next.history.revisions.at(-1)?.id ?? '' };
@@ -166,41 +174,9 @@ export class DocumentService {
   ): AxcutDocument {
     const current = this.readDocument(projectId);
     let next = updater(current);
-    next = {
-      ...next,
-      project: {
-        ...next.project,
-        updatedAt: new Date().toISOString(),
-      },
-    };
+    next = refreshProjectUpdatedAt(next);
     this.writeDocument(next, summary, updateProjectRow);
     return next;
-  }
-
-  private appendRevision(document: AxcutDocument, input: { author: 'system' | 'agent' | 'user'; summary: string; operations: AxcutRevision['operations'] }): AxcutDocument {
-    const revision: AxcutRevision = {
-      id: createId('rev'),
-      createdAt: new Date().toISOString(),
-      author: input.author,
-      summary: input.summary,
-      operations: input.operations,
-    };
-    return {
-      ...document,
-      history: {
-        revisions: [...document.history.revisions, revision],
-      },
-    };
-  }
-
-  private refreshUpdatedAt(document: AxcutDocument): AxcutDocument {
-    return {
-      ...document,
-      project: {
-        ...document.project,
-        updatedAt: new Date().toISOString(),
-      },
-    };
   }
 
   private assertAttachableAssetPath(filePath: string): void {

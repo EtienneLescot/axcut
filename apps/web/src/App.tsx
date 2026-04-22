@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { AxcutDocument } from '@axcut/schema';
+import type { ApplyOperationInput, AxcutDocument } from '@axcut/schema';
+
+import { SuggestionList } from './components/SuggestionList.js';
+import { TranscriptEditor } from './components/TranscriptEditor.js';
+import { VirtualPreview } from './components/VirtualPreview.js';
 
 type ProjectSummary = {
   id: string;
@@ -153,6 +157,19 @@ export function App() {
     },
   });
 
+  const applyOperation = useMutation({
+    mutationFn: async (operation: ApplyOperationInput['operation']) => requestJson(`/api/projects/${selectedProjectId}/operations`, {
+      method: 'POST',
+      body: JSON.stringify({ operation }),
+      headers: {
+        'X-Axcut-Token': sessionToken!,
+      },
+    }),
+    onSuccess: async () => {
+      await invalidateProject();
+    },
+  });
+
   const snapshot = snapshotQuery.data;
   const document = snapshot?.document;
   const primaryAsset = useMemo(
@@ -217,6 +234,26 @@ export function App() {
                  <button onClick={() => sendChat.mutate()} disabled={!sessionToken || !message || sendChat.isPending}>Run agent</button>
               </div>
             </div>
+
+            <SuggestionList
+              suggestions={document.agent.suggestions}
+              lastReasoningSummary={document.agent.lastReasoningSummary}
+              busy={applyOperation.isPending}
+              onApprove={(suggestionId) => {
+                applyOperation.mutate({
+                  type: 'approve_suggestion',
+                  suggestionId,
+                  reason: 'Approved from the suggestions panel.',
+                });
+              }}
+              onReject={(suggestionId) => {
+                applyOperation.mutate({
+                  type: 'reject_suggestion',
+                  suggestionId,
+                  reason: 'Rejected from the suggestions panel.',
+                });
+              }}
+            />
           </>
         ) : null}
       </aside>
@@ -232,32 +269,32 @@ export function App() {
                 </div>
                  <button onClick={() => triggerExport.mutate()} disabled={!sessionToken || triggerExport.isPending || !document.timeline.clips.length}>Export</button>
               </div>
-              {videoSrc ? <video src={videoSrc} controls className="video" /> : <div className="video placeholder">Attach a video to start previewing.</div>}
-              <div className="timeline">
-                {document.timeline.clips.length > 0 ? document.timeline.clips.map((clip) => {
-                  const total = primaryAsset?.durationSec || 1;
-                  const width = `${Math.max(3, ((clip.sourceEndSec - clip.sourceStartSec) / total) * 100)}%`;
-                  return (
-                    <div key={clip.id} className="timeline-clip" style={{ width }} title={`${clip.sourceStartSec.toFixed(2)}s - ${clip.sourceEndSec.toFixed(2)}s`}>
-                      {clip.sourceStartSec.toFixed(1)}-{clip.sourceEndSec.toFixed(1)}
-                    </div>
-                  );
-                }) : <div className="muted">No virtual clips yet.</div>}
-              </div>
+              <VirtualPreview
+                videoSrc={videoSrc}
+                clips={document.timeline.clips}
+                revision={document.preview.revision}
+              />
             </section>
 
             <section className="columns">
-              <div className="panel">
-                <h2>Transcript</h2>
-                <div className="transcript">
-                  {document.transcript?.segments.slice(0, 80).map((segment) => (
-                    <div key={segment.id} className={`segment ${segment.kind}`}>
-                      <strong>{segment.startSec.toFixed(2)} - {segment.endSec.toFixed(2)}</strong>
-                      <p>{segment.kind === 'silence' ? '[silence]' : segment.text}</p>
-                    </div>
-                  )) ?? <p className="muted">Transcript will appear after ingest completes.</p>}
-                </div>
-              </div>
+              <TranscriptEditor
+                document={document}
+                busy={applyOperation.isPending}
+                onDropWordRange={(startWordId, endWordId) => {
+                  applyOperation.mutate({
+                    type: 'drop_word_range',
+                    startWordId,
+                    endWordId,
+                    reason: 'Removed from the transcript editor selection.',
+                  });
+                }}
+                onRestoreTimeline={() => {
+                  applyOperation.mutate({
+                    type: 'restore_full_timeline',
+                    reason: 'Restored from the transcript editor.',
+                  });
+                }}
+              />
 
               <div className="panel">
                 <h2>Jobs</h2>
