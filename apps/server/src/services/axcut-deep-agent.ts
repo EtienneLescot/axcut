@@ -2,16 +2,19 @@ import path from 'node:path';
 
 import { MemorySaver } from '@langchain/langgraph';
 import { createDeepAgentRuntime } from '@yagr/deepagent-bootstrap';
-import { buildDeepAgentSessionConfig, CheckpointManager, DeepAgentSessionStore } from '@yagr/session-checkpoint';
+import type { RuntimeContextCompactionEvent, RuntimeOperationEvent } from '@yagr/runtime-events';
+import { SessionService } from '@yagr/session-service';
+import { consumeLangGraphStream } from '@yagr/stream-adapter';
 import { HumanMessage, tool } from 'langchain';
 import { z } from 'zod';
 
 import type { AxcutOperation, AxcutSuggestion } from '@axcut/schema';
 
 import { buildFillerSuggestions, buildPauseSuggestions, searchTranscript } from '../lib/structured-agent.js';
-import { agentSessionsRoot, projectArtifactsRoot } from '../lib/paths.js';
+import { agentSessionsRoot, dataRoot, projectArtifactsRoot } from '../lib/paths.js';
 import { createAxcutChatModel } from '../llm/create-chat-model.js';
 import type { DocumentService } from './document-service.js';
+import type { EventBus } from './event-bus.js';
 import type { PythonWorker } from './python-worker.js';
 
 const searchTranscriptToolSchema = z.object({
@@ -62,13 +65,18 @@ const plannerFallbackToolSchema = z.object({
 
 export class AxcutDeepAgentService {
   private readonly checkpointer = new MemorySaver();
-  private readonly sessionStore = new DeepAgentSessionStore(agentSessionsRoot);
-  private readonly checkpointManager = new CheckpointManager(this.checkpointer, agentSessionsRoot);
+  private readonly sessions = new SessionService({
+    sessionsDir: agentSessionsRoot,
+    webUiSessionsDir: path.join(dataRoot, 'ui-sessions'),
+  });
 
   constructor(
     private readonly documents: DocumentService,
     private readonly worker: PythonWorker,
-  ) {}
+    private readonly events: EventBus,
+  ) {
+    this.sessions.setCheckpointer(this.checkpointer);
+  }
 
   create(projectId: string) {
     const getProject = () => this.documents.readDocument(projectId);
@@ -235,59 +243,51 @@ export class AxcutDeepAgentService {
 
   async invoke(projectId: string, prompt: string) {
     const document = this.documents.readDocument(projectId);
-    this.sessionStore.ensure(projectId, { title: document.project.title || projectId });
+    this.sessions.ensure(projectId, { title: document.project.title || projectId });
     await this.restoreLatestCheckpointIfNeeded(projectId);
 
     const agent = this.create(projectId);
-    const result = await agent.invoke({
+    const stream = agent.streamEvents({
       messages: [new HumanMessage(prompt)],
-    }, buildDeepAgentSessionConfig(projectId));
+    }, this.sessions.buildSessionConfig(projectId));
 
-    await this.checkpointManager.saveCheckpoint(projectId);
-    this.sessionStore.touch(projectId, { title: document.project.title || projectId });
+    const result = await consumeLangGraphStream(stream, {
+      onTextDelta: async (delta: string) => {
+        this.events.emit(projectId, 'agent.message.delta', { delta });
+      },
+      onThinkingDelta: async (delta: string) => {
+        this.events.emit(projectId, 'agent.thinking.delta', { delta });
+      },
+      onOperation: async (operation: RuntimeOperationEvent) => {
+        this.events.emit(projectId, 'agent.operation', { operation });
+      },
+      onCompaction: async (compaction: RuntimeContextCompactionEvent) => {
+        this.events.emit(projectId, 'agent.compaction', { compaction });
+      },
+    });
+
+    await this.sessions.saveCheckpoint(projectId);
+    this.sessions.touch(projectId, { title: document.project.title || projectId });
 
     return {
-      text: extractAssistantText(result.messages),
+      text: result.responseText || this.documents.readDocument(projectId).agent.lastReasoningSummary || 'Completed the deepagents editing turn.',
       state: result,
     };
   }
 
   private async restoreLatestCheckpointIfNeeded(projectId: string): Promise<void> {
-    const existing = await this.checkpointer.getTuple(buildDeepAgentSessionConfig(projectId));
+    const existing = await this.checkpointer.getTuple(this.sessions.buildSessionConfig(projectId));
     if (existing) {
       return;
     }
 
-    const latest = this.checkpointManager.listCheckpointsSync(projectId)[0];
+    const latest = this.sessions.listCheckpointsSync(projectId)[0];
     if (!latest) {
       return;
     }
 
-    await this.checkpointManager.restoreCheckpoint(projectId, latest.id);
+    await this.sessions.restoreCheckpoint(projectId, latest.id);
   }
-}
-
-function extractAssistantText(messages: unknown): string {
-  if (!Array.isArray(messages)) {
-    return '';
-  }
-  const lastText = [...messages]
-    .reverse()
-    .find((message) => {
-      if (!message || typeof message !== 'object') return false;
-      const candidate = message as { content?: unknown; lc_kwargs?: { content?: unknown } };
-      return typeof candidate.content === 'string'
-        || typeof candidate.lc_kwargs?.content === 'string';
-    });
-  if (!lastText || typeof lastText !== 'object') {
-    return '';
-  }
-  const candidate = lastText as { content?: unknown; lc_kwargs?: { content?: unknown } };
-  return typeof candidate.content === 'string'
-    ? candidate.content
-    : typeof candidate.lc_kwargs?.content === 'string'
-      ? candidate.lc_kwargs.content
-      : '';
 }
 
 const AXCUT_DEEP_AGENT_PROMPT = `You are Axcut, an expert agentic video editor.

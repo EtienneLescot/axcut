@@ -2,9 +2,11 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { ApplyOperationInput, AxcutDocument } from '@axcut/schema';
 
+import { LiveRunPanel } from './components/LiveRunPanel.js';
 import { SuggestionList } from './components/SuggestionList.js';
 import { TranscriptEditor } from './components/TranscriptEditor.js';
 import { VirtualPreview } from './components/VirtualPreview.js';
+import { emptyLiveRunState, reduceLiveRunState, type ProjectStreamEvent } from './lib/live-run.js';
 
 type ProjectSummary = {
   id: string;
@@ -37,19 +39,44 @@ async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T
   return response.json() as Promise<T>;
 }
 
-function useProjectEvents(projectId: string | null, sessionToken: string | undefined, onEvent: () => void): void {
+function useProjectEvents(
+  projectId: string | null,
+  sessionToken: string | undefined,
+  onEvent: (event: ProjectStreamEvent) => void,
+): void {
   useEffect(() => {
     if (!projectId || !sessionToken) {
       return undefined;
     }
     const source = new EventSource(`/api/projects/${projectId}/stream?token=${encodeURIComponent(sessionToken)}`);
-    source.onmessage = () => onEvent();
-    source.addEventListener('job.progress', onEvent as EventListener);
-    source.addEventListener('job.completed', onEvent as EventListener);
-    source.addEventListener('project.transcript.updated', onEvent as EventListener);
-    source.addEventListener('project.revision.created', onEvent as EventListener);
-    source.addEventListener('preview.ready', onEvent as EventListener);
+    const eventNames = [
+      'job.progress',
+      'job.completed',
+      'project.transcript.updated',
+      'project.revision.created',
+      'preview.ready',
+      'agent.message.user',
+      'agent.message.delta',
+      'agent.thinking.delta',
+      'agent.operation',
+      'agent.compaction',
+      'agent.message.assistant',
+    ] as const;
+    const listeners = eventNames.map((eventName) => {
+      const listener = ((incoming: MessageEvent<string>) => {
+        try {
+          onEvent(JSON.parse(incoming.data) as ProjectStreamEvent);
+        } catch {
+          // Ignore malformed stream payloads.
+        }
+      }) as EventListener;
+      source.addEventListener(eventName, listener);
+      return { eventName, listener };
+    });
     return () => {
+      for (const { eventName, listener } of listeners) {
+        source.removeEventListener(eventName, listener);
+      }
       source.close();
     };
   }, [onEvent, projectId, sessionToken]);
@@ -61,6 +88,7 @@ export function App() {
   const [title, setTitle] = useState('Axcut Session');
   const [assetPath, setAssetPath] = useState('');
   const [message, setMessage] = useState('Cut filler words, stutters, and dead air aggressively.');
+  const [liveRun, setLiveRun] = useState(emptyLiveRunState);
 
   const sessionQuery = useQuery({
     queryKey: ['session'],
@@ -72,6 +100,20 @@ export function App() {
     void queryClient.invalidateQueries({ queryKey: ['project', selectedProjectId] });
     void queryClient.invalidateQueries({ queryKey: ['projects'] });
   }, [queryClient, selectedProjectId]);
+
+  const handleProjectEvent = useCallback((event: ProjectStreamEvent) => {
+    setLiveRun((current) => reduceLiveRunState(current, event));
+    if (
+      event.type === 'job.progress'
+      || event.type === 'job.completed'
+      || event.type === 'project.transcript.updated'
+      || event.type === 'project.revision.created'
+      || event.type === 'preview.ready'
+      || event.type === 'agent.message.assistant'
+    ) {
+      invalidateProject();
+    }
+  }, [invalidateProject]);
 
   const projectsQuery = useQuery({
     enabled: Boolean(sessionToken),
@@ -99,7 +141,11 @@ export function App() {
     }
   }, [projectsQuery.data, selectedProjectId]);
 
-  useProjectEvents(selectedProjectId, sessionToken, invalidateProject);
+  useEffect(() => {
+    setLiveRun(emptyLiveRunState);
+  }, [selectedProjectId]);
+
+  useProjectEvents(selectedProjectId, sessionToken, handleProjectEvent);
 
   const createProject = useMutation({
     mutationFn: async () => requestJson<{ document: AxcutDocument }>('/api/projects', {
@@ -234,6 +280,8 @@ export function App() {
                  <button onClick={() => sendChat.mutate()} disabled={!sessionToken || !message || sendChat.isPending}>Run agent</button>
               </div>
             </div>
+
+            <LiveRunPanel state={liveRun} />
 
             <SuggestionList
               suggestions={document.agent.suggestions}

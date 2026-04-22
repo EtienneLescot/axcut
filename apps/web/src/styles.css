@@ -275,6 +275,86 @@ textarea {
   color: #cbd5e1;
 }
 
+.live-run-panel {
+  max-height: 420px;
+  overflow: auto;
+}
+
+.live-badge {
+  padding: 0.35rem 0.65rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #cbd5e1;
+  font-size: 0.85rem;
+}
+
+.live-badge.active {
+  background: rgba(16, 185, 129, 0.18);
+  color: #d1fae5;
+}
+
+.live-block {
+  margin-top: 0.75rem;
+  padding: 0.8rem;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.live-block.user {
+  background: rgba(91, 116, 255, 0.14);
+}
+
+.live-block.assistant {
+  background: rgba(16, 185, 129, 0.12);
+}
+
+.live-block.thinking {
+  background: rgba(168, 85, 247, 0.12);
+}
+
+.live-operations,
+.live-compactions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.operation-card,
+.compaction-card {
+  padding: 0.85rem;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.operation-card.done {
+  border-color: rgba(16, 185, 129, 0.45);
+}
+
+.operation-card.error {
+  border-color: rgba(244, 63, 94, 0.45);
+}
+
+.operation-header {
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.operation-status {
+  color: #cbd5e1;
+}
+
+.operation-body {
+  margin: 0;
+  padding: 0.75rem;
+  overflow: auto;
+  border-radius: 10px;
+  background: rgba(10, 14, 28, 0.75);
+  color: #dbeafe;
+  white-space: pre-wrap;
+}
+
 .word-stream {
   display: flex;
   gap: 0.35rem;

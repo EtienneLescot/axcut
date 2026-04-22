@@ -24,7 +24,7 @@ export class AxcutAgentRuntime {
     private readonly worker: PythonWorker,
     private readonly events: EventBus,
   ) {
-    this.deepAgent = new AxcutDeepAgentService(documents, worker);
+    this.deepAgent = new AxcutDeepAgentService(documents, worker, events);
   }
 
   async run(projectId: string, prompt: string): Promise<AgentRunResult> {
