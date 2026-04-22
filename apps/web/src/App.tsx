@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { ApplyOperationInput, AxcutDocument } from '@axcut/schema';
+import { LiveRunPanel, emptyLiveRunState, reduceLiveRunState, type ProjectStreamEvent } from '@yagr/webui-surface';
 
-import { LiveRunPanel } from './components/LiveRunPanel.js';
 import { SuggestionList } from './components/SuggestionList.js';
 import { TranscriptEditor } from './components/TranscriptEditor.js';
 import { VirtualPreview } from './components/VirtualPreview.js';
-import { emptyLiveRunState, reduceLiveRunState, type ProjectStreamEvent } from './lib/live-run.js';
 
 type ProjectSummary = {
   id: string;

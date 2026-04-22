@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { emptyLiveRunState, reduceLiveRunState, type ProjectStreamEvent } from './live-run.js';
+import { emptyLiveRunState, reduceLiveRunState, type ProjectStreamEvent } from '@yagr/webui-surface';
 
 function event(input: Partial<ProjectStreamEvent> & Pick<ProjectStreamEvent, 'type'>): ProjectStreamEvent {
   return {

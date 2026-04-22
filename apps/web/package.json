@@ -12,6 +12,7 @@
   "dependencies": {
     "@axcut/schema": "0.1.0",
     "@tanstack/react-query": "^5.90.5",
+    "@yagr/webui-surface": "file:../../../yagr-axcut-primitives/packages/webui-surface",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
