@@ -10,6 +10,7 @@
     "dev": "concurrently -n server,web -c magenta,cyan \"npm run dev:server\" \"npm run dev:web\"",
     "dev:server": "npm run dev --workspace @axcut/server",
     "dev:web": "npm run dev --workspace @axcut/web",
+    "llm:setup": "node scripts/run-yagr-llm-setup.mjs",
     "build": "npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present"

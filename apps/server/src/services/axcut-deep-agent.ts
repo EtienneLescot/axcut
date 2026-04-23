@@ -74,7 +74,7 @@ export class AxcutDeepAgentService {
     this.sessions.setCheckpointer(this.checkpointer);
   }
 
-  create(projectId: string) {
+  async create(projectId: string) {
     const getProject = () => this.documents.readDocument(projectId);
 
     const getProjectState = tool(async () => {
@@ -186,7 +186,7 @@ export class AxcutDeepAgentService {
     });
 
     return createDeepAgentRuntime({
-      model: createAxcutChatModel(this.llmConfig),
+      model: await createAxcutChatModel(this.llmConfig),
       checkpointer: this.checkpointer,
       tools: [
         getProjectState,
@@ -205,7 +205,7 @@ export class AxcutDeepAgentService {
     this.sessions.ensure(projectId, { title: document.project.title || projectId });
     await this.restoreLatestCheckpointIfNeeded(projectId);
 
-    const agent = this.create(projectId);
+    const agent = await this.create(projectId);
     const stream = agent.streamEvents({
       messages: [new HumanMessage(prompt)],
     }, this.sessions.buildSessionConfig(projectId));
