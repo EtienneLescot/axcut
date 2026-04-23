@@ -27,22 +27,6 @@ export class PythonWorker {
     return this.runJson(['transcribe', '--video', videoPath, '--asset-id', assetId, '--dsl-output', dslOutput, '--json-output', jsonOutput]);
   }
 
-  async planPrompt(transcriptDslPath: string, prompt: string, cleanedOutput: string, planOutput: string, intervalsOutput: string): Promise<WorkerResponse<Record<string, unknown>>> {
-    return this.runJson([
-      'plan-prompt',
-      '--transcript',
-      transcriptDslPath,
-      '--prompt',
-      prompt,
-      '--cleaned-output',
-      cleanedOutput,
-      '--plan-output',
-      planOutput,
-      '--intervals-output',
-      intervalsOutput,
-    ]);
-  }
-
   async exportVideo(videoPath: string, intervalsPath: string, outputPath: string): Promise<WorkerResponse<Record<string, unknown>>> {
     return this.runJson(['export', '--video', videoPath, '--intervals', intervalsPath, '--output', outputPath]);
   }

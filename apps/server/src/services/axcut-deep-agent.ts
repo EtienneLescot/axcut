@@ -11,11 +11,10 @@ import { z } from 'zod';
 import type { AxcutOperation, AxcutSuggestion } from '@axcut/schema';
 
 import { buildFillerSuggestions, buildPauseSuggestions, searchTranscript } from '../lib/structured-agent.js';
-import { agentSessionsRoot, dataRoot, projectArtifactsRoot } from '../lib/paths.js';
+import { agentSessionsRoot, dataRoot } from '../lib/paths.js';
 import { createAxcutChatModel } from '../llm/create-chat-model.js';
 import type { DocumentService } from './document-service.js';
 import type { EventBus } from './event-bus.js';
-import type { PythonWorker } from './python-worker.js';
 
 const searchTranscriptToolSchema = z.object({
   query: z.string().min(1).describe('Search query to locate transcript passages.'),
@@ -59,10 +58,6 @@ const suggestionDecisionToolSchema = z.object({
   reason: z.string().default(''),
 });
 
-const plannerFallbackToolSchema = z.object({
-  prompt: z.string().min(1),
-});
-
 export class AxcutDeepAgentService {
   private readonly checkpointer = new MemorySaver();
   private readonly sessions = new SessionService({
@@ -72,7 +67,6 @@ export class AxcutDeepAgentService {
 
   constructor(
     private readonly documents: DocumentService,
-    private readonly worker: PythonWorker,
     private readonly events: EventBus,
   ) {
     this.sessions.setCheckpointer(this.checkpointer);
@@ -189,42 +183,6 @@ export class AxcutDeepAgentService {
       schema: suggestionDecisionToolSchema,
     });
 
-    const plannerFallback = tool(async ({ prompt }) => {
-      const document = getProject();
-      if (!document.transcript?.sourceDslPath) {
-        return { summary: 'No transcript available for planner fallback.' };
-      }
-      const artifactsRoot = projectArtifactsRoot(projectId);
-      const safeSlug = prompt.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'plan';
-      const cleanedPath = path.join(artifactsRoot, `${safeSlug}-cleaned.axcut`);
-      const planPath = path.join(artifactsRoot, `${safeSlug}-plan.json`);
-      const intervalsPath = path.join(artifactsRoot, `${safeSlug}-intervals.json`);
-      const planned = await this.worker.planPrompt(
-        document.transcript.sourceDslPath,
-        prompt,
-        cleanedPath,
-        planPath,
-        intervalsPath,
-      );
-      const summary = typeof planned.data.summary === 'string'
-        ? planned.data.summary
-        : `Applied ${Array.isArray(planned.data.intervals) ? planned.data.intervals.length : 0} keep intervals from planner fallback.`;
-      const result = this.documents.replaceTimeline(
-        projectId,
-        (planned.data.intervals as Array<{ startSec: number; endSec: number }>) ?? [],
-        summary,
-        'agent',
-      );
-      return {
-        summary,
-        revisionId: result.revisionId,
-      };
-    }, {
-      name: 'run_rewrite_planner',
-      description: 'Fallback to the transcript rewrite planner for broad editorial requests that need global reframing.',
-      schema: plannerFallbackToolSchema,
-    });
-
     return createDeepAgentRuntime({
       model: createAxcutChatModel(),
       checkpointer: this.checkpointer,
@@ -235,7 +193,6 @@ export class AxcutDeepAgentService {
         applyTimelineOperation,
         approveSuggestion,
         rejectSuggestion,
-        plannerFallback,
       ],
       systemPrompt: AXCUT_DEEP_AGENT_PROMPT,
     });
@@ -300,7 +257,6 @@ Rules:
 - When the user explicitly asks for options, suggestions, or proposals, use suggest_cuts and do not apply edits immediately.
 - When the user gives a direct editing command with clear intent, apply the minimal structured operation needed.
 - Use approve_suggestion or reject_suggestion when interacting with existing suggestions.
-- Use run_rewrite_planner only when the user asks for broad editorial restructuring that is difficult to express as a few direct operations.
 - Keep replies concise and explain what you changed or suggested.
 - Never invent transcript content or timestamps.
 - Do not ask unnecessary clarifying questions if the existing transcript and project state are sufficient.`;

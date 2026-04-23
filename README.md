@@ -76,12 +76,8 @@ npm run build
 npm run test
 ```
 
-## Legacy POC
-
-The original Python-first CLI/TUI proof of concept still exists in `src/axcut/` and `ui/`, but the active product path is now the workspace-based web stack above.
-
 ## `.axcut` Direction
 
 The long-term editing source of truth is the versioned `.axcut` JSON project document.
 
-The legacy transcript DSL still exists as an ingest/export artifact and for the current prompt-planning fallback, but timeline edits now flow through structured operations on the project document.
+The transcript DSL remains an ingest/export artifact, while timeline edits flow through structured operations on the project document and the Yagr-backed deepagents runtime.

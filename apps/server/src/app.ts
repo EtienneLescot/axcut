@@ -44,7 +44,7 @@ export async function createServer() {
   const documents = new DocumentService(db);
   const worker = new PythonWorker();
   const jobs = new JobService(db, documents, worker, events);
-  const agentRuntime = new AxcutAgentRuntime(documents, worker, events);
+  const agentRuntime = new AxcutAgentRuntime(documents, events);
   const chat = new ChatService(db, documents, agentRuntime, events);
 
   fastify.setErrorHandler((error, _request, reply) => {
