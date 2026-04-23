@@ -15,7 +15,37 @@ import { DatabaseService } from './services/database.js';
 import { DocumentService } from './services/document-service.js';
 import { EventBus } from './services/event-bus.js';
 import { JobService } from './services/job-service.js';
+import { LlmConfigService } from './services/llm-config-service.js';
 import { PythonWorker } from './services/python-worker.js';
+
+async function ensureConfiguredProject(documents: DocumentService, jobs: JobService, logger: ReturnType<typeof Fastify>['log']): Promise<void> {
+  const configuredVideoPath = process.env.AXCUT_VIDEO_PATH?.trim();
+  if (!configuredVideoPath) {
+    return;
+  }
+
+  const resolvedVideoPath = path.resolve(configuredVideoPath);
+  const configuredTitle = process.env.AXCUT_PROJECT_TITLE?.trim() || path.basename(resolvedVideoPath);
+  const existingProjects = documents.listProjects();
+
+  for (const project of existingProjects) {
+    const snapshot = documents.getSnapshot(project.id).document;
+    const asset = snapshot.assets.find((item) => item.originalPath === resolvedVideoPath);
+    if (!asset) {
+      continue;
+    }
+    if (!asset.proxyPath || !snapshot.transcript) {
+      jobs.enqueueAssetIngest(project.id, asset.id, { autoTranscribe: true });
+      logger.info(`Axcut resumed ingest for configured video ${resolvedVideoPath}`);
+    }
+    return;
+  }
+
+  const document = documents.createProject({ title: configuredTitle });
+  const { asset } = documents.addAsset(document.project.id, { path: resolvedVideoPath, autoTranscribe: true });
+  jobs.enqueueAssetIngest(document.project.id, asset.id, { autoTranscribe: true });
+  logger.info(`Axcut bootstrapped project ${document.project.id} for ${resolvedVideoPath}`);
+}
 
 export async function createServer() {
   const fastify = Fastify({ logger: true });
@@ -42,10 +72,13 @@ export async function createServer() {
   const events = new EventBus();
   const db = new DatabaseService(databasePath);
   const documents = new DocumentService(db);
+  const llmConfig = new LlmConfigService();
   const worker = new PythonWorker();
   const jobs = new JobService(db, documents, worker, events);
-  const agentRuntime = new AxcutAgentRuntime(documents, events);
+  const agentRuntime = new AxcutAgentRuntime(documents, events, llmConfig);
   const chat = new ChatService(db, documents, agentRuntime, events);
+
+  await ensureConfiguredProject(documents, jobs, fastify.log);
 
   fastify.setErrorHandler((error, _request, reply) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -72,6 +105,7 @@ export async function createServer() {
   });
 
   fastify.get('/api/session', async () => ({ token: sessionToken }));
+  fastify.get('/api/llm/config', async () => llmConfig.getSnapshot());
 
   fastify.get('/api/projects', async () => ({ projects: documents.listProjects() }));
 

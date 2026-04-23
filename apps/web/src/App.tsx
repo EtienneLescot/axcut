@@ -1,10 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { ApplyOperationInput, AxcutDocument } from '@axcut/schema';
-import { LiveRunPanel, emptyLiveRunState, reduceLiveRunState, type ProjectStreamEvent } from '@yagr/webui-surface';
+import type { AxcutDocument } from '@axcut/schema';
+import type { ProjectStreamEvent } from '@yagr/webui-surface';
 
-import { SuggestionList } from './components/SuggestionList.js';
-import { TranscriptEditor } from './components/TranscriptEditor.js';
 import { VirtualPreview } from './components/VirtualPreview.js';
 
 type ProjectSummary = {
@@ -21,6 +19,14 @@ type ProjectSnapshot = {
 
 type SessionPayload = {
   token: string;
+};
+
+type LlmStatus = {
+  ready: boolean;
+  effective: {
+    providerLabel: string;
+    model: string;
+  };
 };
 
 async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
@@ -41,7 +47,7 @@ async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T
 function useProjectEvents(
   projectId: string | null,
   sessionToken: string | undefined,
-  onEvent: (event: ProjectStreamEvent) => void,
+  onEvent: () => void,
 ): void {
   useEffect(() => {
     if (!projectId || !sessionToken) {
@@ -54,17 +60,14 @@ function useProjectEvents(
       'project.transcript.updated',
       'project.revision.created',
       'preview.ready',
-      'agent.message.user',
-      'agent.message.delta',
-      'agent.thinking.delta',
-      'agent.operation',
-      'agent.compaction',
       'agent.message.assistant',
     ] as const;
     const listeners = eventNames.map((eventName) => {
       const listener = ((incoming: MessageEvent<string>) => {
         try {
-          onEvent(JSON.parse(incoming.data) as ProjectStreamEvent);
+          const _event = JSON.parse(incoming.data) as ProjectStreamEvent;
+          void _event;
+          onEvent();
         } catch {
           // Ignore malformed stream payloads.
         }
@@ -83,11 +86,7 @@ function useProjectEvents(
 
 export function App() {
   const queryClient = useQueryClient();
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
-  const [title, setTitle] = useState('Axcut Session');
-  const [assetPath, setAssetPath] = useState('');
-  const [message, setMessage] = useState('Cut filler words, stutters, and dead air aggressively.');
-  const [liveRun, setLiveRun] = useState(emptyLiveRunState);
+  const [message, setMessage] = useState('');
 
   const sessionQuery = useQuery({
     queryKey: ['session'],
@@ -95,24 +94,15 @@ export function App() {
   });
   const sessionToken = sessionQuery.data?.token;
 
-  const invalidateProject = useCallback(() => {
-    void queryClient.invalidateQueries({ queryKey: ['project', selectedProjectId] });
-    void queryClient.invalidateQueries({ queryKey: ['projects'] });
-  }, [queryClient, selectedProjectId]);
-
-  const handleProjectEvent = useCallback((event: ProjectStreamEvent) => {
-    setLiveRun((current) => reduceLiveRunState(current, event));
-    if (
-      event.type === 'job.progress'
-      || event.type === 'job.completed'
-      || event.type === 'project.transcript.updated'
-      || event.type === 'project.revision.created'
-      || event.type === 'preview.ready'
-      || event.type === 'agent.message.assistant'
-    ) {
-      invalidateProject();
-    }
-  }, [invalidateProject]);
+  const llmConfigQuery = useQuery({
+    enabled: Boolean(sessionToken),
+    queryKey: ['llm-config'],
+    queryFn: () => requestJson<LlmStatus>('/api/llm/config', {
+      headers: {
+        'X-Axcut-Token': sessionToken!,
+      },
+    }),
+  });
 
   const projectsQuery = useQuery({
     enabled: Boolean(sessionToken),
@@ -122,61 +112,33 @@ export function App() {
         'X-Axcut-Token': sessionToken!,
       },
     }),
+    refetchInterval: 5000,
   });
+
+  const projectId = projectsQuery.data?.projects[0]?.id ?? null;
 
   const snapshotQuery = useQuery({
-    enabled: Boolean(selectedProjectId && sessionToken),
-    queryKey: ['project', selectedProjectId],
-    queryFn: () => requestJson<ProjectSnapshot>(`/api/projects/${selectedProjectId}`, {
+    enabled: Boolean(projectId && sessionToken),
+    queryKey: ['project', projectId],
+    queryFn: () => requestJson<ProjectSnapshot>(`/api/projects/${projectId}`, {
       headers: {
         'X-Axcut-Token': sessionToken!,
       },
     }),
   });
 
-  useEffect(() => {
-    if (!selectedProjectId && projectsQuery.data?.projects[0]) {
-      setSelectedProjectId(projectsQuery.data.projects[0].id);
+  const invalidateProject = useCallback(() => {
+    if (!projectId) {
+      return;
     }
-  }, [projectsQuery.data, selectedProjectId]);
+    void queryClient.invalidateQueries({ queryKey: ['project', projectId] });
+    void queryClient.invalidateQueries({ queryKey: ['projects'] });
+  }, [projectId, queryClient]);
 
-  useEffect(() => {
-    setLiveRun(emptyLiveRunState);
-  }, [selectedProjectId]);
-
-  useProjectEvents(selectedProjectId, sessionToken, handleProjectEvent);
-
-  const createProject = useMutation({
-    mutationFn: async () => requestJson<{ document: AxcutDocument }>('/api/projects', {
-      method: 'POST',
-      body: JSON.stringify({ title }),
-      headers: {
-        'X-Axcut-Token': sessionToken!,
-      },
-    }),
-    onSuccess: async (data) => {
-      setSelectedProjectId(data.document.project.id);
-      await queryClient.invalidateQueries({ queryKey: ['projects'] });
-      await queryClient.invalidateQueries({ queryKey: ['project', data.document.project.id] });
-    },
-  });
-
-  const attachAsset = useMutation({
-    mutationFn: async () => requestJson(`/api/projects/${selectedProjectId}/assets`, {
-      method: 'POST',
-      body: JSON.stringify({ path: assetPath, autoTranscribe: true }),
-      headers: {
-        'X-Axcut-Token': sessionToken!,
-      },
-    }),
-    onSuccess: async () => {
-      setAssetPath('');
-      await queryClient.invalidateQueries({ queryKey: ['project', selectedProjectId] });
-    },
-  });
+  useProjectEvents(projectId, sessionToken, invalidateProject);
 
   const sendChat = useMutation({
-    mutationFn: async () => requestJson(`/api/projects/${selectedProjectId}/chat`, {
+    mutationFn: async () => requestJson(`/api/projects/${projectId}/chat`, {
       method: 'POST',
       body: JSON.stringify({ message }),
       headers: {
@@ -185,33 +147,7 @@ export function App() {
     }),
     onSuccess: async () => {
       setMessage('');
-      await queryClient.invalidateQueries({ queryKey: ['project', selectedProjectId] });
-    },
-  });
-
-  const triggerExport = useMutation({
-    mutationFn: async () => requestJson(`/api/projects/${selectedProjectId}/export`, {
-      method: 'POST',
-      body: JSON.stringify({ preset: 'final-balanced' }),
-      headers: {
-        'X-Axcut-Token': sessionToken!,
-      },
-    }),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: ['project', selectedProjectId] });
-    },
-  });
-
-  const applyOperation = useMutation({
-    mutationFn: async (operation: ApplyOperationInput['operation']) => requestJson(`/api/projects/${selectedProjectId}/operations`, {
-      method: 'POST',
-      body: JSON.stringify({ operation }),
-      headers: {
-        'X-Axcut-Token': sessionToken!,
-      },
-    }),
-    onSuccess: async () => {
-      await invalidateProject();
+      invalidateProject();
     },
   });
 
@@ -221,149 +157,85 @@ export function App() {
     () => document?.assets.find((asset) => asset.id === document.project.primaryAssetId) ?? document?.assets[0],
     [document],
   );
-  const videoSrc = selectedProjectId && primaryAsset
-    ? `/api/projects/${selectedProjectId}/assets/${primaryAsset.id}/media?variant=${primaryAsset.proxyPath ? 'proxy' : 'original'}&token=${encodeURIComponent(sessionToken ?? '')}`
+  const videoSrc = projectId && primaryAsset
+    ? `/api/projects/${projectId}/assets/${primaryAsset.id}/media?variant=${primaryAsset.proxyPath ? 'proxy' : 'original'}&token=${encodeURIComponent(sessionToken ?? '')}`
     : null;
-  const exportOutput = snapshot?.jobs.find((job) => job.kind === 'export' && job.status === 'completed' && job.resultJson)?.resultJson;
+  const latestJob = snapshot?.jobs[0] ?? null;
+  const statusText = !projectId
+    ? 'No configured project. Set AXCUT_VIDEO_PATH before starting the server.'
+    : latestJob
+      ? latestJob.message
+      : 'Ready';
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
-        <div className="panel">
+      <aside className="sidebar panel">
+        <div className="header-block">
           <h1>Axcut</h1>
-          <p className="muted">TypeScript app layer, Python media worker, canonical `.axcut` project document.</p>
-          <div className="row gap">
-            <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Project title" />
-            <button onClick={() => createProject.mutate()} disabled={!sessionToken || createProject.isPending}>New project</button>
-          </div>
+          <p className="muted">Chat on the left. Video on the right.</p>
         </div>
 
-        <div className="panel grow">
-          <h2>Projects</h2>
-          <div className="project-list">
-            {projectsQuery.data?.projects.map((project) => (
-              <button
-                key={project.id}
-                className={project.id === selectedProjectId ? 'project-item active' : 'project-item'}
-                onClick={() => setSelectedProjectId(project.id)}
-              >
-                <strong>{project.title}</strong>
-                <span>{new Date(project.updatedAt).toLocaleString()}</span>
-              </button>
-            ))}
-          </div>
+        <div className="status-bar">
+          <span>{document?.project.title ?? 'Waiting for configured video'}</span>
+          <span className={llmConfigQuery.data?.ready ? 'status-pill ready' : 'status-pill'}>
+            {llmConfigQuery.data?.ready
+              ? `${llmConfigQuery.data.effective.providerLabel} · ${llmConfigQuery.data.effective.model}`
+              : 'LLM not configured'}
+          </span>
         </div>
 
-        {document ? (
-          <>
-            <div className="panel">
-              <h2>Asset Ingest</h2>
-              <div className="stack gap">
-                <input value={assetPath} onChange={(event) => setAssetPath(event.target.value)} placeholder="Absolute path to a local video" />
-                 <button onClick={() => attachAsset.mutate()} disabled={!sessionToken || !assetPath || attachAsset.isPending}>Attach video</button>
+        <p className="muted status-copy">{statusText}</p>
+
+        <div className="messages">
+          {snapshot?.messages.length ? snapshot.messages.map((item) => (
+            <div key={item.id} className={`message ${item.role}`}>
+              <div className="message-meta">
+                <strong className={`message-role ${item.role}`}>{item.role}</strong>
+                <span className="muted">{new Date(item.createdAt).toLocaleTimeString()}</span>
               </div>
+              <p>{item.content}</p>
             </div>
-
-            <div className="panel grow">
-              <h2>Conversation</h2>
-              <div className="messages">
-                {snapshot?.messages.map((item) => (
-                  <div key={item.id} className={`message ${item.role}`}>
-                    <strong>{item.role}</strong>
-                    <p>{item.content}</p>
-                  </div>
-                ))}
-              </div>
-              <div className="stack gap">
-                <textarea value={message} onChange={(event) => setMessage(event.target.value)} rows={4} placeholder="Describe the cut you want." />
-                 <button onClick={() => sendChat.mutate()} disabled={!sessionToken || !message || sendChat.isPending}>Run agent</button>
-              </div>
+          )) : (
+            <div className="message-empty muted">
+              {projectId ? 'No conversation yet.' : 'Start the server with AXCUT_VIDEO_PATH set to a local video file.'}
             </div>
+          )}
+        </div>
 
-            <LiveRunPanel state={liveRun} />
-
-            <SuggestionList
-              suggestions={document.agent.suggestions}
-              lastReasoningSummary={document.agent.lastReasoningSummary}
-              busy={applyOperation.isPending}
-              onApprove={(suggestionId) => {
-                applyOperation.mutate({
-                  type: 'approve_suggestion',
-                  suggestionId,
-                  reason: 'Approved from the suggestions panel.',
-                });
-              }}
-              onReject={(suggestionId) => {
-                applyOperation.mutate({
-                  type: 'reject_suggestion',
-                  suggestionId,
-                  reason: 'Rejected from the suggestions panel.',
-                });
-              }}
-            />
-          </>
-        ) : null}
+        <div className="composer">
+          <textarea
+            value={message}
+            onChange={(event) => setMessage(event.target.value)}
+            rows={5}
+            placeholder="Describe the edit you want."
+          />
+          <button
+            onClick={() => sendChat.mutate()}
+            disabled={!projectId || !sessionToken || !llmConfigQuery.data?.ready || !message.trim() || sendChat.isPending}
+          >
+            Send
+          </button>
+        </div>
       </aside>
 
-      <main className="workspace">
+      <main className="workspace panel">
+        <div className="header-block">
+          <h2>{document?.project.title ?? 'Video Preview'}</h2>
+          <p className="muted">
+            {primaryAsset
+              ? `${primaryAsset.label}${primaryAsset.proxyPath ? ' · proxy ready' : ' · loading original source'}`
+              : 'Waiting for configured video source'}
+          </p>
+        </div>
+
         {document ? (
-          <>
-            <section className="panel preview-panel">
-              <div className="panel-header">
-                <div>
-                  <h2>{document.project.title}</h2>
-                  <p className="muted">Preview strategy: {document.preview.strategy} · Revision {document.preview.revision}</p>
-                </div>
-                 <button onClick={() => triggerExport.mutate()} disabled={!sessionToken || triggerExport.isPending || !document.timeline.clips.length}>Export</button>
-              </div>
-              <VirtualPreview
-                videoSrc={videoSrc}
-                clips={document.timeline.clips}
-                revision={document.preview.revision}
-              />
-            </section>
-
-            <section className="columns">
-              <TranscriptEditor
-                document={document}
-                busy={applyOperation.isPending}
-                onDropWordRange={(startWordId, endWordId) => {
-                  applyOperation.mutate({
-                    type: 'drop_word_range',
-                    startWordId,
-                    endWordId,
-                    reason: 'Removed from the transcript editor selection.',
-                  });
-                }}
-                onRestoreTimeline={() => {
-                  applyOperation.mutate({
-                    type: 'restore_full_timeline',
-                    reason: 'Restored from the transcript editor.',
-                  });
-                }}
-              />
-
-              <div className="panel">
-                <h2>Jobs</h2>
-                <div className="jobs">
-                  {snapshot?.jobs.map((job) => (
-                    <div key={job.id} className="job-item">
-                      <strong>{job.kind}</strong>
-                      <span>{job.status}</span>
-                      <progress value={job.progress} max={1} />
-                      <p>{job.message}</p>
-                    </div>
-                  ))}
-                </div>
-                {exportOutput ? <p className="muted">Last export: {exportOutput}</p> : null}
-              </div>
-            </section>
-          </>
+          <VirtualPreview
+            videoSrc={videoSrc}
+            clips={document.timeline.clips}
+            revision={document.preview.revision}
+          />
         ) : (
-          <section className="empty-state">
-            <h2>No project selected</h2>
-            <p>Create a project to start the new Axcut web workflow.</p>
-          </section>
+          <div className="video placeholder">No video configured.</div>
         )}
       </main>
     </div>

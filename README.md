@@ -38,12 +38,15 @@ npm install
 cp .env.example .env
 ```
 
-Minimal `.env`:
+Minimal `.env` if you want to preseed the runtime:
 
 ```bash
 OPENAI_API_KEY=sk-...
-AXCUT_EDIT_PROMPT="cut filler words, stutters, and dead air aggressively"
+AXCUT_AGENT_PROVIDER=openai
+AXCUT_AGENT_MODEL=gpt-5.4
 ```
+
+The web UI also exposes a provider-agnostic LLM setup panel, so `.env` is no longer the only configuration path.
 
 ## Running The Web App
 
@@ -61,12 +64,13 @@ Endpoints:
 ## Workflow
 
 1. Create a project in the web UI.
-2. Attach a local video by absolute path.
-3. Wait for probe, proxy generation, and optional transcription jobs.
-4. Use the chat panel to request a cut.
-5. Use the transcript editor to select word ranges and remove them manually.
-6. Preview the current cut with the virtual seek-based player.
-7. Export when the timeline is ready.
+2. Configure the LLM provider, model, API key, and optional base URL in the sidebar if the runtime is not ready yet.
+3. Attach a local video by absolute path.
+4. Wait for probe, proxy generation, and optional transcription jobs.
+5. Use the chat panel to request a cut.
+6. Use the transcript editor to select word ranges and remove them manually.
+7. Preview the current cut with the virtual seek-based player.
+8. Export when the timeline is ready.
 
 ## Commands
 

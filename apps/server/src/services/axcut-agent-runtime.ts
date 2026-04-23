@@ -3,6 +3,7 @@ import type { AxcutDocument } from '@axcut/schema';
 import { AxcutDeepAgentService } from './axcut-deep-agent.js';
 import type { DocumentService } from './document-service.js';
 import type { EventBus } from './event-bus.js';
+import type { LlmConfigService } from './llm-config-service.js';
 
 export type AgentRunResult = {
   summary: string;
@@ -17,8 +18,9 @@ export class AxcutAgentRuntime {
   constructor(
     private readonly documents: DocumentService,
     private readonly events: EventBus,
+    llmConfig: LlmConfigService,
   ) {
-    this.deepAgent = new AxcutDeepAgentService(documents, events);
+    this.deepAgent = new AxcutDeepAgentService(documents, events, llmConfig);
   }
 
   async run(projectId: string, prompt: string): Promise<AgentRunResult> {

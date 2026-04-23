@@ -1,17 +1,22 @@
-import { ChatOpenAI } from '@langchain/openai';
+import { createLangChainChatModel, normalizeProviderId, providerRequiresApiKey, resolveProviderRuntimeConfig } from '@yagr/provider-runtime';
 
-export function createAxcutChatModel() {
-  const apiKey = process.env.OPENAI_API_KEY?.trim();
-  if (!apiKey) {
-    throw new Error('OPENAI_API_KEY is required for the deepagents runtime.');
+import type { LlmConfigService } from '../services/llm-config-service.js';
+
+export function createAxcutChatModel(configService: LlmConfigService) {
+  const config = configService.getRuntimeConfig();
+  if (config.provider && !normalizeProviderId(config.provider)) {
+    throw new Error(`The selected Yagr provider ${config.provider} is not supported by Axcut yet. Choose one of: openai, anthropic, google, mistral, openrouter, openai-compatible.`);
+  }
+  const effective = resolveProviderRuntimeConfig(config);
+  if (providerRequiresApiKey(effective.provider) && !effective.apiKey) {
+    throw new Error(`An API key is required for provider ${effective.provider}. Run \`npm run llm:setup\` or \`yagr llm setup\`.`);
   }
 
-  return new ChatOpenAI({
-    apiKey,
-    model: process.env.AXCUT_AGENT_MODEL?.trim() || 'gpt-5.4',
+  return createLangChainChatModel({
+    provider: effective.provider,
+    model: effective.model,
+    apiKey: effective.apiKey,
+    baseUrl: effective.baseUrl,
     temperature: 0,
-    ...(process.env.OPENAI_BASE_URL?.trim()
-      ? { configuration: { baseURL: process.env.OPENAI_BASE_URL.trim() } }
-      : {}),
   });
 }

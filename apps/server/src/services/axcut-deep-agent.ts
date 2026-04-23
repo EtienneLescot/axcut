@@ -15,6 +15,7 @@ import { agentSessionsRoot, dataRoot } from '../lib/paths.js';
 import { createAxcutChatModel } from '../llm/create-chat-model.js';
 import type { DocumentService } from './document-service.js';
 import type { EventBus } from './event-bus.js';
+import type { LlmConfigService } from './llm-config-service.js';
 
 const searchTranscriptToolSchema = z.object({
   query: z.string().min(1).describe('Search query to locate transcript passages.'),
@@ -68,6 +69,7 @@ export class AxcutDeepAgentService {
   constructor(
     private readonly documents: DocumentService,
     private readonly events: EventBus,
+    private readonly llmConfig: LlmConfigService,
   ) {
     this.sessions.setCheckpointer(this.checkpointer);
   }
@@ -184,7 +186,7 @@ export class AxcutDeepAgentService {
     });
 
     return createDeepAgentRuntime({
-      model: createAxcutChatModel(),
+      model: createAxcutChatModel(this.llmConfig),
       checkpointer: this.checkpointer,
       tools: [
         getProjectState,

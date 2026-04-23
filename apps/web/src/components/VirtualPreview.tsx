@@ -14,6 +14,7 @@ export function VirtualPreview({ videoSrc, clips, revision }: VirtualPreviewProp
   const isProgrammaticSeekRef = useRef(false);
   const [virtualTimeSec, setVirtualTimeSec] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [loadState, setLoadState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
 
   const virtualDurationSec = useMemo(() => totalVirtualDuration(clips), [clips]);
   const activePosition = useMemo(() => locateVirtualPosition(clips, virtualTimeSec), [clips, virtualTimeSec]);
@@ -104,6 +105,7 @@ export function VirtualPreview({ videoSrc, clips, revision }: VirtualPreviewProp
     const video = videoRef.current;
     setIsPlaying(false);
     setVirtualTimeSec(0);
+    setLoadState(videoSrc ? 'loading' : 'idle');
     if (!video) {
       return;
     }
@@ -123,21 +125,43 @@ export function VirtualPreview({ videoSrc, clips, revision }: VirtualPreviewProp
       </p>
       {videoSrc ? (
         <>
-          <video
-            ref={videoRef}
-            src={videoSrc}
-            className="video"
-            preload="metadata"
-            onPause={() => setIsPlaying(false)}
-            onPlay={() => setIsPlaying(true)}
-            onTimeUpdate={handleTimeUpdate}
-          />
+          <div className="video-frame">
+            <video
+              key={videoSrc}
+              ref={videoRef}
+              src={videoSrc}
+              className="video"
+              preload="metadata"
+              playsInline
+              onLoadedMetadata={() => {
+                setLoadState('ready');
+                if (clips.length > 0) {
+                  seekToVirtualTime(virtualTimeSec);
+                }
+              }}
+              onWaiting={() => setLoadState('loading')}
+              onCanPlay={() => setLoadState('ready')}
+              onError={() => {
+                setLoadState('error');
+                setIsPlaying(false);
+              }}
+              onPause={() => setIsPlaying(false)}
+              onPlay={() => setIsPlaying(true)}
+              onEnded={() => setIsPlaying(false)}
+              onTimeUpdate={handleTimeUpdate}
+            />
+            {loadState !== 'ready' ? (
+              <div className="video-overlay muted">
+                {loadState === 'error' ? 'Video preview could not be loaded.' : 'Loading preview media...'}
+              </div>
+            ) : null}
+          </div>
 
           <div className="preview-controls">
-            <button onClick={handlePlayPause} disabled={clips.length === 0}>
+            <button onClick={handlePlayPause} disabled={clips.length === 0 || loadState !== 'ready'}>
               {isPlaying ? 'Pause' : 'Play'}
             </button>
-            <button onClick={() => seekToVirtualTime(0)} disabled={clips.length === 0}>Restart</button>
+            <button onClick={() => seekToVirtualTime(0)} disabled={clips.length === 0 || loadState !== 'ready'}>Restart</button>
             <div className="preview-readout">
               <strong>{formatSeconds(virtualTimeSec)}</strong>
               <span className="muted">/ {formatSeconds(virtualDurationSec)}</span>
@@ -153,14 +177,16 @@ export function VirtualPreview({ videoSrc, clips, revision }: VirtualPreviewProp
                 const nextValue = Number.parseFloat(event.target.value);
                 seekToVirtualTime(nextValue);
               }}
-              disabled={clips.length === 0}
+              disabled={clips.length === 0 || loadState !== 'ready'}
             />
           </div>
 
           <div className="preview-meta muted">
-            {activePosition
+            {loadState === 'error'
+              ? 'Preview request failed. Verify the source or proxy file exists and is streamable.'
+              : activePosition
               ? `Previewing clip ${activePosition.clipIndex + 1}/${clips.length} at source ${formatSeconds(activePosition.sourceTimeSec)}`
-              : 'No virtual timeline available yet.'}
+               : 'No virtual timeline available yet.'}
           </div>
 
           <div className="timeline interactive">
