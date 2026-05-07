@@ -16,6 +16,7 @@ export type ProjectRow = {
 export type MessageRow = {
   id: string;
   projectId: string;
+  sessionId: string | null;
   role: 'user' | 'assistant' | 'system';
   content: string;
   revisionId: string | null;
@@ -58,6 +59,7 @@ export class DatabaseService {
       CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL,
+        session_id TEXT,
         role TEXT NOT NULL,
         content TEXT NOT NULL,
         revision_id TEXT,
@@ -81,6 +83,13 @@ export class DatabaseService {
 
       CREATE INDEX IF NOT EXISTS idx_jobs_project_updated ON jobs(project_id, updated_at DESC);
     `);
+
+    const messageColumns = this.db.prepare(`PRAGMA table_info(messages)`).all() as Array<{ name: string }>;
+    if (!messageColumns.some((column) => column.name === 'session_id')) {
+      this.db.prepare(`ALTER TABLE messages ADD COLUMN session_id TEXT`).run();
+      this.db.prepare(`UPDATE messages SET session_id = project_id WHERE session_id IS NULL`).run();
+    }
+    this.db.prepare(`CREATE INDEX IF NOT EXISTS idx_messages_project_session_created ON messages(project_id, session_id, created_at)`).run();
   }
 
   listProjects(): ProjectRow[] {
@@ -109,18 +118,26 @@ export class DatabaseService {
     const row: MessageRow = {
       id: input.id ?? createId('msg'),
       projectId: input.projectId,
+      sessionId: input.sessionId ?? null,
       role: input.role,
       content: input.content,
       revisionId: input.revisionId ?? null,
       createdAt: input.createdAt ?? new Date().toISOString(),
     };
-    this.db.prepare(`INSERT INTO messages (id, project_id, role, content, revision_id, created_at) VALUES (@id, @projectId, @role, @content, @revisionId, @createdAt)`).run(row);
+    this.db.prepare(`INSERT INTO messages (id, project_id, session_id, role, content, revision_id, created_at) VALUES (@id, @projectId, @sessionId, @role, @content, @revisionId, @createdAt)`).run(row);
     return row;
   }
 
-  listMessages(projectId: string): MessageRow[] {
-    const rows = this.db.prepare(`SELECT id, project_id AS projectId, role, content, revision_id AS revisionId, created_at AS createdAt FROM messages WHERE project_id = ? ORDER BY created_at ASC`).all(projectId);
+  listMessages(projectId: string, sessionId?: string): MessageRow[] {
+    const rows = sessionId
+      ? this.db.prepare(`SELECT id, project_id AS projectId, session_id AS sessionId, role, content, revision_id AS revisionId, created_at AS createdAt FROM messages WHERE project_id = ? AND session_id = ? ORDER BY created_at ASC`).all(projectId, sessionId)
+      : this.db.prepare(`SELECT id, project_id AS projectId, session_id AS sessionId, role, content, revision_id AS revisionId, created_at AS createdAt FROM messages WHERE project_id = ? ORDER BY created_at ASC`).all(projectId);
     return rows as MessageRow[];
+  }
+
+  countMessagesBySession(projectId: string): Record<string, number> {
+    const rows = this.db.prepare(`SELECT COALESCE(session_id, project_id) AS sessionId, COUNT(*) AS messageCount FROM messages WHERE project_id = ? GROUP BY COALESCE(session_id, project_id)`).all(projectId) as Array<{ sessionId: string; messageCount: number }>;
+    return Object.fromEntries(rows.map((row) => [row.sessionId, row.messageCount]));
   }
 
   createJob(projectId: string, kind: string, payload: unknown): JobRow {

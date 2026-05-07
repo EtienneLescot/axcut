@@ -78,6 +78,30 @@ export async function createServer() {
   const agentRuntime = new AxcutAgentRuntime(documents, events, llmConfig);
   const chat = new ChatService(db, documents, agentRuntime, events);
 
+  const buildSessionSummary = (projectId: string, activeSessionId?: string) => {
+    const counts = db.countMessagesBySession(projectId);
+    return agentRuntime.listSessions(projectId).map((session) => ({
+      id: session.id,
+      title: session.title,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      closedAt: session.closedAt,
+      messageCount: counts[session.id] ?? 0,
+      active: session.id === activeSessionId,
+    }));
+  };
+
+  const buildProjectSnapshot = (projectId: string, requestedSessionId?: string) => {
+    const activeSession = requestedSessionId
+      ? agentRuntime.getSession(projectId, requestedSessionId)
+      : agentRuntime.getOrCreateSession(projectId);
+    return {
+      ...documents.getSnapshot(projectId, activeSession.id),
+      activeSessionId: activeSession.id,
+      sessions: buildSessionSummary(projectId, activeSession.id),
+    };
+  };
+
   await ensureConfiguredProject(documents, jobs, fastify.log);
 
   fastify.setErrorHandler((error, _request, reply) => {
@@ -107,6 +131,31 @@ export async function createServer() {
   fastify.get('/api/session', async () => ({ token: sessionToken }));
   fastify.get('/api/llm/config', async () => llmConfig.getSnapshot());
 
+  fastify.post('/api/llm/providers/:provider/connect', async (request) => {
+    const { provider } = request.params as { provider: string };
+    return llmConfig.connectProvider(provider, request.body as Record<string, unknown>);
+  });
+
+  fastify.post('/api/llm/providers/:provider/device/complete', async (request) => {
+    const { provider } = request.params as { provider: string };
+    return llmConfig.completeDeviceProvider(provider, request.body as Record<string, unknown>);
+  });
+
+  fastify.post('/api/llm/providers/:provider/select', async (request) => {
+    const { provider } = request.params as { provider: string };
+    return { snapshot: llmConfig.selectProvider(provider, request.body as Record<string, unknown>) };
+  });
+
+  fastify.delete('/api/llm/providers/:provider', async (request) => {
+    const { provider } = request.params as { provider: string };
+    return { snapshot: llmConfig.disconnectProvider(provider) };
+  });
+
+  fastify.get('/api/llm/providers/:provider/models', async (request) => {
+    const { provider } = request.params as { provider: string };
+    return llmConfig.listProviderModels(provider, request.query as { baseUrl?: string });
+  });
+
   fastify.get('/api/projects', async () => ({ projects: documents.listProjects() }));
 
   fastify.post('/api/projects', async (request, reply) => {
@@ -115,9 +164,68 @@ export async function createServer() {
     return { document };
   });
 
+  fastify.get('/api/projects/:projectId/sessions', async (request) => {
+    const { projectId } = request.params as { projectId: string };
+    const activeSession = agentRuntime.getOrCreateSession(projectId);
+    return {
+      activeSessionId: activeSession.id,
+      sessions: buildSessionSummary(projectId, activeSession.id),
+    };
+  });
+
+  fastify.post('/api/projects/:projectId/sessions', async (request, reply) => {
+    const { projectId } = request.params as { projectId: string };
+    const session = agentRuntime.createSession(projectId);
+    events.emit(projectId, 'agent.session.created', { sessionId: session.id });
+    reply.code(201);
+    return {
+      session,
+      snapshot: buildProjectSnapshot(projectId, session.id),
+    };
+  });
+
+  fastify.get('/api/projects/:projectId/sessions/:sessionId', async (request) => {
+    const { projectId, sessionId } = request.params as { projectId: string; sessionId: string };
+    const session = agentRuntime.getSession(projectId, sessionId);
+    return {
+      session,
+      messages: db.listMessages(projectId, session.id),
+    };
+  });
+
+  fastify.patch('/api/projects/:projectId/sessions/:sessionId', async (request) => {
+    const { projectId, sessionId } = request.params as { projectId: string; sessionId: string };
+    const title = typeof (request.body as { title?: unknown } | undefined)?.title === 'string'
+      ? (request.body as { title: string }).title
+      : '';
+    const session = agentRuntime.renameSession(projectId, sessionId, title);
+    events.emit(projectId, 'agent.session.updated', { sessionId: session.id });
+    return {
+      session,
+      sessions: buildSessionSummary(projectId, session.id),
+    };
+  });
+
+  fastify.delete('/api/projects/:projectId/sessions/:sessionId', async (request) => {
+    const { projectId, sessionId } = request.params as { projectId: string; sessionId: string };
+    await agentRuntime.deleteSession(projectId, sessionId);
+    const nextSessionId = agentRuntime.listSessions(projectId)[0]?.id;
+    const activeSession = nextSessionId
+      ? agentRuntime.getSession(projectId, nextSessionId)
+      : agentRuntime.getOrCreateSession(projectId);
+    events.emit(projectId, 'agent.session.deleted', { sessionId });
+    return {
+      activeSessionId: activeSession.id,
+      sessions: buildSessionSummary(projectId, activeSession.id),
+    };
+  });
+
   fastify.get('/api/projects/:projectId', async (request) => {
     const { projectId } = request.params as { projectId: string };
-    return documents.getSnapshot(projectId);
+    const sessionId = typeof (request.query as { sessionId?: unknown } | undefined)?.sessionId === 'string'
+      ? (request.query as { sessionId: string }).sessionId
+      : undefined;
+    return buildProjectSnapshot(projectId, sessionId);
   });
 
   fastify.get('/api/projects/:projectId/document', async (request) => {

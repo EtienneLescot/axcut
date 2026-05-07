@@ -15,6 +15,9 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present"
   },
+  "dependencies": {
+    "@yagr/provider-runtime": "^0.1.2"
+  },
   "devDependencies": {
     "concurrently": "^9.2.1",
     "tsx": "^4.20.6",

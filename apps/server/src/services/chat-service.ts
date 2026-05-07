@@ -13,26 +13,31 @@ export class ChatService {
     private readonly events: EventBus,
   ) {}
 
-  async run(projectId: string, input: unknown): Promise<{ assistantMessage: ReturnType<DatabaseService['insertMessage']>; document: ReturnType<DocumentService['getSnapshot']>['document'] }> {
+  async run(projectId: string, input: unknown): Promise<{ assistantMessage: ReturnType<DatabaseService['insertMessage']>; document: ReturnType<DocumentService['getSnapshot']>['document']; sessionId: string }> {
     const payload: ChatInput = chatInputSchema.parse(input);
-    const userMessage = this.db.insertMessage({ projectId, role: 'user', content: payload.message, revisionId: null });
-    this.events.emit(projectId, 'agent.message.user', { messageId: userMessage.id, content: userMessage.content });
-    const result = await this.runtime.run(projectId, payload.message);
+    const session = payload.sessionId
+      ? this.runtime.getSession(projectId, payload.sessionId)
+      : this.runtime.getOrCreateSession(projectId);
+    const userMessage = this.db.insertMessage({ projectId, sessionId: session.id, role: 'user', content: payload.message, revisionId: null });
+    this.events.emit(projectId, 'agent.message.user', { sessionId: session.id, messageId: userMessage.id, content: userMessage.content });
+    const result = await this.runtime.run(projectId, session.id, payload.message);
 
     const assistant = this.db.insertMessage({
       projectId,
+      sessionId: session.id,
       role: 'assistant',
       content: result.summary,
       revisionId: result.revisionId,
     });
     if (result.revisionId) {
-      this.events.emit(projectId, 'project.revision.created', { revisionId: result.revisionId });
+      this.events.emit(projectId, 'project.revision.created', { sessionId: session.id, revisionId: result.revisionId });
     }
-    this.events.emit(projectId, 'agent.message.assistant', { messageId: assistant.id, content: assistant.content });
+    this.events.emit(projectId, 'agent.message.assistant', { sessionId: session.id, messageId: assistant.id, content: assistant.content });
 
     return {
       assistantMessage: assistant,
       document: result.document,
+      sessionId: session.id,
     };
   }
 }

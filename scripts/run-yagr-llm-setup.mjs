@@ -3,21 +3,26 @@ import { stdin as input, stdout as output } from 'node:process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { YagrConfigService } from '../../yagr-axcut-primitives/src/config/yagr-config-service.js';
 import {
+  YagrConfigService,
   YAGR_SELECTABLE_MODEL_PROVIDERS,
+  beginCodexAuth,
+  beginGitHubCopilotAuth,
+  completeCodexAuth,
+  completeGitHubCopilotAuth,
+  ensureGitHubCopilotSession,
+  ensureOpenAiAccountSession,
+  fetchAvailableModels,
   getDefaultBaseUrlForProvider,
   getDefaultModelForProvider,
+  getOpenAiAccountSession,
   getProviderDisplayName,
   getProviderSetupHint,
   isOAuthAccountProvider,
+  prepareProviderRuntime,
   providerNeedsBaseUrlInput,
   providerRequiresApiKey,
-} from '../../yagr-axcut-primitives/src/llm/provider-registry.js';
-import { fetchAvailableModels } from '../../yagr-axcut-primitives/src/llm/provider-discovery.js';
-import { prepareProviderRuntime } from '../../yagr-axcut-primitives/src/llm/proxy-runtime.js';
-import { beginGitHubCopilotAuth, completeGitHubCopilotAuth, ensureGitHubCopilotSession } from '../../yagr-axcut-primitives/src/llm/copilot-account.js';
-import { beginCodexAuth, completeCodexAuth, ensureOpenAiAccountSession, getOpenAiAccountSession } from '../../yagr-axcut-primitives/src/llm/openai-account.js';
+} from '@yagr/provider-runtime';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 process.env.YAGR_LAUNCH_CWD ??= repoRoot;
@@ -98,8 +103,8 @@ async function runProviderAuth(rl, provider) {
     const challenge = await beginCodexAuth();
     print('Open this URL in your browser and sign in with your ChatGPT account:');
     print(challenge.authUrl);
-    await askText(rl, challenge.callbackServerStarted ? 'Press Enter after sign-in' : 'Paste the callback URL', '');
-    await completeCodexAuth();
+    const callbackUrl = await askText(rl, challenge.callbackServerStarted ? 'Press Enter after sign-in' : 'Paste the callback URL', '');
+    await completeCodexAuth(callbackUrl);
     const session = getOpenAiAccountSession();
     if (!session?.accessToken) {
       throw new Error('OpenAI OAuth completed but no session was stored.');

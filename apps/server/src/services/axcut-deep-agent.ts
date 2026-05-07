@@ -3,7 +3,7 @@ import path from 'node:path';
 import { MemorySaver } from '@langchain/langgraph';
 import { createDeepAgentRuntime } from '@yagr/deepagent-bootstrap';
 import type { RuntimeContextCompactionEvent, RuntimeOperationEvent } from '@yagr/runtime-events';
-import { SessionService } from '@yagr/session-service';
+import { SessionService, deriveSessionTitle, type DeepAgentSessionRecord } from '@yagr/session-service';
 import { consumeLangGraphStream } from '@yagr/stream-adapter';
 import { HumanMessage, tool } from 'langchain';
 import { z } from 'zod';
@@ -72,6 +72,45 @@ export class AxcutDeepAgentService {
     private readonly llmConfig: LlmConfigService,
   ) {
     this.sessions.setCheckpointer(this.checkpointer);
+  }
+
+  getOrCreateSession(projectId: string): DeepAgentSessionRecord {
+    const document = this.documents.readDocument(projectId);
+    const scope = this.projectScope(projectId);
+    return this.sessions.getActiveForScope(scope)
+      ?? this.sessions.ensure(projectId, { title: document.project.title || 'New conversation', scope });
+  }
+
+  createSession(projectId: string): DeepAgentSessionRecord {
+    return this.sessions.rotateForScope(this.projectScope(projectId), { title: 'New conversation' });
+  }
+
+  getSession(projectId: string, sessionId: string): DeepAgentSessionRecord {
+    const existing = this.sessions.get(sessionId);
+    if (existing?.scope && (existing.scope.kind !== 'axcut-project' || existing.scope.key !== projectId)) {
+      throw new Error(`Session ${sessionId} does not belong to project ${projectId}.`);
+    }
+    const session = this.sessions.ensure(sessionId, { title: 'New conversation', scope: this.projectScope(projectId) });
+    return session;
+  }
+
+  listSessions(projectId: string): DeepAgentSessionRecord[] {
+    const sessions = this.sessions.listForScope(this.projectScope(projectId));
+    return sessions.length ? sessions : [this.getOrCreateSession(projectId)];
+  }
+
+  renameSession(projectId: string, sessionId: string, title: string): DeepAgentSessionRecord {
+    this.getSession(projectId, sessionId);
+    const renamed = this.sessions.touch(sessionId, { title: title.trim() || 'New conversation' });
+    if (!renamed) {
+      throw new Error(`Unknown session ${sessionId}`);
+    }
+    return renamed;
+  }
+
+  async deleteSession(projectId: string, sessionId: string): Promise<void> {
+    this.getSession(projectId, sessionId);
+    await this.sessions.delete(sessionId);
   }
 
   async create(projectId: string) {
@@ -200,33 +239,38 @@ export class AxcutDeepAgentService {
     });
   }
 
-  async invoke(projectId: string, prompt: string) {
+  async invoke(projectId: string, sessionId: string, prompt: string) {
     const document = this.documents.readDocument(projectId);
-    this.sessions.ensure(projectId, { title: document.project.title || projectId });
-    await this.restoreLatestCheckpointIfNeeded(projectId);
+    this.getSession(projectId, sessionId);
+    await this.restoreLatestCheckpointIfNeeded(sessionId);
 
     const agent = await this.create(projectId);
     const stream = agent.streamEvents({
       messages: [new HumanMessage(prompt)],
-    }, this.sessions.buildSessionConfig(projectId));
+    }, this.sessions.buildSessionConfig(sessionId));
 
     const result = await consumeLangGraphStream(stream, {
       onTextDelta: async (delta: string) => {
-        this.events.emit(projectId, 'agent.message.delta', { delta });
+        this.events.emit(projectId, 'agent.message.delta', { sessionId, delta });
       },
       onThinkingDelta: async (delta: string) => {
-        this.events.emit(projectId, 'agent.thinking.delta', { delta });
+        this.events.emit(projectId, 'agent.thinking.delta', { sessionId, delta });
       },
       onOperation: async (operation: RuntimeOperationEvent) => {
-        this.events.emit(projectId, 'agent.operation', { operation });
+        this.events.emit(projectId, 'agent.operation', { sessionId, operation });
       },
       onCompaction: async (compaction: RuntimeContextCompactionEvent) => {
-        this.events.emit(projectId, 'agent.compaction', { compaction });
+        this.events.emit(projectId, 'agent.compaction', { sessionId, compaction });
       },
     });
 
-    await this.sessions.saveCheckpoint(projectId);
-    this.sessions.touch(projectId, { title: document.project.title || projectId });
+    await this.sessions.saveCheckpoint(sessionId);
+    const currentSession = this.sessions.get(sessionId);
+    this.sessions.touch(sessionId, {
+      title: currentSession?.title === 'New conversation'
+        ? deriveSessionTitle(prompt)
+        : currentSession?.title,
+    });
 
     return {
       text: result.responseText || this.documents.readDocument(projectId).agent.lastReasoningSummary || 'Completed the deepagents editing turn.',
@@ -234,18 +278,22 @@ export class AxcutDeepAgentService {
     };
   }
 
-  private async restoreLatestCheckpointIfNeeded(projectId: string): Promise<void> {
-    const existing = await this.checkpointer.getTuple(this.sessions.buildSessionConfig(projectId));
+  private async restoreLatestCheckpointIfNeeded(sessionId: string): Promise<void> {
+    const existing = await this.checkpointer.getTuple(this.sessions.buildSessionConfig(sessionId));
     if (existing) {
       return;
     }
 
-    const latest = this.sessions.listCheckpointsSync(projectId)[0];
+    const latest = this.sessions.listCheckpointsSync(sessionId)[0];
     if (!latest) {
       return;
     }
 
-    await this.sessions.restoreCheckpoint(projectId, latest.id);
+    await this.sessions.restoreCheckpoint(sessionId, latest.id);
+  }
+
+  private projectScope(projectId: string) {
+    return { kind: 'axcut-project', key: projectId };
   }
 }
 

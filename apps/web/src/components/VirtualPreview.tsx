@@ -7,9 +7,11 @@ type VirtualPreviewProps = {
   videoSrc: string | null;
   clips: AxcutClip[];
   revision: number;
+  seekTarget?: { timeSec: number; requestId: number } | null;
+  onTimeChange?: (timeSec: number) => void;
 };
 
-export function VirtualPreview({ videoSrc, clips, revision }: VirtualPreviewProps) {
+export function VirtualPreview({ videoSrc, clips, revision, seekTarget, onTimeChange }: VirtualPreviewProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const isProgrammaticSeekRef = useRef(false);
   const [virtualTimeSec, setVirtualTimeSec] = useState(0);
@@ -19,17 +21,22 @@ export function VirtualPreview({ videoSrc, clips, revision }: VirtualPreviewProp
   const virtualDurationSec = useMemo(() => totalVirtualDuration(clips), [clips]);
   const activePosition = useMemo(() => locateVirtualPosition(clips, virtualTimeSec), [clips, virtualTimeSec]);
 
+  const updateVirtualTime = useCallback((nextTimeSec: number) => {
+    setVirtualTimeSec(nextTimeSec);
+    onTimeChange?.(nextTimeSec);
+  }, [onTimeChange]);
+
   const seekToVirtualTime = useCallback((nextVirtualTimeSec: number, preservePlayback = false) => {
     const video = videoRef.current;
     const position = locateVirtualPosition(clips, nextVirtualTimeSec);
     if (!video || !position) {
-      setVirtualTimeSec(0);
+      updateVirtualTime(0);
       setIsPlaying(false);
       return;
     }
     const shouldContinuePlayback = preservePlayback && !video.paused;
     isProgrammaticSeekRef.current = true;
-    setVirtualTimeSec(position.virtualTimeSec);
+    updateVirtualTime(position.virtualTimeSec);
     if (Math.abs(video.currentTime - position.sourceTimeSec) > 0.01) {
       video.currentTime = position.sourceTimeSec;
     }
@@ -38,7 +45,7 @@ export function VirtualPreview({ videoSrc, clips, revision }: VirtualPreviewProp
         setIsPlaying(false);
       });
     }
-  }, [clips]);
+  }, [clips, updateVirtualTime]);
 
   const handlePlayPause = useCallback(() => {
     const video = videoRef.current;
@@ -55,7 +62,7 @@ export function VirtualPreview({ videoSrc, clips, revision }: VirtualPreviewProp
       return;
     }
     isProgrammaticSeekRef.current = true;
-    setVirtualTimeSec(position.virtualTimeSec);
+    updateVirtualTime(position.virtualTimeSec);
     if (Math.abs(video.currentTime - position.sourceTimeSec) > 0.01) {
       video.currentTime = position.sourceTimeSec;
     }
@@ -64,7 +71,7 @@ export function VirtualPreview({ videoSrc, clips, revision }: VirtualPreviewProp
     }).catch(() => {
       setIsPlaying(false);
     });
-  }, [clips, virtualTimeSec]);
+  }, [clips, updateVirtualTime, virtualTimeSec]);
 
   const handleTimeUpdate = useCallback(() => {
     const video = videoRef.current;
@@ -90,7 +97,7 @@ export function VirtualPreview({ videoSrc, clips, revision }: VirtualPreviewProp
       const nextClip = clips[position.clipIndex + 1];
       if (!nextClip) {
         video.pause();
-        setVirtualTimeSec(virtualDurationSec);
+        updateVirtualTime(virtualDurationSec);
         setIsPlaying(false);
         return;
       }
@@ -98,13 +105,13 @@ export function VirtualPreview({ videoSrc, clips, revision }: VirtualPreviewProp
       return;
     }
 
-    setVirtualTimeSec(clampVirtualTime(clips, position.virtualTimeSec));
-  }, [clips, seekToVirtualTime, virtualDurationSec]);
+    updateVirtualTime(clampVirtualTime(clips, position.virtualTimeSec));
+  }, [clips, seekToVirtualTime, updateVirtualTime, virtualDurationSec]);
 
   useEffect(() => {
     const video = videoRef.current;
     setIsPlaying(false);
-    setVirtualTimeSec(0);
+    updateVirtualTime(0);
     setLoadState(videoSrc ? 'loading' : 'idle');
     if (!video) {
       return;
@@ -116,7 +123,14 @@ export function VirtualPreview({ videoSrc, clips, revision }: VirtualPreviewProp
         video.currentTime = start.sourceTimeSec;
       }
     }
-  }, [clips, revision, videoSrc]);
+  }, [revision, updateVirtualTime, videoSrc]);
+
+  useEffect(() => {
+    if (!seekTarget) {
+      return;
+    }
+    seekToVirtualTime(seekTarget.timeSec);
+  }, [seekTarget, seekToVirtualTime]);
 
   return (
     <>
@@ -189,24 +203,6 @@ export function VirtualPreview({ videoSrc, clips, revision }: VirtualPreviewProp
                : 'No virtual timeline available yet.'}
           </div>
 
-          <div className="timeline interactive">
-            {clips.length > 0 ? clips.map((clip) => {
-              const total = Math.max(virtualDurationSec, 0.001);
-              const width = `${Math.max(4, ((clip.timelineEndSec - clip.timelineStartSec) / total) * 100)}%`;
-              const active = activePosition?.clip.id === clip.id;
-              return (
-                <button
-                  key={clip.id}
-                  className={active ? 'timeline-clip active' : 'timeline-clip'}
-                  style={{ width }}
-                  title={`${formatSeconds(clip.timelineStartSec)} → ${formatSeconds(clip.timelineEndSec)}`}
-                  onClick={() => seekToVirtualTime(clip.timelineStartSec)}
-                >
-                  {formatSeconds(clip.sourceStartSec)}-{formatSeconds(clip.sourceEndSec)}
-                </button>
-              );
-            }) : <div className="muted">No virtual clips yet.</div>}
-          </div>
         </>
       ) : <div className="video placeholder">Attach a video to start previewing.</div>}
     </>

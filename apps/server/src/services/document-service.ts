@@ -37,10 +37,10 @@ export class DocumentService {
     return document;
   }
 
-  getSnapshot(projectId: string): { document: AxcutDocument; messages: ReturnType<DatabaseService['listMessages']>; jobs: ReturnType<DatabaseService['listJobs']> } {
+  getSnapshot(projectId: string, sessionId?: string): { document: AxcutDocument; messages: ReturnType<DatabaseService['listMessages']>; jobs: ReturnType<DatabaseService['listJobs']> } {
     return {
       document: this.readDocument(projectId),
-      messages: this.db.listMessages(projectId),
+      messages: this.db.listMessages(projectId, sessionId),
       jobs: this.db.listJobs(projectId),
     };
   }

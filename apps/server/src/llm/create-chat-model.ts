@@ -1,4 +1,4 @@
-import { createLangChainModel } from '../lib/yagr-runtime.js';
+import { createLangChainModel } from '@yagr/provider-runtime';
 import type { LlmConfigService } from '../services/llm-config-service.js';
 
 export async function createAxcutChatModel(configService: LlmConfigService) {

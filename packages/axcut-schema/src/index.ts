@@ -204,6 +204,7 @@ export const addAssetInputSchema = z.object({
 });
 
 export const chatInputSchema = z.object({
+  sessionId: z.string().trim().min(1).optional(),
   message: z.string().trim().min(1),
 });
 
