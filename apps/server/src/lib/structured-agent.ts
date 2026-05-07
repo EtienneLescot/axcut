@@ -1,13 +1,12 @@
 import type {
   AxcutDocument,
   AxcutSuggestion,
-  AxcutTimelineOperation,
   AxcutTranscriptSegment,
   AxcutWord,
 } from '@axcut/schema';
 
 import { createId } from './ids.js';
-import { normalizeIntervals, primaryAssetDuration, subtractInterval, timelineIntervals } from './timeline.js';
+import { timelineIntervals } from './timeline.js';
 
 const fillerLexicon = new Set([
   'uh',
@@ -21,13 +20,7 @@ const fillerLexicon = new Set([
   'mm',
 ]);
 
-const restorePromptPattern = /\b(restore|reset|start over|start-over|undo all|full timeline|full video|show everything|keep everything)\b/i;
-const suggestionPromptPattern = /\b(suggest|proposal|propose|option|options|what can you cut|what should we cut)\b/i;
 const fillerPromptPattern = /\b(filler|hesitation|stutter|stutters|disfluenc|um|uh)\b/i;
-const pausePromptPattern = /\b(pause|pauses|silence|dead air|dead-air)\b/i;
-const nonSpeechPromptPattern = /\b(not speak|not speaking|don t speak|do not speak|no speech|non speech|without speech|ne parle pas|pas de parole|sans parole)\b/i;
-const cutPromptPattern = /\b(cut|remove|trim|delete|drop|supprimer|retirer|enlever|couper)\b/i;
-const searchPromptPattern = /\b(find|search|look for|where is|show me)\b/i;
 
 export type TranscriptSearchHit = {
   segmentId: string;
@@ -38,113 +31,6 @@ export type TranscriptSearchHit = {
   text: string;
   score: number;
 };
-
-export type RuntimeIntent =
-  | { kind: 'restore'; summary: string; operation: AxcutTimelineOperation }
-  | { kind: 'apply'; summary: string; intervals: Array<{ startSec: number; endSec: number }> }
-  | { kind: 'suggest'; summary: string; suggestions: AxcutSuggestion[] }
-  | { kind: 'message'; summary: string };
-
-export function interpretPrompt(document: AxcutDocument, prompt: string): RuntimeIntent | null {
-  const normalizedPrompt = prompt.trim();
-  const normalizedPromptText = normalizeText(normalizedPrompt);
-  if (!normalizedPrompt) {
-    return { kind: 'message', summary: 'Describe the cut you want to make.' };
-  }
-
-  if (restorePromptPattern.test(normalizedPromptText)) {
-    return {
-      kind: 'restore',
-      summary: 'Restored the full timeline from the source video.',
-      operation: {
-        type: 'restore_full_timeline',
-        reason: 'Reset the timeline to the full source video.',
-      },
-    };
-  }
-
-  const transcript = document.transcript;
-  if (!transcript) {
-    return null;
-  }
-
-  if (cutPromptPattern.test(normalizedPromptText) && nonSpeechPromptPattern.test(normalizedPromptText)) {
-    const intervals = buildSpeechIntervals(document);
-    if (intervals.length === 0) {
-      return { kind: 'message', summary: 'No spoken transcript segments are available to keep.' };
-    }
-    return {
-      kind: 'apply',
-      summary: `Removed non-speaking ranges and kept ${intervals.length} spoken segment${intervals.length === 1 ? '' : 's'}.`,
-      intervals,
-    };
-  }
-
-  const fillerSuggestions = fillerPromptPattern.test(normalizedPromptText)
-    ? buildFillerSuggestions(document)
-    : [];
-  const pauseSuggestions = pausePromptPattern.test(normalizedPromptText)
-    ? buildPauseSuggestions(document)
-    : [];
-  const combinedSuggestions = [...fillerSuggestions, ...pauseSuggestions].slice(0, 12);
-
-  if (combinedSuggestions.length > 0) {
-    if (suggestionPromptPattern.test(normalizedPromptText) || !cutPromptPattern.test(normalizedPromptText)) {
-      return {
-        kind: 'suggest',
-        summary: `Prepared ${combinedSuggestions.length} structured cut suggestion${combinedSuggestions.length === 1 ? '' : 's'} from the current transcript.`,
-        suggestions: combinedSuggestions,
-      };
-    }
-
-    return {
-      kind: 'apply',
-      summary: summarizeAppliedSuggestions(combinedSuggestions),
-      intervals: applySuggestionsToTimeline(document, combinedSuggestions),
-    };
-  }
-
-  if (searchPromptPattern.test(normalizedPromptText)) {
-    const hits = searchTranscript(document, normalizedPrompt, 5);
-    if (hits.length > 0) {
-      return {
-        kind: 'message',
-        summary: `Search hits: ${hits.map((hit) => `${formatRange(hit.startSec, hit.endSec)} ${hit.text}`).join(' | ')}`,
-      };
-    }
-  }
-
-  return null;
-}
-
-export function buildSpeechIntervals(document: AxcutDocument): Array<{ startSec: number; endSec: number }> {
-  const transcript = document.transcript;
-  if (!transcript) {
-    return [];
-  }
-
-  const duration = primaryAssetDuration(document);
-  const currentIntervals = timelineIntervals(document);
-  const baseIntervals = currentIntervals.length > 0
-    ? currentIntervals
-    : duration > 0 ? [{ startSec: 0, endSec: duration }] : [];
-  const speechSegments = transcript.segments
-    .filter((segment) => segment.kind === 'speech')
-    .filter((segment) => segment.endSec > segment.startSec);
-
-  const intersections: Array<{ startSec: number; endSec: number }> = [];
-  for (const segment of speechSegments) {
-    for (const interval of baseIntervals) {
-      const startSec = Math.max(segment.startSec, interval.startSec);
-      const endSec = Math.min(segment.endSec, interval.endSec);
-      if (endSec > startSec) {
-        intersections.push({ startSec, endSec });
-      }
-    }
-  }
-
-  return normalizeIntervals(duration, intersections);
-}
 
 export function searchTranscript(document: AxcutDocument, query: string, limit = 8): TranscriptSearchHit[] {
   const transcript = document.transcript;
@@ -222,64 +108,6 @@ export function buildPauseSuggestions(document: AxcutDocument, minDurationSec = 
     }));
 }
 
-export function applySuggestionsToTimeline(
-  document: AxcutDocument,
-  suggestions: AxcutSuggestion[],
-): Array<{ startSec: number; endSec: number }> {
-  const duration = document.assets.find((asset) => asset.id === document.project.primaryAssetId)?.durationSec
-    ?? document.assets[0]?.durationSec
-    ?? 0;
-  let intervals = timelineIntervals(document);
-  if (intervals.length === 0 && duration > 0) {
-    intervals = [{ startSec: 0, endSec: duration }];
-  }
-
-  for (const suggestion of suggestions) {
-    const operation = suggestion.proposedOperation;
-    if (!operation) {
-      continue;
-    }
-    if (operation.type === 'drop_range') {
-      intervals = subtractInterval(intervals, { startSec: operation.startSec, endSec: operation.endSec });
-      continue;
-    }
-    if (operation.type === 'drop_word_range') {
-      const wordRange = resolveWordRange(document.transcript?.words ?? [], operation.startWordId, operation.endWordId);
-      if (wordRange) {
-        intervals = subtractInterval(intervals, wordRange);
-      }
-      continue;
-    }
-  }
-
-  return normalizeIntervals(duration, intervals);
-}
-
-function summarizeAppliedSuggestions(suggestions: AxcutSuggestion[]): string {
-  const fillerCount = suggestions.filter((item) => item.proposedOperation?.type === 'drop_word_range').length;
-  const pauseCount = suggestions.filter((item) => item.proposedOperation?.type === 'drop_range').length;
-  const parts = [];
-  if (fillerCount > 0) {
-    parts.push(`removed ${fillerCount} filler cue${fillerCount === 1 ? '' : 's'}`);
-  }
-  if (pauseCount > 0) {
-    parts.push(`trimmed ${pauseCount} long pause${pauseCount === 1 ? '' : 's'}`);
-  }
-  return `Applied a structured transcript cut: ${parts.join(' and ')}.`;
-}
-
-function resolveWordRange(words: AxcutWord[], startWordId: string, endWordId: string): { startSec: number; endSec: number } | null {
-  const start = words.find((word) => word.id === startWordId);
-  const end = words.find((word) => word.id === endWordId);
-  if (!start || !end) {
-    return null;
-  }
-  return {
-    startSec: Math.min(start.startSec, end.startSec),
-    endSec: Math.max(start.endSec, end.endSec),
-  };
-}
-
 function overlapsCurrentTimeline(
   intervals: Array<{ startSec: number; endSec: number }>,
   startSec: number,
@@ -322,7 +150,7 @@ function tokenize(value: string): string[] {
 }
 
 function normalizeText(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 function normalizeToken(value: string): string {

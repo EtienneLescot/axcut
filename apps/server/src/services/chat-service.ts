@@ -20,7 +20,7 @@ export class ChatService {
       : this.runtime.getOrCreateSession(projectId);
     const userMessage = this.db.insertMessage({ projectId, sessionId: session.id, role: 'user', content: payload.message, revisionId: null });
     this.events.emit(projectId, 'agent.message.user', { sessionId: session.id, messageId: userMessage.id, content: userMessage.content });
-    const result = await this.runtime.run(projectId, session.id, payload.message);
+    const result = await this.runtime.run(projectId, session.id, payload.message, dbMessagesToAgentHistory(this.db.listMessages(projectId, session.id)));
 
     const assistant = this.db.insertMessage({
       projectId,
@@ -40,4 +40,14 @@ export class ChatService {
       sessionId: session.id,
     };
   }
+}
+
+function dbMessagesToAgentHistory(messages: ReturnType<DatabaseService['listMessages']>) {
+  return messages
+    .filter((message) => message.role === 'user' || message.role === 'assistant' || message.role === 'system')
+    .map((message) => ({
+      id: message.id,
+      role: message.role,
+      content: message.content,
+    }));
 }

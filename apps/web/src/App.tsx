@@ -130,8 +130,20 @@ function authHeaders(sessionToken: string): HeadersInit {
 }
 
 function artifactName(filePath?: string): string | null {
-  const name = filePath?.split('/').filter(Boolean).at(-1);
+  const name = filePath?.split(/[\\/]/).filter(Boolean).at(-1);
   return name || null;
+}
+
+function parseJobResult(job?: JobSummary | null): Record<string, unknown> | null {
+  if (!job?.resultJson) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(job.resultJson) as unknown;
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
 }
 
 function formatTimestamp(seconds: number): string {
@@ -185,6 +197,30 @@ function getSttStatus(document: AxcutDocument | undefined, jobs: JobSummary[] | 
   };
 }
 
+function getExportStatus(job: JobSummary | null, busy: boolean, error: unknown) {
+  if (busy) {
+    return { label: 'Export queued', detail: 'Starting render job.', progress: 0, tone: 'running' as const };
+  }
+  if (error) {
+    return { label: 'Export failed', detail: error instanceof Error ? error.message : String(error), progress: 1, tone: 'error' as const };
+  }
+  if (!job) {
+    return null;
+  }
+  if (job.status === 'completed') {
+    return { label: 'Export complete', detail: job.message || 'Rendered MP4 is ready.', progress: 1, tone: 'ready' as const };
+  }
+  if (job.status === 'failed') {
+    return { label: 'Export failed', detail: job.message, progress: job.progress, tone: 'error' as const };
+  }
+  return {
+    label: job.status === 'queued' ? 'Export queued' : 'Export running',
+    detail: job.message,
+    progress: Math.max(0, Math.min(1, job.progress)),
+    tone: 'running' as const,
+  };
+}
+
 function useProjectEvents(
   projectId: string | null,
   sessionToken: string | undefined,
@@ -197,6 +233,7 @@ function useProjectEvents(
     const source = new EventSource(`/api/projects/${projectId}/stream?token=${encodeURIComponent(sessionToken)}`);
     const eventNames = [
       'job.progress',
+      'job.queued',
       'job.completed',
       'job.failed',
       'project.asset.updated',
@@ -398,6 +435,22 @@ export function App() {
     },
   });
 
+  const exportVideo = useMutation({
+    mutationFn: async () => {
+      if (!projectId || !sessionToken) {
+        throw new Error('No active project.');
+      }
+      return requestJson<{ job: JobSummary }>(`/api/projects/${projectId}/export`, {
+        method: 'POST',
+        body: JSON.stringify({ preset: document?.export.preset ?? 'final-balanced' }),
+        headers: authHeaders(sessionToken),
+      });
+    },
+    onSuccess: () => {
+      invalidateProject();
+    },
+  });
+
   const snapshot = snapshotQuery.data;
   const document = snapshot?.document;
   const activeSession = snapshot?.sessions.find((session) => session.id === snapshot.activeSessionId) ?? snapshot?.sessions[0];
@@ -421,6 +474,14 @@ export function App() {
     ];
   }, [primaryAsset, projectId, sessionToken]);
   const latestJob = snapshot?.jobs[0] ?? null;
+  const latestExportJob = snapshot?.jobs.find((job) => job.kind === 'export') ?? null;
+  const exportJobResult = parseJobResult(latestExportJob);
+  const exportArtifactName = artifactName(typeof exportJobResult?.outputPath === 'string' ? exportJobResult.outputPath : undefined);
+  const exportHref = projectId && sessionToken && latestExportJob?.status === 'completed' && exportArtifactName
+    ? `/api/projects/${projectId}/artifacts/${encodeURIComponent(exportArtifactName)}?token=${encodeURIComponent(sessionToken)}`
+    : null;
+  const exportBusy = exportVideo.isPending || latestExportJob?.status === 'queued' || latestExportJob?.status === 'running';
+  const exportStatus = getExportStatus(latestExportJob, exportVideo.isPending, exportVideo.error);
   const statusText = !projectId
     ? 'No configured project. Set AXCUT_VIDEO_PATH before starting the server.'
     : latestJob
@@ -547,10 +608,14 @@ export function App() {
           <div className="preview-actions">
             <button className="secondary" onClick={() => setTranscriptModal('source')} disabled={!sourceTranscriptName}>Source transcript</button>
             <button className="secondary" onClick={() => setTranscriptModal('edited')} disabled={!document?.transcript}>Edited transcript</button>
+            <button onClick={() => exportVideo.mutate()} disabled={!document?.timeline.clips.length || !sessionToken || exportBusy}>
+              {exportBusy ? 'Exporting...' : 'Export'}
+            </button>
           </div>
         </div>
 
         <SttStatusBar status={sttStatus} />
+        {exportStatus ? <ExportStatusBar status={exportStatus} href={exportHref} /> : null}
 
         {document ? (
           <VirtualPreview
@@ -631,6 +696,23 @@ function SttStatusBar({ status }: { status: ReturnType<typeof getSttStatus> }) {
       <div className="stt-status-copy">
         <strong>{status.label}</strong>
         <span className="muted">{status.detail}</span>
+      </div>
+      <div className="stt-progress" aria-label={`${status.label}: ${Math.round(status.progress * 100)}%`}>
+        <div style={{ width: `${Math.round(status.progress * 100)}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function ExportStatusBar({ status, href }: { status: NonNullable<ReturnType<typeof getExportStatus>>; href: string | null }) {
+  return (
+    <div className={`export-status ${status.tone}`}>
+      <div className="export-status-copy">
+        <div>
+          <strong>{status.label}</strong>
+          <span className="muted">{status.detail}</span>
+        </div>
+        {href ? <a className="export-download" href={href} download>Download MP4</a> : null}
       </div>
       <div className="stt-progress" aria-label={`${status.label}: ${Math.round(status.progress * 100)}%`}>
         <div style={{ width: `${Math.round(status.progress * 100)}%` }} />

@@ -2,63 +2,77 @@ import path from 'node:path';
 
 import { MemorySaver } from '@langchain/langgraph';
 import { SessionService, deriveSessionTitle, type DeepAgentSessionRecord } from '@yagr/session-service';
-import { AIMessage, HumanMessage, createAgent, tool } from 'langchain';
+import { AIMessage, HumanMessage, SystemMessage, createAgent, tool } from 'langchain';
 import { z } from 'zod';
 
-import type { AxcutOperation, AxcutSuggestion } from '@axcut/schema';
+import type { AxcutDocument, AxcutOperation, AxcutSuggestion } from '@axcut/schema';
 
 import { buildFillerSuggestions, buildPauseSuggestions, searchTranscript } from '../lib/structured-agent.js';
+import { normalizeIntervals, timelineIntervals } from '../lib/timeline.js';
 import { agentSessionsRoot, dataRoot } from '../lib/paths.js';
 import { createAxcutChatModel } from '../llm/create-chat-model.js';
 import type { DocumentService } from './document-service.js';
 import type { EventBus } from './event-bus.js';
 import type { LlmConfigService } from './llm-config-service.js';
 
+export type AgentConversationMessage = {
+  id?: string;
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+};
+
+const nullableString = z.string().nullable().default(null);
+
 const searchTranscriptToolSchema = z.object({
   query: z.string().min(1).describe('Search query to locate transcript passages.'),
-  limit: z.number().int().positive().max(12).optional().default(8),
+  limit: z.number().int().positive().max(12).nullable().default(null),
 }).strict();
 
 const suggestCutsToolSchema = z.object({
   kind: z.enum(['filler', 'pause']).describe('Suggestion category to generate.'),
-  minDurationSec: z.number().positive().max(5).optional().default(0.6),
-  limit: z.number().int().positive().max(12).optional().default(6),
+  minDurationSec: z.number().positive().max(5).nullable().default(null),
+  limit: z.number().int().positive().max(12).nullable().default(null),
 }).strict();
 
 const timelineOperationToolSchema = z.object({
   type: z.enum(['replace_timeline', 'drop_range', 'drop_word_range', 'restore_full_timeline']),
-  reason: z.string().default(''),
-  intervalsJson: z.string().default('[]').describe('For replace_timeline only: JSON array like [{"startSec":0,"endSec":12.5}] or [[0,12.5]].'),
-  startSec: z.number().nonnegative().default(0).describe('For drop_range only.'),
-  endSec: z.number().nonnegative().default(0).describe('For drop_range only.'),
-  startWordId: z.string().default('').describe('For drop_word_range only.'),
-  endWordId: z.string().default('').describe('For drop_word_range only.'),
+  reason: nullableString,
+  intervalsJson: nullableString.describe('For replace_timeline only: JSON array like [{"startSec":0,"endSec":12.5}] or [[0,12.5]].'),
+  startSec: z.number().nonnegative().nullable().default(null).describe('For drop_range only.'),
+  endSec: z.number().nonnegative().nullable().default(null).describe('For drop_range only.'),
+  startWordId: nullableString.describe('For drop_word_range only.'),
+  endWordId: nullableString.describe('For drop_word_range only.'),
 }).strict();
 
 const suggestionDecisionToolSchema = z.object({
   suggestionId: z.string().min(1),
-  reason: z.string().default(''),
+  reason: nullableString,
 }).strict();
 
 type TimelineOperationToolInput = z.infer<typeof timelineOperationToolSchema>;
 
+function withDefault<T>(value: T | null | undefined, defaultValue: T): T {
+  return value ?? defaultValue;
+}
+
 function buildTimelineOperationFromToolInput(input: TimelineOperationToolInput): AxcutOperation {
+  const reason = withDefault(input.reason, '');
   switch (input.type) {
     case 'replace_timeline':
       return {
         type: 'replace_timeline',
-        reason: input.reason,
-        intervals: parseIntervalsJson(input.intervalsJson),
+        reason,
+        intervals: parseIntervalsJson(withDefault(input.intervalsJson, '[]')),
       };
     case 'drop_range':
-      if (input.endSec <= input.startSec) {
+      if (withDefault(input.endSec, 0) <= withDefault(input.startSec, 0)) {
         throw new Error('drop_range requires endSec to be greater than startSec.');
       }
       return {
         type: 'drop_range',
-        reason: input.reason,
-        startSec: input.startSec,
-        endSec: input.endSec,
+        reason,
+        startSec: withDefault(input.startSec, 0),
+        endSec: withDefault(input.endSec, 0),
       };
     case 'drop_word_range':
       if (!input.startWordId || !input.endWordId) {
@@ -66,14 +80,14 @@ function buildTimelineOperationFromToolInput(input: TimelineOperationToolInput):
       }
       return {
         type: 'drop_word_range',
-        reason: input.reason,
+        reason,
         startWordId: input.startWordId,
         endWordId: input.endWordId,
       };
     case 'restore_full_timeline':
       return {
         type: 'restore_full_timeline',
-        reason: input.reason,
+        reason,
       };
   }
 }
@@ -142,6 +156,130 @@ function stringifyMessageContent(content: unknown): string {
   return '';
 }
 
+export function buildAgentInputMessages(prompt: string, history: AgentConversationMessage[] = [], invocationPrompt = prompt) {
+  const messages = history
+    .filter((message) => message.content.trim())
+    .map((message) => {
+      const isCurrentUserMessage = message.role === 'user' && message.content === prompt;
+      const fields = { content: isCurrentUserMessage ? invocationPrompt : message.content, id: message.id };
+      if (message.role === 'assistant') {
+        return new AIMessage(fields);
+      }
+      if (message.role === 'system') {
+        return new SystemMessage(fields);
+      }
+      return new HumanMessage(fields);
+    });
+
+  const lastUserMessage = [...history].reverse().find((message) => message.role === 'user');
+  if (!lastUserMessage || lastUserMessage.content !== prompt) {
+    messages.push(new HumanMessage(invocationPrompt));
+  }
+
+  return messages.length > 0 ? messages : [new HumanMessage(invocationPrompt)];
+}
+
+export function buildAxcutInvocationPrompt(document: AxcutDocument, prompt: string): string {
+  const speechKeepIntervals = buildSpeechKeepIntervals(document);
+  const firstSpeechRange = findFirstCurrentSpeechRange(document);
+  const transcriptSegments = document.transcript?.segments.slice(0, 240).map((segment) => ({
+    id: segment.id,
+    kind: segment.kind,
+    startSec: segment.startSec,
+    endSec: segment.endSec,
+    text: segment.text,
+  })) ?? [];
+  const transcriptTruncated = (document.transcript?.segments.length ?? 0) > transcriptSegments.length;
+  const context = {
+    project: document.project,
+    assets: document.assets.map((asset) => ({
+      id: asset.id,
+      label: asset.label,
+      durationSec: asset.durationSec ?? 0,
+      hasProxy: Boolean(asset.proxyPath),
+    })),
+    timeline: document.timeline.clips.map((clip) => ({
+      id: clip.id,
+      sourceStartSec: clip.sourceStartSec,
+      sourceEndSec: clip.sourceEndSec,
+      timelineStartSec: clip.timelineStartSec,
+      timelineEndSec: clip.timelineEndSec,
+      reason: clip.reason,
+    })),
+    transcript: document.transcript
+      ? {
+          language: document.transcript.language,
+          segmentCount: document.transcript.segments.length,
+          wordCount: document.transcript.words.length,
+          truncated: transcriptTruncated,
+          segments: transcriptSegments,
+        }
+      : null,
+    suggestions: document.agent.suggestions,
+    operationHints: {
+      speechKeepIntervalsForNonSpeakingRemoval: speechKeepIntervals,
+      firstCurrentSpeechRange: firstSpeechRange,
+    },
+  };
+
+  return [
+    'Axcut project context for this turn:',
+    JSON.stringify(context),
+    '',
+    'Operation guidance:',
+    '- The LLM must decide whether an edit is appropriate. Do not edit unless the user requested it.',
+    '- For removing non-speaking/silence ranges, call apply_timeline_operation with type "replace_timeline" and intervalsJson set to operationHints.speechKeepIntervalsForNonSpeakingRemoval.',
+    '- For removing the first phrase/first spoken segment, call apply_timeline_operation with type "drop_range" using operationHints.firstCurrentSpeechRange.',
+    '- If the requested edit is not covered by operationHints, derive the minimal operation from the timeline/transcript context or use search_transcript first.',
+    '',
+    'User request:',
+    prompt,
+  ].join('\n');
+}
+
+function buildSpeechKeepIntervals(document: AxcutDocument): Array<{ startSec: number; endSec: number }> {
+  const transcript = document.transcript;
+  if (!transcript) {
+    return [];
+  }
+  const currentIntervals = timelineIntervals(document);
+  const speechSegments = transcript.segments.filter((segment) => segment.kind === 'speech' && segment.endSec > segment.startSec);
+  const intersections: Array<{ startSec: number; endSec: number }> = [];
+  for (const segment of speechSegments) {
+    for (const interval of currentIntervals) {
+      const startSec = Math.max(segment.startSec, interval.startSec);
+      const endSec = Math.min(segment.endSec, interval.endSec);
+      if (endSec > startSec) {
+        intersections.push({ startSec, endSec });
+      }
+    }
+  }
+  return normalizeIntervals(primaryDuration(document), intersections);
+}
+
+function findFirstCurrentSpeechRange(document: AxcutDocument): { startSec: number; endSec: number } | null {
+  const transcript = document.transcript;
+  if (!transcript) {
+    return null;
+  }
+  const currentIntervals = timelineIntervals(document);
+  for (const segment of [...transcript.segments].filter((item) => item.kind === 'speech').sort((left, right) => left.startSec - right.startSec)) {
+    for (const interval of currentIntervals) {
+      const startSec = Math.max(segment.startSec, interval.startSec);
+      const endSec = Math.min(segment.endSec, interval.endSec);
+      if (endSec > startSec) {
+        return { startSec, endSec };
+      }
+    }
+  }
+  return null;
+}
+
+function primaryDuration(document: AxcutDocument): number {
+  const asset = document.assets.find((item) => item.id === document.project.primaryAssetId) ?? document.assets[0];
+  return asset?.durationSec ?? 0;
+}
+
 export class AxcutDeepAgentService {
   private readonly checkpointer = new MemorySaver();
   private readonly sessions = new SessionService({
@@ -199,42 +337,9 @@ export class AxcutDeepAgentService {
   async create(projectId: string) {
     const getProject = () => this.documents.readDocument(projectId);
 
-    const getProjectState = tool(async () => {
-      const document = getProject();
-      return {
-        project: document.project,
-        assets: document.assets.map((asset) => ({
-          id: asset.id,
-          label: asset.label,
-          durationSec: asset.durationSec ?? 0,
-          hasProxy: Boolean(asset.proxyPath),
-        })),
-        timeline: document.timeline.clips.map((clip) => ({
-          id: clip.id,
-          sourceStartSec: clip.sourceStartSec,
-          sourceEndSec: clip.sourceEndSec,
-          timelineStartSec: clip.timelineStartSec,
-          timelineEndSec: clip.timelineEndSec,
-          reason: clip.reason,
-        })),
-        transcriptSummary: document.transcript
-          ? {
-              language: document.transcript.language,
-              segmentCount: document.transcript.segments.length,
-              wordCount: document.transcript.words.length,
-            }
-          : null,
-        suggestions: document.agent.suggestions,
-      };
-    }, {
-      name: 'get_project_state',
-      description: 'Read the current Axcut project state, timeline, transcript metadata, and existing suggestions.',
-      schema: z.object({}).strict(),
-    });
-
     const transcriptSearch = tool(async ({ query, limit }) => {
       const document = getProject();
-      return searchTranscript(document, query, limit);
+      return searchTranscript(document, query, withDefault(limit, 8));
     }, {
       name: 'search_transcript',
       description: 'Search the transcript for passages relevant to the user request.',
@@ -245,8 +350,8 @@ export class AxcutDeepAgentService {
       const document = getProject();
       const suggestions = (kind === 'filler'
         ? buildFillerSuggestions(document)
-        : buildPauseSuggestions(document, minDurationSec))
-        .slice(0, limit);
+        : buildPauseSuggestions(document, withDefault(minDurationSec, 0.6)))
+        .slice(0, withDefault(limit, 6));
       this.documents.setSuggestions(projectId, suggestions, `Prepared ${suggestions.length} ${kind} suggestion${suggestions.length === 1 ? '' : 's'}.`);
       return {
         count: suggestions.length,
@@ -280,7 +385,7 @@ export class AxcutDeepAgentService {
       const result = this.documents.applyOperation(projectId, {
         type: 'approve_suggestion',
         suggestionId,
-        reason,
+        reason: withDefault(reason, ''),
       }, reason || 'Approved a suggested cut.', 'agent');
       return {
         revisionId: result.revisionId,
@@ -296,7 +401,7 @@ export class AxcutDeepAgentService {
       const result = this.documents.applyOperation(projectId, {
         type: 'reject_suggestion',
         suggestionId,
-        reason,
+        reason: withDefault(reason, ''),
       }, reason || 'Rejected a suggested cut.', 'agent');
       return {
         revisionId: result.revisionId,
@@ -312,7 +417,6 @@ export class AxcutDeepAgentService {
       model: await createAxcutChatModel(this.llmConfig),
       checkpointer: this.checkpointer,
       tools: [
-        getProjectState,
         transcriptSearch,
         suggestCuts,
         applyTimelineOperation,
@@ -323,14 +427,14 @@ export class AxcutDeepAgentService {
     });
   }
 
-  async invoke(projectId: string, sessionId: string, prompt: string) {
-    const document = this.documents.readDocument(projectId);
+  async invoke(projectId: string, sessionId: string, prompt: string, history: AgentConversationMessage[] = []) {
     this.getSession(projectId, sessionId);
-    await this.restoreLatestCheckpointIfNeeded(sessionId);
+    const hasCheckpoint = await this.restoreLatestCheckpointIfNeeded(sessionId);
+    const invocationPrompt = buildAxcutInvocationPrompt(this.documents.readDocument(projectId), prompt);
 
     const agent = await this.create(projectId);
     const result = await agent.invoke({
-      messages: [new HumanMessage(prompt)],
+      messages: hasCheckpoint ? [new HumanMessage(invocationPrompt)] : buildAgentInputMessages(prompt, history, invocationPrompt),
     }, this.sessions.buildSessionConfig(sessionId));
 
     await this.sessions.saveCheckpoint(sessionId);
@@ -347,18 +451,19 @@ export class AxcutDeepAgentService {
     };
   }
 
-  private async restoreLatestCheckpointIfNeeded(sessionId: string): Promise<void> {
+  private async restoreLatestCheckpointIfNeeded(sessionId: string): Promise<boolean> {
     const existing = await this.checkpointer.getTuple(this.sessions.buildSessionConfig(sessionId));
     if (existing) {
-      return;
+      return true;
     }
 
     const latest = this.sessions.listCheckpointsSync(sessionId)[0];
     if (!latest) {
-      return;
+      return false;
     }
 
     await this.sessions.restoreCheckpoint(sessionId, latest.id);
+    return true;
   }
 
   private projectScope(projectId: string) {
@@ -371,8 +476,10 @@ const AXCUT_DEEP_AGENT_PROMPT = `You are Axcut, an expert agentic video editor.
 Your job is to edit a local video project through structured tools rather than by rewriting large files directly.
 
 Rules:
-- Always inspect project state before making large editing decisions.
-- Prefer transcript search before making assumptions about the user's target passage.
+- The current project state, timeline, transcript segments, and suggestions are included in each user turn as Axcut project context.
+- For direct editing requests, decide from that context and call an editing tool. Do not ask the user to restate information already present in the context.
+- Prefer a single editing tool call when the context is sufficient, especially with Codex OAuth providers.
+- Use transcript search only when the provided context is insufficient for locating a passage.
 - When the user explicitly asks for options, suggestions, or proposals, use suggest_cuts and do not apply edits immediately.
 - When the user gives a direct editing command with clear intent, apply the minimal structured operation needed.
 - Use approve_suggestion or reject_suggestion when interacting with existing suggestions.

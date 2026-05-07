@@ -316,7 +316,8 @@ code {
   margin: 0;
 }
 
-.stt-status {
+.stt-status,
+.export-status {
   display: grid;
   gap: 0.55rem;
   padding: 0.75rem 0.85rem;
@@ -325,10 +326,31 @@ code {
   border: 1px solid #263247;
 }
 
-.stt-status-copy {
+.stt-status-copy,
+.export-status-copy {
   display: flex;
   justify-content: space-between;
   gap: 0.75rem;
+}
+
+.export-status-copy {
+  align-items: center;
+}
+
+.export-status-copy > div {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.export-download {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #0f2e25;
+  border: 1px solid #166534;
+  color: #d1fae5;
+  padding: 0.45rem 0.7rem;
+  text-decoration: none;
+  font-size: 0.85rem;
 }
 
 .stt-progress {
@@ -347,11 +369,13 @@ code {
   transition: width 180ms ease;
 }
 
-.stt-status.ready .stt-progress div {
+.stt-status.ready .stt-progress div,
+.export-status.ready .stt-progress div {
   background: linear-gradient(90deg, #059669, #34d399);
 }
 
-.stt-status.error .stt-progress div {
+.stt-status.error .stt-progress div,
+.export-status.error .stt-progress div {
   background: linear-gradient(90deg, #be123c, #fb7185);
 }
 
@@ -681,7 +705,8 @@ code {
   .modal-header,
   .timeline-header,
   .message-meta,
-  .stt-status-copy {
+  .stt-status-copy,
+  .export-status-copy {
     flex-direction: column;
     align-items: flex-start;
   }
