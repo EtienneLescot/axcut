@@ -1,6 +1,7 @@
 import type { AxcutDocument } from '@axcut/schema';
 import type { DeepAgentSessionRecord } from '@yagr/session-service';
 
+import { interpretPrompt, type RuntimeIntent } from '../lib/structured-agent.js';
 import { AxcutDeepAgentService } from './axcut-deep-agent.js';
 import type { DocumentService } from './document-service.js';
 import type { EventBus } from './event-bus.js';
@@ -59,6 +60,15 @@ export class AxcutAgentRuntime {
       };
     }
 
+    const structuredIntent = interpretPrompt(snapshot, prompt);
+    if (structuredIntent) {
+      this.events.emit(projectId, 'agent.phase', {
+        phase: 'structured',
+        message: 'Applying a structured transcript edit',
+      });
+      return this.runStructuredIntent(projectId, snapshot, structuredIntent);
+    }
+
     this.events.emit(projectId, 'agent.phase', {
       phase: 'deepagents',
       message: 'Running the deepagents editing loop',
@@ -76,5 +86,44 @@ export class AxcutAgentRuntime {
       revisionId,
       mode: 'deepagents',
     };
+  }
+
+  private runStructuredIntent(projectId: string, snapshot: AxcutDocument, intent: RuntimeIntent): AgentRunResult {
+    switch (intent.kind) {
+      case 'restore': {
+        const result = this.documents.applyOperation(projectId, intent.operation, intent.summary, 'agent');
+        return {
+          summary: intent.summary,
+          document: result.document,
+          revisionId: result.revisionId,
+          mode: 'message',
+        };
+      }
+      case 'apply': {
+        const result = this.documents.replaceTimeline(projectId, intent.intervals, intent.summary, 'agent');
+        return {
+          summary: intent.summary,
+          document: result.document,
+          revisionId: result.revisionId,
+          mode: 'message',
+        };
+      }
+      case 'suggest': {
+        const document = this.documents.setSuggestions(projectId, intent.suggestions, intent.summary);
+        return {
+          summary: intent.summary,
+          document,
+          revisionId: null,
+          mode: 'message',
+        };
+      }
+      case 'message':
+        return {
+          summary: intent.summary,
+          document: snapshot,
+          revisionId: null,
+          mode: 'message',
+        };
+    }
   }
 }

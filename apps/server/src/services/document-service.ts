@@ -38,8 +38,13 @@ export class DocumentService {
   }
 
   getSnapshot(projectId: string, sessionId?: string): { document: AxcutDocument; messages: ReturnType<DatabaseService['listMessages']>; jobs: ReturnType<DatabaseService['listJobs']> } {
+    let document = this.readDocument(projectId);
+    const asset = document.assets.find((item) => item.id === document.project.primaryAssetId) ?? document.assets[0];
+    if (asset?.durationSec && document.timeline.clips.length === 0) {
+      document = this.ensureFullTimelineForAsset(projectId, asset.id, 'Initial full-length timeline from media metadata');
+    }
     return {
-      document: this.readDocument(projectId),
+      document,
       messages: this.db.listMessages(projectId, sessionId),
       jobs: this.db.listJobs(projectId),
     };
@@ -77,6 +82,34 @@ export class DocumentService {
       ...current,
       assets: current.assets.map((asset) => (asset.id === assetId ? { ...asset, ...patch } : asset)),
     }));
+  }
+
+  ensureFullTimelineForAsset(projectId: string, assetId: string, summary: string): AxcutDocument {
+    return this.mutateDocument(projectId, summary, (current) => {
+      if (current.timeline.clips.length > 0) {
+        return current;
+      }
+      const asset = current.assets.find((item) => item.id === assetId);
+      if (!asset?.durationSec) {
+        return current;
+      }
+      return {
+        ...current,
+        timeline: {
+          ...current.timeline,
+          clips: buildTimelineFromIntervals(assetId, [{ startSec: 0, endSec: asset.durationSec }], {
+            origin: 'system',
+            reason: summary,
+            transcript: current.transcript,
+          }),
+          gaps: [],
+        },
+        preview: {
+          ...current.preview,
+          revision: current.preview.revision + 1,
+        },
+      };
+    });
   }
 
   updateTranscript(projectId: string, transcript: AxcutTranscript, summary: string): AxcutDocument {

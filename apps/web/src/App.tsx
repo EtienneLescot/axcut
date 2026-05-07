@@ -32,9 +32,23 @@ type SessionSummary = {
 type ProjectSnapshot = {
   document: AxcutDocument;
   messages: Message[];
-  jobs: Array<{ id: string; kind: string; status: string; progress: number; message: string; resultJson: string | null }>;
+  jobs: JobSummary[];
   activeSessionId: string;
   sessions: SessionSummary[];
+};
+
+type JobSummary = {
+  id: string;
+  kind: string;
+  status: string;
+  progress: number;
+  message: string;
+  resultJson: string | null;
+};
+
+type VideoSource = {
+  src: string;
+  label: string;
 };
 
 type SessionPayload = {
@@ -94,8 +108,8 @@ async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T
     headers.set('Content-Type', 'application/json');
   }
   const response = await fetch(input, {
-    headers,
     ...init,
+    headers,
   });
   if (!response.ok) {
     throw new Error(await response.text());
@@ -103,8 +117,72 @@ async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T
   return response.json() as Promise<T>;
 }
 
+async function requestText(input: RequestInfo, init?: RequestInit): Promise<string> {
+  const response = await fetch(input, init);
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  return response.text();
+}
+
 function authHeaders(sessionToken: string): HeadersInit {
   return { 'X-Axcut-Token': sessionToken };
+}
+
+function artifactName(filePath?: string): string | null {
+  const name = filePath?.split('/').filter(Boolean).at(-1);
+  return name || null;
+}
+
+function formatTimestamp(seconds: number): string {
+  const safe = Math.max(0, seconds);
+  const minutes = Math.floor(safe / 60);
+  const wholeSeconds = Math.floor(safe % 60);
+  const tenths = Math.floor((safe % 1) * 10);
+  return `${minutes}:${String(wholeSeconds).padStart(2, '0')}.${tenths}`;
+}
+
+function buildEditedTranscript(document: AxcutDocument): string {
+  const transcript = document.transcript;
+  if (!transcript) {
+    return 'No transcript is available yet.';
+  }
+  if (document.timeline.clips.length === 0) {
+    return 'No edited timeline is available yet.';
+  }
+
+  const lines: string[] = [];
+  for (const [index, clip] of document.timeline.clips.entries()) {
+    const words = transcript.words.filter((word) => word.endSec > clip.sourceStartSec && word.startSec < clip.sourceEndSec);
+    const text = words.map((word) => word.text).join(' ').replace(/\s+/g, ' ').trim();
+    lines.push(`# Clip ${index + 1}: source ${formatTimestamp(clip.sourceStartSec)}-${formatTimestamp(clip.sourceEndSec)} -> timeline ${formatTimestamp(clip.timelineStartSec)}-${formatTimestamp(clip.timelineEndSec)}`);
+    lines.push(text || '[No spoken words in this clip]');
+    lines.push('');
+  }
+  return lines.join('\n').trimEnd();
+}
+
+function getSttStatus(document: AxcutDocument | undefined, jobs: JobSummary[] | undefined) {
+  const ingestJob = jobs?.find((job) => job.kind === 'ingest_asset') ?? null;
+  if (!document?.assets.length) {
+    return { label: 'STT idle', detail: 'Load a video to start transcription.', progress: 0, tone: 'idle' as const };
+  }
+  if (document.transcript) {
+    return { label: 'STT complete', detail: `${document.transcript.segments.length} segments · ${document.transcript.words.length} words`, progress: 1, tone: 'ready' as const };
+  }
+  if (!ingestJob) {
+    return { label: 'STT waiting', detail: 'Waiting for ingest job.', progress: 0, tone: 'idle' as const };
+  }
+  if (ingestJob.status === 'failed') {
+    return { label: 'STT failed', detail: ingestJob.message, progress: ingestJob.progress, tone: 'error' as const };
+  }
+  const inSttPhase = ingestJob.progress >= 0.7 || /transcrib/i.test(ingestJob.message);
+  return {
+    label: inSttPhase ? 'STT running' : 'Preparing STT',
+    detail: ingestJob.message,
+    progress: Math.max(0, Math.min(1, ingestJob.progress)),
+    tone: 'running' as const,
+  };
 }
 
 function useProjectEvents(
@@ -120,6 +198,8 @@ function useProjectEvents(
     const eventNames = [
       'job.progress',
       'job.completed',
+      'job.failed',
+      'project.asset.updated',
       'project.transcript.updated',
       'project.revision.created',
       'preview.ready',
@@ -160,12 +240,16 @@ export function App() {
   const [message, setMessage] = useState('');
   const [historyOpen, setHistoryOpen] = useState(false);
   const [providerOpen, setProviderOpen] = useState(false);
+  const [loadVideoOpen, setLoadVideoOpen] = useState(false);
+  const [transcriptModal, setTranscriptModal] = useState<'source' | 'edited' | null>(null);
   const [virtualTimeSec, setVirtualTimeSec] = useState(0);
   const [seekTarget, setSeekTarget] = useState<{ timeSec: number; requestId: number } | null>(null);
 
   const sessionQuery = useQuery({
     queryKey: ['session'],
     queryFn: () => requestJson<SessionPayload>('/api/session'),
+    refetchInterval: 5000,
+    refetchOnWindowFocus: true,
   });
   const sessionToken = sessionQuery.data?.token;
 
@@ -270,6 +354,33 @@ export function App() {
     },
   });
 
+  const loadVideo = useMutation({
+    mutationFn: async ({ title, path }: { title: string; path: string }) => {
+      if (!sessionToken) {
+        throw new Error('No Axcut browser session token.');
+      }
+      const created = await requestJson<{ document: AxcutDocument }>('/api/projects', {
+        method: 'POST',
+        body: JSON.stringify({ title: title.trim() || path.split('/').at(-1) || 'Untitled Project' }),
+        headers: authHeaders(sessionToken),
+      });
+      const createdProjectId = created.document.project.id;
+      await requestJson(`/api/projects/${createdProjectId}/assets`, {
+        method: 'POST',
+        body: JSON.stringify({ path, autoTranscribe: true }),
+        headers: authHeaders(sessionToken),
+      });
+      return createdProjectId;
+    },
+    onSuccess: async (createdProjectId) => {
+      setSelectedProjectId(createdProjectId);
+      setActiveSessionId(null);
+      setLoadVideoOpen(false);
+      await queryClient.invalidateQueries({ queryKey: ['projects'] });
+      await queryClient.invalidateQueries({ queryKey: ['project', createdProjectId] });
+    },
+  });
+
   const sendChat = useMutation({
     mutationFn: async () => {
       if (!projectId || !sessionToken) {
@@ -294,9 +405,21 @@ export function App() {
     () => document?.assets.find((asset) => asset.id === document.project.primaryAssetId) ?? document?.assets[0],
     [document],
   );
-  const videoSrc = projectId && primaryAsset
-    ? `/api/projects/${projectId}/assets/${primaryAsset.id}/media?variant=${primaryAsset.proxyPath ? 'proxy' : 'original'}&token=${encodeURIComponent(sessionToken ?? '')}`
-    : null;
+  const videoSources = useMemo<VideoSource[]>(() => {
+    if (!projectId || !primaryAsset || !sessionToken) {
+      return [];
+    }
+    const baseUrl = `/api/projects/${projectId}/assets/${primaryAsset.id}/media`;
+    const token = encodeURIComponent(sessionToken);
+    const original = { src: `${baseUrl}?variant=original&token=${token}`, label: 'original source' };
+    if (!primaryAsset.proxyPath) {
+      return [original];
+    }
+    return [
+      { src: `${baseUrl}?variant=proxy&token=${token}`, label: 'proxy preview' },
+      original,
+    ];
+  }, [primaryAsset, projectId, sessionToken]);
   const latestJob = snapshot?.jobs[0] ?? null;
   const statusText = !projectId
     ? 'No configured project. Set AXCUT_VIDEO_PATH before starting the server.'
@@ -306,6 +429,15 @@ export function App() {
   const providerLabel = llmConfigQuery.data?.ready
     ? `${llmConfigQuery.data.effective.providerLabel} · ${llmConfigQuery.data.effective.model}`
     : 'LLM not configured';
+  const projectCount = projectsQuery.data?.projects.length ?? 0;
+  const sourceTranscriptName = artifactName(document?.transcript?.sourceDslPath ?? document?.transcript?.sourceJsonPath);
+  const sourceTranscriptQuery = useQuery({
+    enabled: Boolean(transcriptModal === 'source' && projectId && sessionToken && sourceTranscriptName),
+    queryKey: ['source-transcript', projectId, sourceTranscriptName],
+    queryFn: () => requestText(`/api/projects/${projectId}/artifacts/${encodeURIComponent(sourceTranscriptName!)}?token=${encodeURIComponent(sessionToken!)}`),
+  });
+  const editedTranscript = useMemo(() => document ? buildEditedTranscript(document) : 'No project is loaded.', [document]);
+  const sttStatus = getSttStatus(document, snapshot?.jobs);
 
   return (
     <div className="app-shell">
@@ -322,22 +454,27 @@ export function App() {
         </header>
 
         <div className="project-row">
-          <select
-            value={projectId ?? ''}
-            onChange={(event) => {
-              setSelectedProjectId(event.target.value || null);
-              setActiveSessionId(null);
-            }}
-          >
-            {projectsQuery.data?.projects.length ? projectsQuery.data.projects.map((project) => (
-              <option key={project.id} value={project.id}>{project.title}</option>
-            )) : <option value="">Waiting for project</option>}
-          </select>
+          {projectCount > 1 ? (
+            <select
+              value={projectId ?? ''}
+              onChange={(event) => {
+                setSelectedProjectId(event.target.value || null);
+                setActiveSessionId(null);
+              }}
+              aria-label="Current project"
+            >
+              {projectsQuery.data?.projects.map((project) => (
+                <option key={project.id} value={project.id}>{project.title}</option>
+              ))}
+            </select>
+          ) : (
+            <div className="project-title-pill">
+              <span className="muted">Project</span>
+              <strong>{document?.project.title ?? 'No video loaded'}</strong>
+            </div>
+          )}
+          <button className="secondary" onClick={() => setLoadVideoOpen(true)}>Load video</button>
         </div>
-
-        <button className={llmConfigQuery.data?.ready ? 'provider-pill ready' : 'provider-pill'} onClick={() => setProviderOpen(true)}>
-          {providerLabel}
-        </button>
 
         <div className="session-card">
           <span className="muted">Current conversation</span>
@@ -387,6 +524,13 @@ export function App() {
           >
             {sendChat.isPending ? 'Working...' : 'Send'}
           </button>
+          <div className="composer-footer">
+            <button type="button" className={llmConfigQuery.data?.ready ? 'provider-pill compact ready' : 'provider-pill compact'} onClick={() => setProviderOpen(true)}>
+              {providerLabel}
+            </button>
+            {sendChat.isPending ? <span className="muted">Waiting for the agent response...</span> : null}
+          </div>
+          {sendChat.isError ? <p className="error-copy">{sendChat.error instanceof Error ? sendChat.error.message : 'Chat request failed.'}</p> : null}
         </form>
       </aside>
 
@@ -400,11 +544,17 @@ export function App() {
                 : 'Waiting for configured video source'}
             </p>
           </div>
+          <div className="preview-actions">
+            <button className="secondary" onClick={() => setTranscriptModal('source')} disabled={!sourceTranscriptName}>Source transcript</button>
+            <button className="secondary" onClick={() => setTranscriptModal('edited')} disabled={!document?.transcript}>Edited transcript</button>
+          </div>
         </div>
+
+        <SttStatusBar status={sttStatus} />
 
         {document ? (
           <VirtualPreview
-            videoSrc={videoSrc}
+            videoSources={videoSources}
             clips={document.timeline.clips}
             revision={document.preview.revision}
             seekTarget={seekTarget}
@@ -447,6 +597,76 @@ export function App() {
           }}
         />
       ) : null}
+
+      {loadVideoOpen ? (
+        <LoadVideoDialog
+          busy={loadVideo.isPending}
+          error={loadVideo.error instanceof Error ? loadVideo.error.message : null}
+          onClose={() => setLoadVideoOpen(false)}
+          onLoad={(input) => loadVideo.mutate(input)}
+        />
+      ) : null}
+
+      {transcriptModal ? (
+        <TranscriptDialog
+          title={transcriptModal === 'source' ? 'Source Transcript' : 'Edited Transcript'}
+          subtitle={transcriptModal === 'source'
+            ? sourceTranscriptName ?? 'No transcript artifact available yet.'
+            : 'Reconstructed from the current Axcut timeline.'}
+          content={transcriptModal === 'source'
+            ? sourceTranscriptQuery.data ?? ''
+            : editedTranscript}
+          loading={transcriptModal === 'source' && sourceTranscriptQuery.isLoading}
+          error={transcriptModal === 'source' && sourceTranscriptQuery.error instanceof Error ? sourceTranscriptQuery.error.message : null}
+          onClose={() => setTranscriptModal(null)}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function SttStatusBar({ status }: { status: ReturnType<typeof getSttStatus> }) {
+  return (
+    <div className={`stt-status ${status.tone}`}>
+      <div className="stt-status-copy">
+        <strong>{status.label}</strong>
+        <span className="muted">{status.detail}</span>
+      </div>
+      <div className="stt-progress" aria-label={`${status.label}: ${Math.round(status.progress * 100)}%`}>
+        <div style={{ width: `${Math.round(status.progress * 100)}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function TranscriptDialog({
+  title,
+  subtitle,
+  content,
+  loading,
+  error,
+  onClose,
+}: {
+  title: string;
+  subtitle: string;
+  content: string;
+  loading: boolean;
+  error: string | null;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <section className="modal panel transcript-modal">
+        <div className="modal-header">
+          <div>
+            <h2>{title}</h2>
+            <p className="muted">{subtitle}</p>
+          </div>
+          <button className="secondary" onClick={onClose}>Close</button>
+        </div>
+        {error ? <p className="error-copy">{error}</p> : null}
+        <pre className="transcript-viewer">{loading ? 'Loading transcript...' : content || 'Transcript is empty.'}</pre>
+      </section>
     </div>
   );
 }
@@ -531,6 +751,55 @@ function SessionHistoryDialog({
   );
 }
 
+function LoadVideoDialog({
+  busy,
+  error,
+  onClose,
+  onLoad,
+}: {
+  busy: boolean;
+  error: string | null;
+  onClose: () => void;
+  onLoad: (input: { title: string; path: string }) => void;
+}) {
+  const [title, setTitle] = useState('');
+  const [path, setPath] = useState('');
+
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <section className="modal panel load-video-modal">
+        <div className="modal-header">
+          <div>
+            <h2>Load Video</h2>
+            <p className="muted">Enter a video path that exists on the machine running the Axcut server.</p>
+          </div>
+          <button className="secondary" onClick={onClose}>Close</button>
+        </div>
+        <form
+          className="provider-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (path.trim()) {
+              onLoad({ title, path: path.trim() });
+            }
+          }}
+        >
+          <label>
+            <span className="muted">Project title</span>
+            <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Defaults to the video filename" />
+          </label>
+          <label>
+            <span className="muted">Server-local video path</span>
+            <input value={path} onChange={(event) => setPath(event.target.value)} placeholder="/home/you/Videos/source.mp4" />
+          </label>
+          {error ? <p className="error-copy">{error}</p> : null}
+          <button disabled={busy || !path.trim()}>{busy ? 'Loading...' : 'Create project and ingest'}</button>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 function ProviderSettingsDialog({
   snapshot,
   sessionToken,
@@ -542,7 +811,8 @@ function ProviderSettingsDialog({
   onClose: () => void;
   onChanged: () => Promise<void>;
 }) {
-  const [providerId, setProviderId] = useState(snapshot?.effective.provider ?? snapshot?.providers[0]?.id ?? 'openai');
+  const [screen, setScreen] = useState<'models' | 'providers' | 'settings'>('models');
+  const [providerId, setProviderId] = useState(snapshot?.effective.provider ?? snapshot?.connectedProviders[0]?.id ?? snapshot?.providers[0]?.id ?? 'openai');
   const activeProvider = snapshot?.providers.find((provider) => provider.id === providerId) ?? snapshot?.providers[0];
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState(activeProvider?.model || activeProvider?.defaultModel || '');
@@ -577,31 +847,104 @@ function ProviderSettingsDialog({
     }
   };
 
-  const providerSections = [
-    ['Connected providers', snapshot?.connectedProviders ?? []] as const,
-    ['Available providers', snapshot?.availableProviders ?? []] as const,
-  ];
+  const loadModels = async () => {
+    if (!sessionToken || !activeProvider) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const params = baseUrl ? `?baseUrl=${encodeURIComponent(baseUrl)}` : '';
+      const result = await requestJson<{ models: string[] }>(`/api/llm/providers/${activeProvider.id}/models${params}`, {
+        headers: authHeaders(sessionToken),
+      });
+      setModels(result.models);
+      setModel((current) => current || result.models[0] || activeProvider.defaultModel);
+    } catch (incoming) {
+      setError(incoming instanceof Error ? incoming.message : String(incoming));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (screen === 'models' && activeProvider?.connected) {
+      void loadModels();
+    }
+    // Load once per selected provider; base URL changes still have the explicit reload button.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProvider?.id, screen]);
+
+  const useModel = () => runProviderAction(async () => {
+    await requestJson(`/api/llm/providers/${activeProvider!.id}/select`, {
+      method: 'POST',
+      body: JSON.stringify({ model, baseUrl: baseUrl || undefined }),
+      headers: authHeaders(sessionToken!),
+    });
+    onClose();
+  });
 
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true">
       <section className="modal panel provider-modal">
         <div className="modal-header">
+          {screen === 'models' ? (
+            <button className="icon-button secondary" onClick={() => setScreen('providers')} aria-label="Change provider">←</button>
+          ) : (
+            <button className="icon-button secondary" onClick={() => setScreen(screen === 'providers' ? 'models' : 'providers')} aria-label="Back">←</button>
+          )}
           <div>
-            <h2>Provider Settings</h2>
-            <p className="muted">Connect, select, and discover models through Yagr.</p>
+            <h2>{screen === 'models' ? 'Select Model' : screen === 'providers' ? 'Connected Providers' : 'Provider Settings'}</h2>
+            <p className="muted">
+              {screen === 'models'
+                ? `${activeProvider?.label ?? 'Provider'} models`
+                : screen === 'providers'
+                  ? 'Choose one of your connected providers.'
+                  : 'Connect or disconnect providers.'}
+            </p>
           </div>
           <button className="secondary" onClick={onClose}>Close</button>
         </div>
 
-        {providerSections.map(([title, providers]) => providers.length ? (
-          <div key={title} className="provider-section">
-            <h3>{title}</h3>
+        {screen === 'models' && activeProvider ? (
+          <div className="model-picker-screen">
+            <div>
+              <h3>{activeProvider.label}</h3>
+              <p className="muted">Current model: {snapshot?.effective.model || activeProvider.defaultModel || 'Not selected'}</p>
+            </div>
+            <label>
+              <span className="muted">Model</span>
+              <input value={model} onChange={(event) => setModel(event.target.value)} placeholder={activeProvider.defaultModel} />
+            </label>
+            <div className="model-list">
+              {models.length ? models.map((candidate) => (
+                <button key={candidate} className={candidate === model ? 'model-option active' : 'model-option'} onClick={() => setModel(candidate)}>
+                  {candidate}
+                </button>
+              )) : (
+                <div className="message-empty muted">{busy ? 'Loading models...' : 'No model list loaded. Use the model field or reload models.'}</div>
+              )}
+            </div>
+            {error ? <p className="error-copy">{error}</p> : null}
+            <div className="provider-actions">
+              <button onClick={useModel} disabled={busy || !model.trim()}>Use model</button>
+              <button className="secondary" onClick={() => void loadModels()} disabled={busy}>Reload models</button>
+              <button className="secondary" onClick={() => setScreen('settings')}>Provider settings</button>
+            </div>
+          </div>
+        ) : null}
+
+        {screen === 'providers' ? (
+          <div className="provider-section">
             <div className="provider-grid">
-              {providers.map((provider) => (
+              {(snapshot?.connectedProviders ?? []).map((provider) => (
                 <button
                   key={provider.id}
                   className={provider.id === providerId ? 'provider-row active' : 'provider-row'}
-                  onClick={() => setProviderId(provider.id)}
+                  onClick={() => {
+                    setProviderId(provider.id);
+                    setScreen('models');
+                  }}
                 >
                   <strong>{provider.label}</strong>
                   <span className="muted">{provider.model || provider.defaultModel || 'Custom model'}</span>
@@ -614,47 +957,66 @@ function ProviderSettingsDialog({
                 </button>
               ))}
             </div>
+            {snapshot?.connectedProviders.length ? null : <div className="message-empty muted">No connected providers yet.</div>}
+            <button className="secondary" onClick={() => setScreen('settings')}>Connect a new provider</button>
           </div>
-        ) : null)}
+        ) : null}
 
-        {activeProvider ? (
-          <div className="provider-form">
-            <div>
-              <h3>{activeProvider.label}</h3>
-              <p className="muted">{activeProvider.setupHint || 'Configure this provider for Axcut chat.'}</p>
-            </div>
-            <label>
-              <span className="muted">Model</span>
-              <input value={model} onChange={(event) => setModel(event.target.value)} placeholder={activeProvider.defaultModel} />
-            </label>
-            {models.length ? (
-              <select value={model} onChange={(event) => setModel(event.target.value)}>
-                {models.map((candidate) => <option key={candidate} value={candidate}>{candidate}</option>)}
-              </select>
-            ) : null}
-            {activeProvider.requiresBaseUrl ? (
-              <label>
-                <span className="muted">Base URL</span>
-                <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder={activeProvider.defaultBaseUrl || 'Provider base URL'} />
-              </label>
-            ) : null}
-            {activeProvider.requiresApiKey ? (
-              <label>
-                <span className="muted">API key</span>
-                <input value={apiKey} onChange={(event) => setApiKey(event.target.value)} type="password" placeholder={activeProvider.connected ? 'Leave blank to keep stored key' : 'Paste API key'} />
-              </label>
-            ) : null}
-            {challenge ? (
-              <div className="device-challenge">
-                <strong>Finish browser login</strong>
-                <a href={challenge.verificationUriComplete || challenge.verificationUri} target="_blank" rel="noreferrer">
-                  {challenge.verificationUriComplete || challenge.verificationUri}
-                </a>
-                <code>{challenge.userCode}</code>
+        {screen === 'settings' && activeProvider ? (
+          <div className="settings-screen">
+            <div className="provider-section">
+              <h3>Available Providers</h3>
+              <div className="provider-grid">
+                {(snapshot?.providers ?? []).map((provider) => (
+                  <button
+                    key={provider.id}
+                    className={provider.id === providerId ? 'provider-row active' : 'provider-row'}
+                    onClick={() => setProviderId(provider.id)}
+                  >
+                    <strong>{provider.label}</strong>
+                    <span className="muted">{provider.setupHint || provider.defaultModel || 'Custom provider'}</span>
+                    <span className="provider-badges">
+                      {provider.connected ? <small className="status-pill ready">Connected</small> : null}
+                      {provider.oauth ? <small className="status-pill">OAuth</small> : null}
+                      {provider.requiresApiKey ? <small className="status-pill">API key</small> : null}
+                    </span>
+                  </button>
+                ))}
               </div>
-            ) : null}
-            {error ? <p className="error-copy">{error}</p> : null}
-            <div className="provider-actions">
+            </div>
+
+            <div className="provider-form">
+              <div>
+                <h3>{activeProvider.label}</h3>
+                <p className="muted">{activeProvider.setupHint || 'Configure this provider for Axcut chat.'}</p>
+              </div>
+              <label>
+                <span className="muted">Model</span>
+                <input value={model} onChange={(event) => setModel(event.target.value)} placeholder={activeProvider.defaultModel} />
+              </label>
+              {activeProvider.requiresBaseUrl ? (
+                <label>
+                  <span className="muted">Base URL</span>
+                  <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder={activeProvider.defaultBaseUrl || 'Provider base URL'} />
+                </label>
+              ) : null}
+              {activeProvider.requiresApiKey ? (
+                <label>
+                  <span className="muted">API key</span>
+                  <input value={apiKey} onChange={(event) => setApiKey(event.target.value)} type="password" placeholder={activeProvider.connected ? 'Leave blank to keep stored key' : 'Paste API key'} />
+                </label>
+              ) : null}
+              {challenge ? (
+                <div className="device-challenge">
+                  <strong>Finish browser login</strong>
+                  <a href={challenge.verificationUriComplete || challenge.verificationUri} target="_blank" rel="noreferrer">
+                    {challenge.verificationUriComplete || challenge.verificationUri}
+                  </a>
+                  <code>{challenge.userCode}</code>
+                </div>
+              ) : null}
+              {error ? <p className="error-copy">{error}</p> : null}
+              <div className="provider-actions">
               <button
                 onClick={() => runProviderAction(async () => {
                   const result = await requestJson<{ challenge?: Omit<DeviceChallenge, 'provider'> }>(`/api/llm/providers/${activeProvider.id}/connect`, {
@@ -664,6 +1026,8 @@ function ProviderSettingsDialog({
                   });
                   if (result.challenge) {
                     setChallenge({ provider: activeProvider.id, ...result.challenge });
+                  } else {
+                    setScreen('models');
                   }
                 })}
                 disabled={busy || (!activeProvider.oauth && activeProvider.requiresApiKey && !apiKey && !activeProvider.connected)}
@@ -672,30 +1036,10 @@ function ProviderSettingsDialog({
               </button>
               <button
                 className="secondary"
-                onClick={() => runProviderAction(async () => {
-                  await requestJson(`/api/llm/providers/${activeProvider.id}/select`, {
-                    method: 'POST',
-                    body: JSON.stringify({ model, baseUrl: baseUrl || undefined }),
-                    headers: authHeaders(sessionToken!),
-                  });
-                })}
+                onClick={useModel}
                 disabled={busy || !model.trim()}
               >
                 Use provider
-              </button>
-              <button
-                className="secondary"
-                onClick={() => runProviderAction(async () => {
-                  const params = baseUrl ? `?baseUrl=${encodeURIComponent(baseUrl)}` : '';
-                  const result = await requestJson<{ models: string[] }>(`/api/llm/providers/${activeProvider.id}/models${params}`, {
-                    headers: authHeaders(sessionToken!),
-                  });
-                  setModels(result.models);
-                  setModel((current) => current || result.models[0] || activeProvider.defaultModel);
-                })}
-                disabled={busy}
-              >
-                Load models
               </button>
               {challenge ? (
                 <button
@@ -706,6 +1050,7 @@ function ProviderSettingsDialog({
                       headers: authHeaders(sessionToken!),
                     });
                     setChallenge(null);
+                    setScreen('models');
                   })}
                   disabled={busy}
                 >
@@ -724,6 +1069,7 @@ function ProviderSettingsDialog({
               >
                 Disconnect
               </button>
+              </div>
             </div>
           </div>
         ) : null}

@@ -48,6 +48,7 @@ export class JobService {
       this.update(jobId, projectId, { status: 'running', progress: 0.15, message: 'Probing source media' });
       const probe = await this.worker.probe(asset.originalPath);
       this.documents.updateAsset(projectId, assetId, probe.data as never, 'Asset media metadata updated');
+      this.documents.ensureFullTimelineForAsset(projectId, assetId, 'Initial full-length timeline from media probe');
       this.events.emit(projectId, 'project.asset.updated', { assetId });
 
       const artifactsRoot = projectArtifactsRoot(projectId);

@@ -7,7 +7,7 @@ import type {
 } from '@axcut/schema';
 
 import { createId } from './ids.js';
-import { normalizeIntervals, subtractInterval, timelineIntervals } from './timeline.js';
+import { normalizeIntervals, primaryAssetDuration, subtractInterval, timelineIntervals } from './timeline.js';
 
 const fillerLexicon = new Set([
   'uh',
@@ -25,7 +25,8 @@ const restorePromptPattern = /\b(restore|reset|start over|start-over|undo all|fu
 const suggestionPromptPattern = /\b(suggest|proposal|propose|option|options|what can you cut|what should we cut)\b/i;
 const fillerPromptPattern = /\b(filler|hesitation|stutter|stutters|disfluenc|um|uh)\b/i;
 const pausePromptPattern = /\b(pause|pauses|silence|dead air|dead-air)\b/i;
-const cutPromptPattern = /\b(cut|remove|trim|delete|drop)\b/i;
+const nonSpeechPromptPattern = /\b(not speak|not speaking|don t speak|do not speak|no speech|non speech|without speech|ne parle pas|pas de parole|sans parole)\b/i;
+const cutPromptPattern = /\b(cut|remove|trim|delete|drop|supprimer|retirer|enlever|couper)\b/i;
 const searchPromptPattern = /\b(find|search|look for|where is|show me)\b/i;
 
 export type TranscriptSearchHit = {
@@ -46,11 +47,12 @@ export type RuntimeIntent =
 
 export function interpretPrompt(document: AxcutDocument, prompt: string): RuntimeIntent | null {
   const normalizedPrompt = prompt.trim();
+  const normalizedPromptText = normalizeText(normalizedPrompt);
   if (!normalizedPrompt) {
     return { kind: 'message', summary: 'Describe the cut you want to make.' };
   }
 
-  if (restorePromptPattern.test(normalizedPrompt)) {
+  if (restorePromptPattern.test(normalizedPromptText)) {
     return {
       kind: 'restore',
       summary: 'Restored the full timeline from the source video.',
@@ -66,16 +68,28 @@ export function interpretPrompt(document: AxcutDocument, prompt: string): Runtim
     return null;
   }
 
-  const fillerSuggestions = fillerPromptPattern.test(normalizedPrompt)
+  if (cutPromptPattern.test(normalizedPromptText) && nonSpeechPromptPattern.test(normalizedPromptText)) {
+    const intervals = buildSpeechIntervals(document);
+    if (intervals.length === 0) {
+      return { kind: 'message', summary: 'No spoken transcript segments are available to keep.' };
+    }
+    return {
+      kind: 'apply',
+      summary: `Removed non-speaking ranges and kept ${intervals.length} spoken segment${intervals.length === 1 ? '' : 's'}.`,
+      intervals,
+    };
+  }
+
+  const fillerSuggestions = fillerPromptPattern.test(normalizedPromptText)
     ? buildFillerSuggestions(document)
     : [];
-  const pauseSuggestions = pausePromptPattern.test(normalizedPrompt)
+  const pauseSuggestions = pausePromptPattern.test(normalizedPromptText)
     ? buildPauseSuggestions(document)
     : [];
   const combinedSuggestions = [...fillerSuggestions, ...pauseSuggestions].slice(0, 12);
 
   if (combinedSuggestions.length > 0) {
-    if (suggestionPromptPattern.test(normalizedPrompt) || !cutPromptPattern.test(normalizedPrompt)) {
+    if (suggestionPromptPattern.test(normalizedPromptText) || !cutPromptPattern.test(normalizedPromptText)) {
       return {
         kind: 'suggest',
         summary: `Prepared ${combinedSuggestions.length} structured cut suggestion${combinedSuggestions.length === 1 ? '' : 's'} from the current transcript.`,
@@ -90,7 +104,7 @@ export function interpretPrompt(document: AxcutDocument, prompt: string): Runtim
     };
   }
 
-  if (searchPromptPattern.test(normalizedPrompt)) {
+  if (searchPromptPattern.test(normalizedPromptText)) {
     const hits = searchTranscript(document, normalizedPrompt, 5);
     if (hits.length > 0) {
       return {
@@ -101,6 +115,35 @@ export function interpretPrompt(document: AxcutDocument, prompt: string): Runtim
   }
 
   return null;
+}
+
+export function buildSpeechIntervals(document: AxcutDocument): Array<{ startSec: number; endSec: number }> {
+  const transcript = document.transcript;
+  if (!transcript) {
+    return [];
+  }
+
+  const duration = primaryAssetDuration(document);
+  const currentIntervals = timelineIntervals(document);
+  const baseIntervals = currentIntervals.length > 0
+    ? currentIntervals
+    : duration > 0 ? [{ startSec: 0, endSec: duration }] : [];
+  const speechSegments = transcript.segments
+    .filter((segment) => segment.kind === 'speech')
+    .filter((segment) => segment.endSec > segment.startSec);
+
+  const intersections: Array<{ startSec: number; endSec: number }> = [];
+  for (const segment of speechSegments) {
+    for (const interval of baseIntervals) {
+      const startSec = Math.max(segment.startSec, interval.startSec);
+      const endSec = Math.min(segment.endSec, interval.endSec);
+      if (endSec > startSec) {
+        intersections.push({ startSec, endSec });
+      }
+    }
+  }
+
+  return normalizeIntervals(duration, intersections);
 }
 
 export function searchTranscript(document: AxcutDocument, query: string, limit = 8): TranscriptSearchHit[] {

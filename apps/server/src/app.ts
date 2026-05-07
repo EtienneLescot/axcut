@@ -8,7 +8,7 @@ import Fastify from 'fastify';
 import { ZodError } from 'zod';
 
 import { streamFile } from './lib/media-stream.js';
-import { databasePath, projectArtifactsRoot } from './lib/paths.js';
+import { databasePath, projectArtifactsRoot, runtimeRoot } from './lib/paths.js';
 import { AxcutAgentRuntime } from './services/axcut-agent-runtime.js';
 import { ChatService } from './services/chat-service.js';
 import { DatabaseService } from './services/database.js';
@@ -47,12 +47,28 @@ async function ensureConfiguredProject(documents: DocumentService, jobs: JobServ
   logger.info(`Axcut bootstrapped project ${document.project.id} for ${resolvedVideoPath}`);
 }
 
+function resolveSessionToken(): string {
+  const configured = process.env.AXCUT_SESSION_TOKEN?.trim();
+  if (configured) {
+    return configured;
+  }
+  const tokenPath = path.join(runtimeRoot, 'session-token');
+  const existing = fs.existsSync(tokenPath) ? fs.readFileSync(tokenPath, 'utf-8').trim() : '';
+  if (existing) {
+    return existing;
+  }
+  const token = randomUUID();
+  fs.mkdirSync(runtimeRoot, { recursive: true });
+  fs.writeFileSync(tokenPath, `${token}\n`, { encoding: 'utf-8', mode: 0o600 });
+  return token;
+}
+
 export async function createServer() {
   const fastify = Fastify({ logger: true });
   await fastify.register(cors, {
     origin: ['http://127.0.0.1:5173', 'http://localhost:5173'],
   });
-  const sessionToken = randomUUID();
+  const sessionToken = resolveSessionToken();
 
   fastify.addHook('preHandler', async (request, reply) => {
     if (request.method === 'OPTIONS' || request.url.startsWith('/api/session')) {
@@ -313,7 +329,7 @@ export async function createServer() {
       reply.code(404);
       return { error: 'Media file not found' };
     }
-    await streamFile(request, reply, filePath);
+    return streamFile(request, reply, filePath);
   });
 
   fastify.get('/api/projects/:projectId/artifacts/:name', async (request, reply) => {
@@ -328,7 +344,7 @@ export async function createServer() {
       reply.code(404);
       return { error: 'Artifact not found' };
     }
-    await streamFile(request, reply, artifactPath);
+    return streamFile(request, reply, artifactPath);
   });
 
   return fastify;

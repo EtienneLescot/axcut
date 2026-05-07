@@ -1,11 +1,8 @@
 import path from 'node:path';
 
 import { MemorySaver } from '@langchain/langgraph';
-import { createDeepAgentRuntime } from '@yagr/deepagent-bootstrap';
-import type { RuntimeContextCompactionEvent, RuntimeOperationEvent } from '@yagr/runtime-events';
 import { SessionService, deriveSessionTitle, type DeepAgentSessionRecord } from '@yagr/session-service';
-import { consumeLangGraphStream } from '@yagr/stream-adapter';
-import { HumanMessage, tool } from 'langchain';
+import { AIMessage, HumanMessage, createAgent, tool } from 'langchain';
 import { z } from 'zod';
 
 import type { AxcutOperation, AxcutSuggestion } from '@axcut/schema';
@@ -20,44 +17,130 @@ import type { LlmConfigService } from './llm-config-service.js';
 const searchTranscriptToolSchema = z.object({
   query: z.string().min(1).describe('Search query to locate transcript passages.'),
   limit: z.number().int().positive().max(12).optional().default(8),
-});
+}).strict();
 
 const suggestCutsToolSchema = z.object({
   kind: z.enum(['filler', 'pause']).describe('Suggestion category to generate.'),
   minDurationSec: z.number().positive().max(5).optional().default(0.6),
   limit: z.number().int().positive().max(12).optional().default(6),
-});
+}).strict();
 
 const timelineOperationToolSchema = z.object({
-  operation: z.discriminatedUnion('type', [
-    z.object({
-      type: z.literal('replace_timeline'),
-      reason: z.string().default(''),
-      intervals: z.array(z.object({ startSec: z.number().nonnegative(), endSec: z.number().nonnegative() })),
-    }),
-    z.object({
-      type: z.literal('drop_range'),
-      reason: z.string().default(''),
-      startSec: z.number().nonnegative(),
-      endSec: z.number().nonnegative(),
-    }),
-    z.object({
-      type: z.literal('drop_word_range'),
-      reason: z.string().default(''),
-      startWordId: z.string().min(1),
-      endWordId: z.string().min(1),
-    }),
-    z.object({
-      type: z.literal('restore_full_timeline'),
-      reason: z.string().default(''),
-    }),
-  ]),
-});
+  type: z.enum(['replace_timeline', 'drop_range', 'drop_word_range', 'restore_full_timeline']),
+  reason: z.string().default(''),
+  intervalsJson: z.string().default('[]').describe('For replace_timeline only: JSON array like [{"startSec":0,"endSec":12.5}] or [[0,12.5]].'),
+  startSec: z.number().nonnegative().default(0).describe('For drop_range only.'),
+  endSec: z.number().nonnegative().default(0).describe('For drop_range only.'),
+  startWordId: z.string().default('').describe('For drop_word_range only.'),
+  endWordId: z.string().default('').describe('For drop_word_range only.'),
+}).strict();
 
 const suggestionDecisionToolSchema = z.object({
   suggestionId: z.string().min(1),
   reason: z.string().default(''),
-});
+}).strict();
+
+type TimelineOperationToolInput = z.infer<typeof timelineOperationToolSchema>;
+
+function buildTimelineOperationFromToolInput(input: TimelineOperationToolInput): AxcutOperation {
+  switch (input.type) {
+    case 'replace_timeline':
+      return {
+        type: 'replace_timeline',
+        reason: input.reason,
+        intervals: parseIntervalsJson(input.intervalsJson),
+      };
+    case 'drop_range':
+      if (input.endSec <= input.startSec) {
+        throw new Error('drop_range requires endSec to be greater than startSec.');
+      }
+      return {
+        type: 'drop_range',
+        reason: input.reason,
+        startSec: input.startSec,
+        endSec: input.endSec,
+      };
+    case 'drop_word_range':
+      if (!input.startWordId || !input.endWordId) {
+        throw new Error('drop_word_range requires startWordId and endWordId.');
+      }
+      return {
+        type: 'drop_word_range',
+        reason: input.reason,
+        startWordId: input.startWordId,
+        endWordId: input.endWordId,
+      };
+    case 'restore_full_timeline':
+      return {
+        type: 'restore_full_timeline',
+        reason: input.reason,
+      };
+  }
+}
+
+function parseIntervalsJson(value: string): Array<{ startSec: number; endSec: number }> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value || '[]');
+  } catch {
+    throw new Error('replace_timeline intervalsJson must be valid JSON.');
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error('replace_timeline intervalsJson must be a JSON array.');
+  }
+
+  return parsed.map((item, index) => {
+    const interval = Array.isArray(item)
+      ? { startSec: item[0], endSec: item[1] }
+      : item;
+    if (!interval || typeof interval !== 'object') {
+      throw new Error(`replace_timeline interval ${index + 1} must be an object or [start,end] pair.`);
+    }
+    const record = interval as Record<string, unknown>;
+    const startSec = record.startSec;
+    const endSec = record.endSec;
+    if (typeof startSec !== 'number' || typeof endSec !== 'number' || !Number.isFinite(startSec) || !Number.isFinite(endSec) || startSec < 0 || endSec <= startSec) {
+      throw new Error(`replace_timeline interval ${index + 1} must have non-negative startSec and a greater endSec.`);
+    }
+    return { startSec, endSec };
+  });
+}
+
+function extractAgentResponseText(result: unknown): string {
+  const messages = typeof result === 'object' && result !== null && 'messages' in result
+    ? (result as { messages?: unknown }).messages
+    : undefined;
+  if (!Array.isArray(messages)) {
+    return '';
+  }
+
+  for (const message of [...messages].reverse()) {
+    if (!AIMessage.isInstance(message)) {
+      continue;
+    }
+    return stringifyMessageContent(message.content).trim();
+  }
+  return '';
+}
+
+function stringifyMessageContent(content: unknown): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content.map((part) => {
+      if (typeof part === 'string') {
+        return part;
+      }
+      if (part && typeof part === 'object' && 'text' in part && typeof (part as { text?: unknown }).text === 'string') {
+        return (part as { text: string }).text;
+      }
+      return '';
+    }).filter(Boolean).join('\n');
+  }
+  return '';
+}
 
 export class AxcutDeepAgentService {
   private readonly checkpointer = new MemorySaver();
@@ -146,7 +229,7 @@ export class AxcutDeepAgentService {
     }, {
       name: 'get_project_state',
       description: 'Read the current Axcut project state, timeline, transcript metadata, and existing suggestions.',
-      schema: z.object({}),
+      schema: z.object({}).strict(),
     });
 
     const transcriptSearch = tool(async ({ query, limit }) => {
@@ -175,10 +258,11 @@ export class AxcutDeepAgentService {
       schema: suggestCutsToolSchema,
     });
 
-    const applyTimelineOperation = tool(async ({ operation }) => {
+    const applyTimelineOperation = tool(async (input) => {
+      const operation = buildTimelineOperationFromToolInput(input);
       const result = this.documents.applyOperation(
         projectId,
-        operation as AxcutOperation,
+        operation,
         operation.reason || 'Applied a deepagents timeline operation.',
         'agent',
       );
@@ -188,7 +272,7 @@ export class AxcutDeepAgentService {
       };
     }, {
       name: 'apply_timeline_operation',
-      description: 'Apply a structured timeline mutation directly to the Axcut project.',
+      description: 'Apply a structured timeline mutation directly to the Axcut project. For replace_timeline, pass intervalsJson as a JSON string array of {startSec,endSec} objects or [start,end] pairs.',
       schema: timelineOperationToolSchema,
     });
 
@@ -224,7 +308,7 @@ export class AxcutDeepAgentService {
       schema: suggestionDecisionToolSchema,
     });
 
-    return createDeepAgentRuntime({
+    return createAgent({
       model: await createAxcutChatModel(this.llmConfig),
       checkpointer: this.checkpointer,
       tools: [
@@ -245,24 +329,9 @@ export class AxcutDeepAgentService {
     await this.restoreLatestCheckpointIfNeeded(sessionId);
 
     const agent = await this.create(projectId);
-    const stream = agent.streamEvents({
+    const result = await agent.invoke({
       messages: [new HumanMessage(prompt)],
     }, this.sessions.buildSessionConfig(sessionId));
-
-    const result = await consumeLangGraphStream(stream, {
-      onTextDelta: async (delta: string) => {
-        this.events.emit(projectId, 'agent.message.delta', { sessionId, delta });
-      },
-      onThinkingDelta: async (delta: string) => {
-        this.events.emit(projectId, 'agent.thinking.delta', { sessionId, delta });
-      },
-      onOperation: async (operation: RuntimeOperationEvent) => {
-        this.events.emit(projectId, 'agent.operation', { sessionId, operation });
-      },
-      onCompaction: async (compaction: RuntimeContextCompactionEvent) => {
-        this.events.emit(projectId, 'agent.compaction', { sessionId, compaction });
-      },
-    });
 
     await this.sessions.saveCheckpoint(sessionId);
     const currentSession = this.sessions.get(sessionId);
@@ -273,7 +342,7 @@ export class AxcutDeepAgentService {
     });
 
     return {
-      text: result.responseText || this.documents.readDocument(projectId).agent.lastReasoningSummary || 'Completed the deepagents editing turn.',
+      text: extractAgentResponseText(result) || this.documents.readDocument(projectId).agent.lastReasoningSummary || 'Completed the editing turn.',
       state: result,
     };
   }

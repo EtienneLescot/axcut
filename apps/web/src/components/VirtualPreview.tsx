@@ -4,22 +4,24 @@ import type { AxcutClip } from '@axcut/schema';
 import { clampVirtualTime, formatSeconds, locateSourcePosition, locateVirtualPosition, totalVirtualDuration } from '../lib/virtual-preview.js';
 
 type VirtualPreviewProps = {
-  videoSrc: string | null;
+  videoSources: Array<{ src: string; label: string }>;
   clips: AxcutClip[];
   revision: number;
   seekTarget?: { timeSec: number; requestId: number } | null;
   onTimeChange?: (timeSec: number) => void;
 };
 
-export function VirtualPreview({ videoSrc, clips, revision, seekTarget, onTimeChange }: VirtualPreviewProps) {
+export function VirtualPreview({ videoSources, clips, revision, seekTarget, onTimeChange }: VirtualPreviewProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const isProgrammaticSeekRef = useRef(false);
   const [virtualTimeSec, setVirtualTimeSec] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [loadState, setLoadState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [sourceIndex, setSourceIndex] = useState(0);
 
   const virtualDurationSec = useMemo(() => totalVirtualDuration(clips), [clips]);
   const activePosition = useMemo(() => locateVirtualPosition(clips, virtualTimeSec), [clips, virtualTimeSec]);
+  const activeSource = videoSources[sourceIndex] ?? null;
 
   const updateVirtualTime = useCallback((nextTimeSec: number) => {
     setVirtualTimeSec(nextTimeSec);
@@ -112,7 +114,8 @@ export function VirtualPreview({ videoSrc, clips, revision, seekTarget, onTimeCh
     const video = videoRef.current;
     setIsPlaying(false);
     updateVirtualTime(0);
-    setLoadState(videoSrc ? 'loading' : 'idle');
+    setSourceIndex(0);
+    setLoadState(videoSources.length > 0 ? 'loading' : 'idle');
     if (!video) {
       return;
     }
@@ -123,7 +126,7 @@ export function VirtualPreview({ videoSrc, clips, revision, seekTarget, onTimeCh
         video.currentTime = start.sourceTimeSec;
       }
     }
-  }, [revision, updateVirtualTime, videoSrc]);
+  }, [revision, updateVirtualTime, videoSources]);
 
   useEffect(() => {
     if (!seekTarget) {
@@ -136,14 +139,15 @@ export function VirtualPreview({ videoSrc, clips, revision, seekTarget, onTimeCh
     <>
       <p className="muted preview-summary">
         Seek-based virtual preview · {clips.length} clip{clips.length === 1 ? '' : 's'} · {formatSeconds(virtualDurationSec)}
+        {activeSource ? ` · ${activeSource.label}` : ''}
       </p>
-      {videoSrc ? (
+      {activeSource ? (
         <>
           <div className="video-frame">
             <video
-              key={videoSrc}
+              key={activeSource.src}
               ref={videoRef}
-              src={videoSrc}
+              src={activeSource.src}
               className="video"
               preload="metadata"
               playsInline
@@ -156,6 +160,11 @@ export function VirtualPreview({ videoSrc, clips, revision, seekTarget, onTimeCh
               onWaiting={() => setLoadState('loading')}
               onCanPlay={() => setLoadState('ready')}
               onError={() => {
+                if (sourceIndex + 1 < videoSources.length) {
+                  setSourceIndex((current) => current + 1);
+                  setLoadState('loading');
+                  return;
+                }
                 setLoadState('error');
                 setIsPlaying(false);
               }}

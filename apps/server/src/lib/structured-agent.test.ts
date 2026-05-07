@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { createEmptyDocument, type AxcutDocument } from '@axcut/schema';
 
-import { buildFillerSuggestions, buildPauseSuggestions, interpretPrompt, searchTranscript } from './structured-agent.js';
+import { buildFillerSuggestions, buildPauseSuggestions, buildSpeechIntervals, interpretPrompt, searchTranscript } from './structured-agent.js';
 import { buildTimelineFromIntervals } from './timeline.js';
 
 function createDocument(): AxcutDocument {
@@ -76,5 +76,15 @@ test('interpretPrompt applies structured cuts on direct remove requests', () => 
   assert.equal(intent?.kind, 'apply');
   if (intent?.kind === 'apply') {
     assert.ok(intent.intervals.length >= 1);
+  }
+});
+
+test('interpretPrompt keeps speech for direct non-speaking removal requests', () => {
+  const intent = interpretPrompt(createDocument(), 'Est-ce que tu peux supprimer tous les moments où je ne parle pas?');
+  assert.ok(intent);
+  assert.equal(intent?.kind, 'apply');
+  if (intent?.kind === 'apply') {
+    assert.deepEqual(intent.intervals, buildSpeechIntervals(createDocument()));
+    assert.deepEqual(intent.intervals.map((interval) => [interval.startSec, interval.endSec]), [[0, 2], [3, 5]]);
   }
 });
