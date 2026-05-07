@@ -20,7 +20,7 @@ export class LlmConfigService {
     const paths = getYagrPaths();
 
     return {
-      ready: isProviderConfigured(localConfig, (candidate) => this.configService.getApiKey(candidate)),
+      ready: isProviderConfigured(localConfig, (candidate: string) => this.configService.getApiKey(candidate)),
       source: {
         homeDir: paths.homeDir,
         configPath: paths.yagrConfigPath,
@@ -40,7 +40,7 @@ export class LlmConfigService {
         apiKeyAvailable: provider ? Boolean(this.configService.getApiKey(provider)) : false,
         apiKeySource: provider && this.configService.getApiKey(provider) ? 'yagr' : 'environment',
       },
-      providers: YAGR_SELECTABLE_MODEL_PROVIDERS.map((candidate) => ({
+      providers: YAGR_SELECTABLE_MODEL_PROVIDERS.map((candidate: string) => ({
         id: candidate,
         label: getProviderDisplayName(candidate),
         defaultModel: getDefaultModelForProvider(candidate),

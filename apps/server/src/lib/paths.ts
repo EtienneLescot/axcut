@@ -5,10 +5,12 @@ const currentDir = path.dirname(fileURLToPath(import.meta.url));
 
 export const repoRoot = path.resolve(currentDir, '../../../../');
 export const dataRoot = path.join(repoRoot, '.axcut-data');
+export const runtimeRoot = path.join(dataRoot, 'runtime');
 export const projectsRoot = path.join(dataRoot, 'projects');
 export const agentSessionsRoot = path.join(dataRoot, 'deepagent-sessions');
 export const llmConfigPath = path.join(dataRoot, 'llm-config.json');
 export const databasePath = path.join(dataRoot, 'metadata.sqlite');
+export const serverRuntimePath = path.join(runtimeRoot, 'server.json');
 
 export function projectRoot(projectId: string): string {
   return path.join(projectsRoot, projectId);
