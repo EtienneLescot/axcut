@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { Save } from 'lucide-react';
 
 export type LlmConfigSnapshot = {
   ready: boolean;
@@ -126,6 +127,7 @@ export function LlmSetupPanel({ snapshot, busy, onSave }: LlmSetupPanelProps) {
         ) : null}
 
         <button
+          className="icon-action"
           onClick={() => onSave({
             provider,
             model,
@@ -134,8 +136,11 @@ export function LlmSetupPanel({ snapshot, busy, onSave }: LlmSetupPanelProps) {
             clearApiKey,
           })}
           disabled={busy || !provider}
+          title="Save LLM config"
+          aria-label="Save LLM config"
         >
-          Save LLM config
+          <Save size={16} strokeWidth={1.8} aria-hidden="true" />
+          <span className="sr-only">Save LLM config</span>
         </button>
       </div>
     </div>

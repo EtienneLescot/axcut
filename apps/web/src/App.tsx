@@ -1,6 +1,28 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import type { ButtonHTMLAttributes, ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { AxcutDocument } from '@axcut/schema';
+import {
+  ArrowLeft,
+  Check,
+  Download,
+  Eye,
+  FileText,
+  FolderOpen,
+  History,
+  LogIn,
+  MessageSquarePlus,
+  Pencil,
+  Plug,
+  Power,
+  RefreshCw,
+  SendHorizontal,
+  Settings2,
+  Trash2,
+  Upload,
+  X,
+} from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 
 import { TimelinePane } from './components/TimelinePane.js';
 import { VirtualPreview } from './components/VirtualPreview.js';
@@ -118,6 +140,26 @@ const transcriptLanguageOptions = [
 
 type TranscriptLanguageSelection = typeof transcriptLanguageOptions[number]['value'];
 
+type IconButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
+  icon: LucideIcon;
+  label: string;
+  children?: ReactNode;
+};
+
+function IconButton({ icon: Icon, label, className, children, ...props }: IconButtonProps) {
+  return (
+    <button
+      {...props}
+      className={['icon-action', className].filter(Boolean).join(' ')}
+      aria-label={props['aria-label'] ?? label}
+      title={props.title ?? label}
+    >
+      <Icon size={16} strokeWidth={1.8} aria-hidden="true" />
+      {children ? <span className="button-text">{children}</span> : <span className="sr-only">{label}</span>}
+    </button>
+  );
+}
+
 async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers ?? {});
   if (init?.body && !headers.has('Content-Type')) {
@@ -193,27 +235,27 @@ function buildEditedTranscript(document: AxcutDocument): string {
 function getSttStatus(document: AxcutDocument | undefined, jobs: JobSummary[] | undefined) {
   const sttJob = jobs?.find((job) => job.kind === 'transcribe_asset' || job.kind === 'ingest_asset') ?? null;
   if (!document?.assets.length) {
-    return { label: 'STT idle', detail: 'Load a video to start transcription.', progress: 0, tone: 'idle' as const };
+    return { label: 'Transcription idle', detail: 'Load a video to start transcription.', progress: 0, tone: 'idle' as const };
   }
   if (sttJob?.status === 'queued' || sttJob?.status === 'running') {
     const inSttPhase = sttJob.kind === 'transcribe_asset' || sttJob.progress >= 0.7 || /transcrib/i.test(sttJob.message);
     return {
-      label: inSttPhase ? 'STT running' : 'Preparing STT',
+      label: inSttPhase ? 'Transcription running' : 'Preparing transcription',
       detail: sttJob.message,
       progress: Math.max(0, Math.min(1, sttJob.progress)),
       tone: 'running' as const,
     };
   }
   if (sttJob?.status === 'failed') {
-    return { label: 'STT failed', detail: sttJob.message, progress: sttJob.progress, tone: 'error' as const };
+    return { label: 'Transcription failed', detail: sttJob.message, progress: sttJob.progress, tone: 'error' as const };
   }
   if (document.transcript) {
-    return { label: 'STT complete', detail: `${document.transcript.segments.length} segments · ${document.transcript.words.length} words · ${document.transcript.language}`, progress: 1, tone: 'ready' as const };
+    return { label: 'Transcription complete', detail: `${document.transcript.segments.length} segments · ${document.transcript.words.length} words · ${document.transcript.language}`, progress: 1, tone: 'ready' as const };
   }
   if (!sttJob) {
-    return { label: 'STT waiting', detail: 'Waiting for ingest job.', progress: 0, tone: 'idle' as const };
+    return { label: 'Transcription waiting', detail: 'Waiting for ingest job.', progress: 0, tone: 'idle' as const };
   }
-  return { label: 'STT waiting', detail: sttJob.message, progress: sttJob.progress, tone: 'idle' as const };
+  return { label: 'Transcription waiting', detail: sttJob.message, progress: sttJob.progress, tone: 'idle' as const };
 }
 
 function getExportStatus(job: JobSummary | null, busy: boolean, error: unknown) {
@@ -518,7 +560,6 @@ export function App() {
       original,
     ];
   }, [primaryAsset, projectId, sessionToken]);
-  const latestJob = snapshot?.jobs[0] ?? null;
   const latestExportJob = snapshot?.jobs.find((job) => job.kind === 'export') ?? null;
   const exportJobResult = parseJobResult(latestExportJob);
   const exportArtifactName = artifactName(typeof exportJobResult?.outputPath === 'string' ? exportJobResult.outputPath : undefined);
@@ -527,11 +568,6 @@ export function App() {
     : null;
   const exportBusy = exportVideo.isPending || latestExportJob?.status === 'queued' || latestExportJob?.status === 'running';
   const exportStatus = getExportStatus(latestExportJob, exportVideo.isPending, exportVideo.error);
-  const statusText = !projectId
-    ? 'No configured project. Set AXCUT_VIDEO_PATH before starting the server.'
-    : latestJob
-      ? latestJob.message
-      : 'Ready';
   const providerLabel = llmConfigQuery.data?.ready
     ? `${llmConfigQuery.data.effective.providerLabel} · ${llmConfigQuery.data.effective.model}`
     : 'LLM not configured';
@@ -556,44 +592,17 @@ export function App() {
     <div className="app-shell">
       <aside className="left-rail panel">
         <header className="chat-header">
-          <div>
+          <div className="chat-title-block">
             <h1>Axcut</h1>
-            <p className="muted">Agentic video editor</p>
+            <p className="chat-session-title muted" title={activeSession?.title ?? 'New conversation'}>
+              {activeSession?.title ?? 'New conversation'}
+            </p>
           </div>
           <div className="header-actions">
-            <button className="secondary" onClick={() => setHistoryOpen(true)} disabled={!projectId}>History</button>
-            <button onClick={() => createSession.mutate()} disabled={!projectId || createSession.isPending}>New chat</button>
+            <IconButton icon={History} label="History" className="secondary" onClick={() => setHistoryOpen(true)} disabled={!projectId} />
+            <IconButton icon={MessageSquarePlus} label="New chat" onClick={() => createSession.mutate()} disabled={!projectId || createSession.isPending} />
           </div>
         </header>
-
-        <div className="project-row">
-          {projectCount > 1 ? (
-            <select
-              value={projectId ?? ''}
-              onChange={(event) => {
-                setSelectedProjectId(event.target.value || null);
-                setActiveSessionId(null);
-              }}
-              aria-label="Current project"
-            >
-              {projectsQuery.data?.projects.map((project) => (
-                <option key={project.id} value={project.id}>{project.title}</option>
-              ))}
-            </select>
-          ) : (
-            <div className="project-title-pill">
-              <span className="muted">Project</span>
-              <strong>{document?.project.title ?? 'No video loaded'}</strong>
-            </div>
-          )}
-          <button className="secondary" onClick={() => setLoadVideoOpen(true)}>Load video</button>
-        </div>
-
-        <div className="session-card">
-          <span className="muted">Current conversation</span>
-          <strong>{activeSession?.title ?? 'New conversation'}</strong>
-          <small className="muted">{statusText}</small>
-        </div>
 
         <div className="messages">
           {snapshot?.messages.length ? snapshot.messages.map((item) => (
@@ -624,24 +633,26 @@ export function App() {
             value={message}
             onChange={(event) => setMessage(event.target.value)}
             onKeyDown={(event) => {
-              if ((event.metaKey || event.ctrlKey) && event.key === 'Enter' && message.trim()) {
+              if (event.key === 'Enter' && !event.shiftKey && message.trim()) {
+                event.preventDefault();
                 sendChat.mutate();
               }
             }}
-            rows={4}
+            rows={2}
             placeholder="Describe the edit you want."
           />
-          <button
-            type="submit"
-            disabled={!projectId || !sessionToken || !llmConfigQuery.data?.ready || !message.trim() || sendChat.isPending}
-          >
-            {sendChat.isPending ? 'Working...' : 'Send'}
-          </button>
           <div className="composer-footer">
             <button type="button" className={llmConfigQuery.data?.ready ? 'provider-pill compact ready' : 'provider-pill compact'} onClick={() => setProviderOpen(true)}>
-              {providerLabel}
+              <Settings2 size={14} strokeWidth={1.8} aria-hidden="true" />
+              <span>{providerLabel}</span>
             </button>
             {sendChat.isPending ? <span className="muted">Waiting for the agent response...</span> : null}
+            <IconButton
+              type="submit"
+              icon={SendHorizontal}
+              label={sendChat.isPending ? 'Working' : 'Send'}
+              disabled={!projectId || !sessionToken || !llmConfigQuery.data?.ready || !message.trim() || sendChat.isPending}
+            />
           </div>
           {sendChat.isError ? <p className="error-copy">{sendChat.error instanceof Error ? sendChat.error.message : 'Chat request failed.'}</p> : null}
         </form>
@@ -657,17 +668,39 @@ export function App() {
                 : 'Waiting for configured video source'}
             </p>
           </div>
+          <div className="preview-statuses">
+            <StatusChip label={sttStatus.label} detail={sttStatus.detail} tone={sttStatus.tone} />
+            {exportStatus ? <StatusChip label={exportStatus.label} detail={exportStatus.detail} tone={exportStatus.tone} href={exportHref} /> : null}
+          </div>
           <div className="preview-actions">
-            <button className="secondary" onClick={() => setTranscriptModal('source')} disabled={!sourceTranscriptName}>Source transcript</button>
-            <button className="secondary" onClick={() => setTranscriptModal('edited')} disabled={!document?.transcript}>Timeline transcript</button>
-            <button onClick={() => exportVideo.mutate()} disabled={!document?.timeline.clips.length || !sessionToken || exportBusy}>
-              {exportBusy ? 'Exporting...' : 'Export'}
-            </button>
+            <div className="preview-project-controls">
+              {projectCount > 1 ? (
+                <select
+                  className="project-select"
+                  value={projectId ?? ''}
+                  onChange={(event) => {
+                    setSelectedProjectId(event.target.value || null);
+                    setActiveSessionId(null);
+                  }}
+                  aria-label="Current project"
+                >
+                  {projectsQuery.data?.projects.map((project) => (
+                    <option key={project.id} value={project.id}>{project.title}</option>
+                  ))}
+                </select>
+              ) : (
+                <div className="project-title-pill compact">
+                  <span className="muted">Project</span>
+                  <strong>{document?.project.title ?? 'No video loaded'}</strong>
+                </div>
+              )}
+              <IconButton icon={FolderOpen} label="Load video" className="secondary" onClick={() => setLoadVideoOpen(true)} />
+            </div>
+            <IconButton icon={FileText} label="Source transcript" className="secondary" onClick={() => setTranscriptModal('source')} disabled={!sourceTranscriptName} />
+            <IconButton icon={Eye} label="Timeline transcript" className="secondary" onClick={() => setTranscriptModal('edited')} disabled={!document?.transcript} />
+            <IconButton icon={Download} label={exportBusy ? 'Exporting' : 'Export'} onClick={() => exportVideo.mutate()} disabled={!document?.timeline.clips.length || !sessionToken || exportBusy} />
           </div>
         </div>
-
-        <SttStatusBar status={sttStatus} />
-        {exportStatus ? <ExportStatusBar status={exportStatus} href={exportHref} /> : null}
 
         {document ? (
           <VirtualPreview
@@ -749,33 +782,20 @@ export function App() {
   );
 }
 
-function SttStatusBar({ status }: { status: ReturnType<typeof getSttStatus> }) {
+function StatusChip({ label, detail, tone, href }: { label: string; detail: string; tone: 'idle' | 'running' | 'ready' | 'error'; href?: string | null }) {
   return (
-    <div className={`stt-status ${status.tone}`}>
-      <div className="stt-status-copy">
-        <strong>{status.label}</strong>
-        <span className="muted">{status.detail}</span>
-      </div>
-      <div className="stt-progress" aria-label={`${status.label}: ${Math.round(status.progress * 100)}%`}>
-        <div style={{ width: `${Math.round(status.progress * 100)}%` }} />
-      </div>
-    </div>
-  );
-}
-
-function ExportStatusBar({ status, href }: { status: NonNullable<ReturnType<typeof getExportStatus>>; href: string | null }) {
-  return (
-    <div className={`export-status ${status.tone}`}>
-      <div className="export-status-copy">
-        <div>
-          <strong>{status.label}</strong>
-          <span className="muted">{status.detail}</span>
-        </div>
-        {href ? <a className="export-download" href={href} download>Download MP4</a> : null}
-      </div>
-      <div className="stt-progress" aria-label={`${status.label}: ${Math.round(status.progress * 100)}%`}>
-        <div style={{ width: `${Math.round(status.progress * 100)}%` }} />
-      </div>
+    <div className={`status-chip ${tone}`} title={detail} aria-label={`${label}: ${detail}`}>
+      <span className="status-dot" aria-hidden="true" />
+      <span className="status-chip-copy">
+        <strong>{label}</strong>
+        <span className="muted">{detail}</span>
+      </span>
+      {href ? (
+        <a className="export-download" href={href} download title="Download MP4" aria-label="Download MP4">
+          <Download size={14} strokeWidth={1.8} aria-hidden="true" />
+          <span>MP4</span>
+        </a>
+      ) : null}
     </div>
   );
 }
@@ -818,7 +838,7 @@ function TranscriptDialog({
             <h2>{title}</h2>
             <p className="muted">{subtitle}</p>
           </div>
-          <button className="secondary" onClick={onClose}>Close</button>
+          <IconButton icon={X} label="Close" className="secondary" onClick={onClose} />
         </div>
         {showControls ? (
           <div className="transcript-toolbar">
@@ -835,9 +855,7 @@ function TranscriptDialog({
                 ))}
               </select>
             </label>
-            <button onClick={onRegenerate} disabled={regenerating}>
-              {regenerating ? 'Regenerating...' : regenerateLabel}
-            </button>
+            <IconButton icon={RefreshCw} label={regenerating ? 'Regenerating' : regenerateLabel ?? 'Regenerate transcript'} onClick={onRegenerate} disabled={regenerating} />
           </div>
         ) : null}
         {error ? <p className="error-copy">{error}</p> : null}
@@ -877,9 +895,9 @@ function SessionHistoryDialog({
             <h2>Conversation History</h2>
             <p className="muted">Switch sessions or start a clean chat.</p>
           </div>
-          <button className="secondary" onClick={onClose}>Close</button>
+          <IconButton icon={X} label="Close" className="secondary" onClick={onClose} />
         </div>
-        <button onClick={onCreate} disabled={busy}>New chat</button>
+        <IconButton icon={MessageSquarePlus} label="New chat" onClick={onCreate} disabled={busy} />
         <div className="session-list">
           {sessions.map((session) => (
             <article key={session.id} className={session.id === activeSessionId ? 'session-item active' : 'session-item'}>
@@ -893,7 +911,7 @@ function SessionHistoryDialog({
                   }}
                 >
                   <input value={editingTitle} onChange={(event) => setEditingTitle(event.target.value)} />
-                  <button disabled={busy || !editingTitle.trim()}>Save</button>
+                  <IconButton icon={Check} label="Save" disabled={busy || !editingTitle.trim()} />
                 </form>
               ) : (
                 <>
@@ -905,17 +923,17 @@ function SessionHistoryDialog({
                   </button>
                   <div className="session-actions">
                     {session.id === activeSessionId ? <span className="status-pill ready">Active</span> : null}
-                    <button
+                    <IconButton
+                      icon={Pencil}
+                      label="Rename"
                       className="secondary"
                       onClick={() => {
                         setEditingId(session.id);
                         setEditingTitle(session.title);
                       }}
                       disabled={busy}
-                    >
-                      Rename
-                    </button>
-                    <button className="danger" onClick={() => onDelete(session.id)} disabled={busy || sessions.length <= 1}>Delete</button>
+                    />
+                    <IconButton icon={Trash2} label="Delete" className="danger" onClick={() => onDelete(session.id)} disabled={busy || sessions.length <= 1} />
                   </div>
                 </>
               )}
@@ -949,7 +967,7 @@ function LoadVideoDialog({
             <h2>Load Video</h2>
             <p className="muted">Enter a video path that exists on the machine running the Axcut server.</p>
           </div>
-          <button className="secondary" onClick={onClose}>Close</button>
+          <IconButton icon={X} label="Close" className="secondary" onClick={onClose} />
         </div>
         <form
           className="provider-form"
@@ -969,7 +987,7 @@ function LoadVideoDialog({
             <input value={path} onChange={(event) => setPath(event.target.value)} placeholder="/home/you/Videos/source.mp4" />
           </label>
           {error ? <p className="error-copy">{error}</p> : null}
-          <button disabled={busy || !path.trim()}>{busy ? 'Loading...' : 'Create project and ingest'}</button>
+          <IconButton icon={Upload} label={busy ? 'Loading video' : 'Create project and ingest'} disabled={busy || !path.trim()} />
         </form>
       </section>
     </div>
@@ -1065,9 +1083,9 @@ function ProviderSettingsDialog({
       <section className="modal panel provider-modal">
         <div className="modal-header">
           {screen === 'models' ? (
-            <button className="icon-button secondary" onClick={() => setScreen('providers')} aria-label="Change provider">←</button>
+            <IconButton icon={ArrowLeft} label="Change provider" className="secondary" onClick={() => setScreen('providers')} />
           ) : (
-            <button className="icon-button secondary" onClick={() => setScreen(screen === 'providers' ? 'models' : 'providers')} aria-label="Back">←</button>
+            <IconButton icon={ArrowLeft} label="Back" className="secondary" onClick={() => setScreen(screen === 'providers' ? 'models' : 'providers')} />
           )}
           <div>
             <h2>{screen === 'models' ? 'Select Model' : screen === 'providers' ? 'Connected Providers' : 'Provider Settings'}</h2>
@@ -1079,7 +1097,7 @@ function ProviderSettingsDialog({
                   : 'Connect or disconnect providers.'}
             </p>
           </div>
-          <button className="secondary" onClick={onClose}>Close</button>
+          <IconButton icon={X} label="Close" className="secondary" onClick={onClose} />
         </div>
 
         {screen === 'models' && activeProvider ? (
@@ -1103,9 +1121,9 @@ function ProviderSettingsDialog({
             </div>
             {error ? <p className="error-copy">{error}</p> : null}
             <div className="provider-actions">
-              <button onClick={useModel} disabled={busy || !model.trim()}>Use model</button>
-              <button className="secondary" onClick={() => void loadModels()} disabled={busy}>Reload models</button>
-              <button className="secondary" onClick={() => setScreen('settings')}>Provider settings</button>
+              <IconButton icon={Check} label="Use model" onClick={useModel} disabled={busy || !model.trim()} />
+              <IconButton icon={RefreshCw} label="Reload models" className="secondary" onClick={() => void loadModels()} disabled={busy} />
+              <IconButton icon={Settings2} label="Provider settings" className="secondary" onClick={() => setScreen('settings')} />
             </div>
           </div>
         ) : null}
@@ -1134,7 +1152,7 @@ function ProviderSettingsDialog({
               ))}
             </div>
             {snapshot?.connectedProviders.length ? null : <div className="message-empty muted">No connected providers yet.</div>}
-            <button className="secondary" onClick={() => setScreen('settings')}>Connect a new provider</button>
+            <IconButton icon={Plug} label="Connect a new provider" className="secondary" onClick={() => setScreen('settings')} />
           </div>
         ) : null}
 
@@ -1193,7 +1211,9 @@ function ProviderSettingsDialog({
               ) : null}
               {error ? <p className="error-copy">{error}</p> : null}
               <div className="provider-actions">
-              <button
+              <IconButton
+                icon={activeProvider.oauth ? LogIn : Plug}
+                label={activeProvider.oauth ? 'Start login' : 'Connect'}
                 onClick={() => runProviderAction(async () => {
                   const result = await requestJson<{ challenge?: Omit<DeviceChallenge, 'provider'> }>(`/api/llm/providers/${activeProvider.id}/connect`, {
                     method: 'POST',
@@ -1207,18 +1227,18 @@ function ProviderSettingsDialog({
                   }
                 })}
                 disabled={busy || (!activeProvider.oauth && activeProvider.requiresApiKey && !apiKey && !activeProvider.connected)}
-              >
-                {activeProvider.oauth ? 'Start login' : 'Connect'}
-              </button>
-              <button
+              />
+              <IconButton
+                icon={Check}
+                label="Use provider"
                 className="secondary"
                 onClick={useModel}
                 disabled={busy || !model.trim()}
-              >
-                Use provider
-              </button>
+              />
               {challenge ? (
-                <button
+                <IconButton
+                  icon={Check}
+                  label="Complete login"
                   onClick={() => runProviderAction(async () => {
                     await requestJson(`/api/llm/providers/${activeProvider.id}/device/complete`, {
                       method: 'POST',
@@ -1229,11 +1249,11 @@ function ProviderSettingsDialog({
                     setScreen('models');
                   })}
                   disabled={busy}
-                >
-                  Complete login
-                </button>
+                />
               ) : null}
-              <button
+              <IconButton
+                icon={Power}
+                label="Disconnect"
                 className="danger"
                 onClick={() => runProviderAction(async () => {
                   await requestJson(`/api/llm/providers/${activeProvider.id}`, {
@@ -1242,9 +1262,7 @@ function ProviderSettingsDialog({
                   });
                 })}
                 disabled={busy || !activeProvider.connected}
-              >
-                Disconnect
-              </button>
+              />
               </div>
             </div>
           </div>

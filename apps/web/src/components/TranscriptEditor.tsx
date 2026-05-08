@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import type { AxcutDocument } from '@axcut/schema';
+import { RotateCcw, Scissors, X } from 'lucide-react';
 
 import { keptWordIdSet, selectWordRange } from '../lib/virtual-preview.js';
 
@@ -43,6 +44,7 @@ export function TranscriptEditor({ document, busy, onDropWordRange, onRestoreTim
         </div>
         <div className="toolbar-actions">
           <button
+            className="icon-action"
             onClick={() => {
               if (selectedRange) {
                 onDropWordRange(selectedRange.startWordId, selectedRange.endWordId);
@@ -51,21 +53,28 @@ export function TranscriptEditor({ document, busy, onDropWordRange, onRestoreTim
               }
             }}
             disabled={busy || !selectedRange}
+            title="Cut selection"
+            aria-label="Cut selection"
           >
-            Cut selection
+            <Scissors size={16} strokeWidth={1.8} aria-hidden="true" />
+            <span className="sr-only">Cut selection</span>
           </button>
           <button
-            className="secondary-button"
+            className="icon-action secondary"
             onClick={() => {
               setAnchorWordId(null);
               setFocusWordId(null);
             }}
             disabled={busy || !selectedRange}
+            title="Clear selection"
+            aria-label="Clear selection"
           >
-            Clear selection
+            <X size={16} strokeWidth={1.8} aria-hidden="true" />
+            <span className="sr-only">Clear selection</span>
           </button>
-          <button className="secondary-button" onClick={onRestoreTimeline} disabled={busy}>
-            Restore full timeline
+          <button className="icon-action secondary" onClick={onRestoreTimeline} disabled={busy} title="Restore full timeline" aria-label="Restore full timeline">
+            <RotateCcw size={16} strokeWidth={1.8} aria-hidden="true" />
+            <span className="sr-only">Restore full timeline</span>
           </button>
         </div>
       </div>

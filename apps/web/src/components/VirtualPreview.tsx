@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { AxcutClip } from '@axcut/schema';
+import { Pause, Play, RotateCcw } from 'lucide-react';
 
 import { clampVirtualTime, formatSeconds, locateSourcePosition, locateVirtualPosition, totalVirtualDuration } from '../lib/virtual-preview.js';
 
@@ -181,10 +182,14 @@ export function VirtualPreview({ videoSources, clips, revision, seekTarget, onTi
           </div>
 
           <div className="preview-controls">
-            <button onClick={handlePlayPause} disabled={clips.length === 0 || loadState !== 'ready'}>
-              {isPlaying ? 'Pause' : 'Play'}
+            <button className="icon-action" onClick={handlePlayPause} disabled={clips.length === 0 || loadState !== 'ready'} title={isPlaying ? 'Pause' : 'Play'} aria-label={isPlaying ? 'Pause' : 'Play'}>
+              {isPlaying ? <Pause size={16} strokeWidth={1.8} aria-hidden="true" /> : <Play size={16} strokeWidth={1.8} aria-hidden="true" />}
+              <span className="sr-only">{isPlaying ? 'Pause' : 'Play'}</span>
             </button>
-            <button onClick={() => seekToVirtualTime(0)} disabled={clips.length === 0 || loadState !== 'ready'}>Restart</button>
+            <button className="icon-action secondary" onClick={() => seekToVirtualTime(0)} disabled={clips.length === 0 || loadState !== 'ready'} title="Restart" aria-label="Restart">
+              <RotateCcw size={16} strokeWidth={1.8} aria-hidden="true" />
+              <span className="sr-only">Restart</span>
+            </button>
             <div className="preview-readout">
               <strong>{formatSeconds(virtualTimeSec)}</strong>
               <span className="muted">/ {formatSeconds(virtualDurationSec)}</span>

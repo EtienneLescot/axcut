@@ -1,4 +1,5 @@
 import type { AxcutSuggestion } from '@axcut/schema';
+import { Check, X } from 'lucide-react';
 
 type SuggestionListProps = {
   suggestions: AxcutSuggestion[];
@@ -46,8 +47,14 @@ export function SuggestionList({
               ) : null}
               {suggestion.status === 'pending' ? (
                 <div className="toolbar-actions">
-                  <button onClick={() => onApprove(suggestion.id)} disabled={busy}>Approve</button>
-                  <button className="secondary-button" onClick={() => onReject(suggestion.id)} disabled={busy}>Reject</button>
+                  <button className="icon-action" onClick={() => onApprove(suggestion.id)} disabled={busy} title="Approve" aria-label="Approve">
+                    <Check size={16} strokeWidth={1.8} aria-hidden="true" />
+                    <span className="sr-only">Approve</span>
+                  </button>
+                  <button className="icon-action secondary" onClick={() => onReject(suggestion.id)} disabled={busy} title="Reject" aria-label="Reject">
+                    <X size={16} strokeWidth={1.8} aria-hidden="true" />
+                    <span className="sr-only">Reject</span>
+                  </button>
                 </div>
               ) : null}
             </div>
