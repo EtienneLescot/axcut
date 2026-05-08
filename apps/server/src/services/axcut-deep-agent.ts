@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 import { MemorySaver } from '@langchain/langgraph';
 import { SessionService, deriveSessionTitle, type DeepAgentSessionRecord } from '@yagr/session-service';
@@ -159,6 +160,42 @@ function stringifyMessageContent(content: unknown): string {
     }).filter(Boolean).join('\n');
   }
   return '';
+}
+
+function safeStringify(value: unknown): string {
+  if (typeof value === 'string') {
+    return value;
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function truncate(value: string, maxLength = 4000): string {
+  return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
+}
+
+function humanizeToolName(name: string): string {
+  return name
+    .split(/[_-]+/g)
+    .filter(Boolean)
+    .map((part) => `${part[0]?.toUpperCase() ?? ''}${part.slice(1)}`)
+    .join(' ') || 'Tool';
+}
+
+function extractStreamText(event: Record<string, unknown>): string {
+  const data = event.data && typeof event.data === 'object' ? event.data as Record<string, unknown> : {};
+  const chunk = data.chunk && typeof data.chunk === 'object' ? data.chunk as Record<string, unknown> : undefined;
+  const content = chunk && 'content' in chunk ? chunk.content : undefined;
+  return stringifyMessageContent(content);
+}
+
+function extractResponseFromStreamEnd(event: Record<string, unknown>): unknown {
+  const data = event.data && typeof event.data === 'object' ? event.data as Record<string, unknown> : undefined;
+  const output = data?.output;
+  return output && typeof output === 'object' && 'messages' in output ? output : null;
 }
 
 export function buildAgentInputMessages(prompt: string, history: AgentConversationMessage[] = [], invocationPrompt = prompt) {
@@ -471,9 +508,120 @@ export class AxcutDeepAgentService {
     const invocationPrompt = buildAxcutInvocationPrompt(this.documents.readDocument(projectId), prompt);
 
     const agent = await this.create(projectId);
-    const result = await agent.invoke({
+    const input = {
       messages: hasCheckpoint ? [new HumanMessage(invocationPrompt)] : buildAgentInputMessages(prompt, history, invocationPrompt),
-    }, this.sessions.buildSessionConfig(sessionId));
+    };
+    const config = this.sessions.buildSessionConfig(sessionId);
+    let result: unknown = null;
+    let streamedResponse = '';
+    const thinkingOperationId = randomUUID();
+    let thinkingStartedAt = 0;
+
+    if (typeof (agent as { streamEvents?: unknown }).streamEvents === 'function') {
+      const stream = (agent as { streamEvents: (agentInput: unknown, config: Record<string, unknown>) => AsyncIterable<Record<string, unknown>> }).streamEvents(input, config);
+      for await (const event of stream) {
+        const eventType = typeof event.event === 'string' ? event.event : '';
+        const name = typeof event.name === 'string' ? event.name : '';
+        const runId = typeof event.run_id === 'string' ? event.run_id : randomUUID();
+        const data = event.data && typeof event.data === 'object' ? event.data as Record<string, unknown> : {};
+
+        if (eventType === 'on_chat_model_start') {
+          thinkingStartedAt = Date.now();
+          this.events.emit(projectId, 'agent.operation', {
+            sessionId,
+            operation: {
+              operationId: thinkingOperationId,
+              label: 'Thinking',
+              category: 'thinking',
+              status: 'running',
+              summary: name || 'Model is planning the next step.',
+              startedAt: thinkingStartedAt,
+            },
+          });
+          continue;
+        }
+
+        if (eventType === 'on_chat_model_stream') {
+          const delta = extractStreamText(event);
+          if (delta) {
+            streamedResponse += delta;
+            this.events.emit(projectId, 'agent.message.delta', { sessionId, delta });
+          }
+          continue;
+        }
+
+        if (eventType === 'on_chat_model_end' && thinkingStartedAt) {
+          this.events.emit(projectId, 'agent.operation', {
+            sessionId,
+            operation: {
+              operationId: thinkingOperationId,
+              label: 'Thinking',
+              category: 'thinking',
+              status: 'done',
+              summary: 'Model step completed.',
+              startedAt: thinkingStartedAt,
+              endedAt: Date.now(),
+            },
+          });
+          continue;
+        }
+
+        if (eventType === 'on_tool_start') {
+          this.events.emit(projectId, 'agent.operation', {
+            sessionId,
+            operation: {
+              operationId: runId,
+              label: humanizeToolName(name),
+              category: name === 'shell' || name === 'bash' ? 'shell' : 'tool',
+              status: 'running',
+              body: truncate(safeStringify(data.input)),
+              startedAt: Date.now(),
+            },
+          });
+          continue;
+        }
+
+        if (eventType === 'on_tool_end') {
+          this.events.emit(projectId, 'agent.operation', {
+            sessionId,
+            operation: {
+              operationId: runId,
+              label: humanizeToolName(name),
+              category: name === 'shell' || name === 'bash' ? 'shell' : 'tool',
+              status: 'done',
+              summary: 'Tool completed.',
+              body: truncate(safeStringify(data.output)),
+              startedAt: Date.now(),
+              endedAt: Date.now(),
+            },
+          });
+          continue;
+        }
+
+        if (eventType === 'on_tool_error') {
+          this.events.emit(projectId, 'agent.operation', {
+            sessionId,
+            operation: {
+              operationId: runId,
+              label: humanizeToolName(name),
+              category: name === 'shell' || name === 'bash' ? 'shell' : 'tool',
+              status: 'error',
+              summary: 'Tool failed.',
+              body: truncate(safeStringify(data.error)),
+              startedAt: Date.now(),
+              endedAt: Date.now(),
+            },
+          });
+          continue;
+        }
+
+        if (eventType === 'on_chain_end') {
+          result = extractResponseFromStreamEnd(event) ?? result;
+        }
+      }
+    } else {
+      result = await agent.invoke(input, config);
+    }
 
     await this.sessions.saveCheckpoint(sessionId);
     const currentSession = this.sessions.get(sessionId);
@@ -484,7 +632,7 @@ export class AxcutDeepAgentService {
     });
 
     return {
-      text: extractAgentResponseText(result) || this.documents.readDocument(projectId).agent.lastReasoningSummary || 'Completed the editing turn.',
+      text: extractAgentResponseText(result) || streamedResponse.trim() || this.documents.readDocument(projectId).agent.lastReasoningSummary || 'Completed the editing turn.',
       state: result,
     };
   }

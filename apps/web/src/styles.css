@@ -436,6 +436,125 @@ code {
   border: 1px dashed #334155;
 }
 
+.live-run-feed {
+  display: grid;
+  gap: 0.62rem;
+}
+
+.message.streaming {
+  box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.3);
+}
+
+.live-entry {
+  background: rgba(15, 23, 42, 0.58);
+  border-color: rgba(148, 163, 184, 0.16);
+}
+
+.live-entry.thinking {
+  background: rgba(59, 130, 246, 0.1);
+  border-color: rgba(96, 165, 250, 0.18);
+}
+
+.live-entry.operation.done {
+  border-color: rgba(52, 211, 153, 0.22);
+}
+
+.live-entry.operation.error {
+  border-color: rgba(251, 113, 133, 0.28);
+}
+
+.live-entry-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+
+.live-entry-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-weight: 650;
+}
+
+.live-entry-status {
+  color: #92a0b6;
+  font-size: 0.78rem;
+}
+
+.live-entry-status.running {
+  color: #fbbf24;
+}
+
+.live-entry-status.done {
+  color: #34d399;
+}
+
+.live-entry-status.error {
+  color: #fb7185;
+}
+
+.details {
+  margin-top: 0.42rem;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+  padding-top: 0.5rem;
+}
+
+.details summary {
+  cursor: pointer;
+  color: #92a0b6;
+  font-size: 0.82rem;
+}
+
+.details-body {
+  max-height: 220px;
+  overflow: auto;
+  margin: 0.5rem 0 0;
+  padding: 0.62rem;
+  border-radius: 10px;
+  background: rgba(5, 9, 20, 0.84);
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  color: #dbeafe;
+  font: 0.78rem/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre-wrap;
+}
+
+.run-indicator {
+  display: none;
+  width: 15px;
+  height: 15px;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2px;
+  align-items: center;
+  margin: 0.2rem 0 0.35rem 0.2rem;
+}
+
+.run-indicator.active {
+  display: grid;
+}
+
+.run-indicator span {
+  width: 3px;
+  height: 3px;
+  background: #92a0b6;
+  opacity: 0.35;
+  animation: pixel-pulse 900ms infinite ease-in-out;
+}
+
+.run-indicator span:nth-child(2) { animation-delay: 90ms; }
+.run-indicator span:nth-child(3) { animation-delay: 180ms; }
+.run-indicator span:nth-child(4) { animation-delay: 270ms; }
+.run-indicator span:nth-child(5) { animation-delay: 360ms; background: #4f7cff; }
+.run-indicator span:nth-child(6) { animation-delay: 450ms; }
+.run-indicator span:nth-child(7) { animation-delay: 540ms; }
+.run-indicator span:nth-child(8) { animation-delay: 630ms; }
+.run-indicator span:nth-child(9) { animation-delay: 720ms; }
+
+@keyframes pixel-pulse {
+  0%, 100% { opacity: 0.25; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+
 .composer {
   display: flex;
   flex-direction: column;

@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ButtonHTMLAttributes, ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { AxcutDocument } from '@axcut/schema';
+import { emptyLiveRunState, reduceLiveRunState, type LiveOperation, type LiveRunState } from '@yagr/webui-surface';
 import {
   ArrowLeft,
+  Brain,
   Check,
   Download,
   Eye,
@@ -18,8 +20,10 @@ import {
   RefreshCw,
   SendHorizontal,
   Settings2,
+  Terminal,
   Trash2,
   Upload,
+  Wrench,
   X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
@@ -282,6 +286,80 @@ function getExportStatus(job: JobSummary | null, busy: boolean, error: unknown) 
   };
 }
 
+function LiveRunFeed({ state }: { state: LiveRunState }) {
+  const hasContent = state.active || state.thinking || state.assistantDraft || state.operations.length > 0 || state.compactions.length > 0;
+  if (!hasContent) {
+    return null;
+  }
+
+  return (
+    <div className="live-run-feed" aria-live="polite">
+      {state.thinking ? (
+        <article className="message live-entry thinking">
+          <div className="live-entry-head">
+            <span className="live-entry-title"><Brain size={15} aria-hidden="true" /> Thinking</span>
+          </div>
+          <p>{state.thinking}</p>
+        </article>
+      ) : null}
+      {state.operations.map((operation) => (
+        <LiveOperationCard key={operation.operationId} operation={operation} />
+      ))}
+      {state.compactions.map((compaction, index) => (
+        <article key={`${compaction.summary}-${index}`} className="message live-entry compaction">
+          <div className="live-entry-head">
+            <span className="live-entry-title"><Brain size={15} aria-hidden="true" /> Context compacted</span>
+            <span className="muted">{compaction.source}</span>
+          </div>
+          <p>{compaction.summary}</p>
+        </article>
+      ))}
+      {state.assistantDraft ? (
+        <article className="message assistant streaming">
+          <div className="message-meta">
+            <strong className="message-role assistant">assistant</strong>
+            <span className="muted">streaming</span>
+          </div>
+          <p>{state.assistantDraft}</p>
+        </article>
+      ) : null}
+      {state.active ? <RunIndicator /> : null}
+    </div>
+  );
+}
+
+function LiveOperationCard({ operation }: { operation: LiveOperation }) {
+  const Icon = operation.category === 'thinking'
+    ? Brain
+    : operation.category === 'shell'
+      ? Terminal
+      : Wrench;
+  const statusLabel = operation.status === 'running' ? 'Running' : operation.status === 'done' ? 'Done' : 'Error';
+  return (
+    <article className={`message live-entry operation ${operation.status}`}>
+      <div className="live-entry-head">
+        <span className="live-entry-title"><Icon size={15} aria-hidden="true" /> {operation.label}</span>
+        <span className={`live-entry-status ${operation.status}`}>{statusLabel}</span>
+      </div>
+      {operation.summary ? <p className="muted">{operation.summary}</p> : null}
+      {operation.body ? (
+        <details className="details">
+          <summary>Show details</summary>
+          <pre className="details-body">{operation.body}</pre>
+        </details>
+      ) : null}
+    </article>
+  );
+}
+
+function RunIndicator() {
+  return (
+    <div className="run-indicator active" aria-label="Agent running" title="Agent running">
+      <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+    </div>
+  );
+}
+
 function useProjectEvents(
   projectId: string | null,
   sessionToken: string | undefined,
@@ -344,6 +422,9 @@ export function App() {
   const [transcriptLanguage, setTranscriptLanguage] = useState<TranscriptLanguageSelection>('auto');
   const [virtualTimeSec, setVirtualTimeSec] = useState(0);
   const [seekTarget, setSeekTarget] = useState<{ timeSec: number; requestId: number } | null>(null);
+  const [liveRun, setLiveRun] = useState<LiveRunState>(emptyLiveRunState);
+  const [autoScrollMessages, setAutoScrollMessages] = useState(true);
+  const messagesRef = useRef<HTMLDivElement | null>(null);
 
   const sessionQuery = useQuery({
     queryKey: ['session'],
@@ -404,13 +485,44 @@ export function App() {
   }, [projectId, queryClient]);
 
   const handleProjectEvent = useCallback((event: ProjectStreamEvent) => {
-    invalidateProject();
+    if (event.type.startsWith('agent.')) {
+      setLiveRun((current) => reduceLiveRunState(current, event));
+      if (event.type === 'agent.message.user') {
+        setAutoScrollMessages(true);
+      }
+    }
+    if (!event.type.startsWith('agent.message.delta') && !event.type.startsWith('agent.thinking.delta') && event.type !== 'agent.operation') {
+      invalidateProject();
+    }
     if (event.type === 'project.transcript.updated') {
       void queryClient.invalidateQueries({ queryKey: ['source-transcript'] });
     }
   }, [invalidateProject, queryClient]);
 
   useProjectEvents(projectId, sessionToken, handleProjectEvent);
+
+  const isMessagesNearBottom = useCallback(() => {
+    const element = messagesRef.current;
+    if (!element) {
+      return true;
+    }
+    return element.scrollHeight - element.scrollTop - element.clientHeight <= 48;
+  }, []);
+
+  const handleMessagesScroll = useCallback(() => {
+    setAutoScrollMessages(isMessagesNearBottom());
+  }, [isMessagesNearBottom]);
+
+  useEffect(() => {
+    if (!autoScrollMessages) {
+      return;
+    }
+    const element = messagesRef.current;
+    if (!element) {
+      return;
+    }
+    element.scrollTop = element.scrollHeight;
+  }, [autoScrollMessages, liveRun, snapshotQuery.data?.messages.length]);
 
   const createSession = useMutation({
     mutationFn: async () => {
@@ -489,21 +601,29 @@ export function App() {
   });
 
   const sendChat = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (text: string) => {
       if (!projectId || !sessionToken) {
         throw new Error('No active project.');
       }
       return requestJson(`/api/projects/${projectId}/chat`, {
         method: 'POST',
-        body: JSON.stringify({ sessionId: activeSessionId ?? undefined, message }),
+        body: JSON.stringify({ sessionId: activeSessionId ?? undefined, message: text }),
         headers: authHeaders(sessionToken),
       });
     },
     onSuccess: async () => {
-      setMessage('');
       invalidateProject();
     },
   });
+
+  const submitChat = useCallback(() => {
+    const text = message.trim();
+    if (!text || sendChat.isPending) {
+      return;
+    }
+    setMessage('');
+    sendChat.mutate(text);
+  }, [message, sendChat]);
 
   const exportVideo = useMutation({
     mutationFn: async () => {
@@ -604,7 +724,7 @@ export function App() {
           </div>
         </header>
 
-        <div className="messages">
+        <div className="messages" ref={messagesRef} onScroll={handleMessagesScroll}>
           {snapshot?.messages.length ? snapshot.messages.map((item) => (
             <article key={item.id} className={`message ${item.role}`}>
               <div className="message-meta">
@@ -618,15 +738,14 @@ export function App() {
               {projectId ? 'No messages in this conversation yet.' : 'Start the server with AXCUT_VIDEO_PATH set to a local video file.'}
             </div>
           )}
+          <LiveRunFeed state={liveRun} />
         </div>
 
         <form
           className="composer"
           onSubmit={(event) => {
             event.preventDefault();
-            if (!sendChat.isPending && message.trim()) {
-              sendChat.mutate();
-            }
+            submitChat();
           }}
         >
           <textarea
@@ -635,7 +754,7 @@ export function App() {
             onKeyDown={(event) => {
               if (event.key === 'Enter' && !event.shiftKey && message.trim()) {
                 event.preventDefault();
-                sendChat.mutate();
+                submitChat();
               }
             }}
             rows={2}
