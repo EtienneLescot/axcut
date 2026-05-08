@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/generated/logo_full_h_readme.png" alt="Axcut" width="720" />
+</p>
+
 # Axcut
 
 Axcut is evolving from a Python proof of concept into a local agentic video-cut application with:

@@ -241,6 +241,21 @@ code {
   letter-spacing: -0.02em;
 }
 
+.app-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.58rem;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.app-title img {
+  width: 2.6rem;
+  height: 2.6rem;
+  display: block;
+  flex: 0 0 auto;
+}
+
 .chat-header p,
 .preview-header p,
 .modal-header p,
@@ -255,10 +270,21 @@ code {
 }
 
 .chat-session-title {
-  max-width: min(25rem, 48vw);
+  min-width: 0;
+  max-width: min(19rem, 34vw);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: 0.88rem;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.title-separator {
+  flex: 0 0 auto;
+  font-size: 0.88rem;
+  font-weight: 500;
 }
 
 .header-actions,

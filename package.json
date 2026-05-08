@@ -10,6 +10,7 @@
     "dev": "concurrently -n server,web -c magenta,cyan \"npm run dev:server\" \"npm run dev:web\"",
     "dev:server": "npm run dev --workspace @axcut/server",
     "dev:web": "npm run dev --workspace @axcut/web",
+    "assets:generate": "node scripts/generate-assets.mjs",
     "clean:processes": "node scripts/clean-processes.mjs",
     "llm:setup": "node scripts/run-yagr-llm-setup.mjs",
     "build": "npm run build --workspaces --if-present",
@@ -21,6 +22,7 @@
   },
   "devDependencies": {
     "concurrently": "^9.2.1",
+    "sharp": "^0.34.5",
     "tsx": "^4.20.6",
     "typescript": "^5.8.3"
   }

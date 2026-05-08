@@ -33,6 +33,10 @@ const providerEnvKeys: Partial<Record<YagrModelProvider, string[]>> = {
   'copilot-proxy': ['COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'],
 };
 
+function providerSupportsReasoningEffort(provider: YagrModelProvider | undefined): boolean {
+  return provider === 'openai-oauth';
+}
+
 export class LlmConfigService {
   constructor(private readonly configService = new YagrConfigService()) {}
 
@@ -54,6 +58,7 @@ export class LlmConfigService {
         provider: provider ?? null,
         model: localConfig.model,
         baseUrl: localConfig.baseUrl,
+        reasoningEffort: localConfig.reasoningEffort,
         apiKeyStored: provider ? Boolean(this.configService.getApiKey(provider)) : false,
       },
       effective: {
@@ -61,6 +66,8 @@ export class LlmConfigService {
         providerLabel: provider ? getProviderDisplayName(provider) : 'Not configured',
         model: localConfig.model ?? '',
         baseUrl: localConfig.baseUrl,
+        reasoningEffort: providerSupportsReasoningEffort(provider) ? localConfig.reasoningEffort : undefined,
+        supportsReasoningEffort: providerSupportsReasoningEffort(provider),
         apiKeyAvailable: provider ? Boolean(this.getStoredOrEnvironmentApiKey(provider)) : false,
         apiKeySource: provider && this.configService.getApiKey(provider) ? 'yagr' : 'environment',
       },
@@ -100,7 +107,7 @@ export class LlmConfigService {
       provider,
       model,
       baseUrl,
-      reasoningEffort: this.optionalReasoningEffort(input.reasoningEffort),
+      reasoningEffort: providerSupportsReasoningEffort(provider) ? this.optionalReasoningEffort(input.reasoningEffort) : undefined,
     });
 
     return { prepared, snapshot: this.getSnapshot() };
@@ -129,12 +136,14 @@ export class LlmConfigService {
       ? input.model.trim()
       : getDefaultModelForProvider(provider);
     const baseUrl = getDefaultBaseUrlForProvider(provider);
+    const reasoningEffort = this.optionalReasoningEffort(input.reasoningEffort);
     const prepared = await prepareProviderRuntime(provider, { baseUrl });
     this.configService.saveLocalConfig({
       ...this.configService.getLocalConfig(),
       provider,
       model,
       baseUrl,
+      ...(providerSupportsReasoningEffort(provider) ? { reasoningEffort } : { reasoningEffort: undefined }),
     });
     return { prepared, snapshot: this.getSnapshot() };
   }
@@ -146,7 +155,7 @@ export class LlmConfigService {
       provider,
       model: this.optionalString(input.model) || getDefaultModelForProvider(provider),
       baseUrl: this.optionalString(input.baseUrl) || getDefaultBaseUrlForProvider(provider),
-      reasoningEffort: this.optionalReasoningEffort(input.reasoningEffort),
+      reasoningEffort: providerSupportsReasoningEffort(provider) ? this.optionalReasoningEffort(input.reasoningEffort) : undefined,
     });
     return this.getSnapshot();
   }
@@ -206,6 +215,8 @@ export class LlmConfigService {
       selected,
       model: selected ? localConfig.model : undefined,
       baseUrl: selected ? localConfig.baseUrl : getDefaultBaseUrlForProvider(provider),
+      supportsReasoningEffort: providerSupportsReasoningEffort(provider),
+      reasoningEffort: selected && providerSupportsReasoningEffort(provider) ? localConfig.reasoningEffort : undefined,
       credentialSource: storedApiKey ? 'yagr' : environmentApiKey ? 'environment' : null,
     };
   }

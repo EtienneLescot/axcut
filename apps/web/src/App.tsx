@@ -94,6 +94,8 @@ type LlmProviderState = {
   selected: boolean;
   model?: string;
   baseUrl?: string;
+  supportsReasoningEffort: boolean;
+  reasoningEffort?: ReasoningEffort;
   credentialSource: 'yagr' | 'environment' | null;
 };
 
@@ -104,11 +106,24 @@ type LlmStatus = {
     providerLabel: string;
     model: string;
     baseUrl?: string;
+    reasoningEffort?: ReasoningEffort;
+    supportsReasoningEffort: boolean;
   };
   providers: LlmProviderState[];
   connectedProviders: LlmProviderState[];
   availableProviders: LlmProviderState[];
 };
+
+type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+
+const reasoningEffortOptions = [
+  { value: 'none', label: 'None' },
+  { value: 'minimal', label: 'Minimal' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'xhigh', label: 'Extra high' },
+] as const satisfies ReadonlyArray<{ value: ReasoningEffort; label: string }>;
 
 type ProjectStreamEvent = {
   type: string;
@@ -689,7 +704,13 @@ export function App() {
   const exportBusy = exportVideo.isPending || latestExportJob?.status === 'queued' || latestExportJob?.status === 'running';
   const exportStatus = getExportStatus(latestExportJob, exportVideo.isPending, exportVideo.error);
   const providerLabel = llmConfigQuery.data?.ready
-    ? `${llmConfigQuery.data.effective.providerLabel} · ${llmConfigQuery.data.effective.model}`
+    ? [
+        llmConfigQuery.data.effective.providerLabel,
+        llmConfigQuery.data.effective.model,
+        llmConfigQuery.data.effective.supportsReasoningEffort
+          ? `reasoning ${llmConfigQuery.data.effective.reasoningEffort || 'default'}`
+          : null,
+      ].filter(Boolean).join(' · ')
     : 'LLM not configured';
   const projectCount = projectsQuery.data?.projects.length ?? 0;
   const sourceTranscriptName = artifactName(document?.transcript?.sourceDslPath ?? document?.transcript?.sourceJsonPath);
@@ -713,10 +734,14 @@ export function App() {
       <aside className="left-rail panel">
         <header className="chat-header">
           <div className="chat-title-block">
-            <h1>Axcut</h1>
-            <p className="chat-session-title muted" title={activeSession?.title ?? 'New conversation'}>
-              {activeSession?.title ?? 'New conversation'}
-            </p>
+            <h1 className="app-title">
+              <img src="/assets/logo_mascot_128.png" alt="" />
+              <span>Axcut</span>
+              <span className="title-separator muted">-</span>
+              <span className="chat-session-title muted" title={activeSession?.title ?? 'New conversation'}>
+                {activeSession?.title ?? 'New conversation'}
+              </span>
+            </h1>
           </div>
           <div className="header-actions">
             <IconButton icon={History} label="History" className="secondary" onClick={() => setHistoryOpen(true)} disabled={!projectId} />
@@ -1130,6 +1155,7 @@ function ProviderSettingsDialog({
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState(activeProvider?.model || activeProvider?.defaultModel || '');
   const [baseUrl, setBaseUrl] = useState(activeProvider?.baseUrl || activeProvider?.defaultBaseUrl || '');
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(activeProvider?.reasoningEffort || snapshot?.effective.reasoningEffort || 'medium');
   const [models, setModels] = useState<string[]>([]);
   const [challenge, setChallenge] = useState<DeviceChallenge | null>(null);
   const [busy, setBusy] = useState(false);
@@ -1138,11 +1164,12 @@ function ProviderSettingsDialog({
   useEffect(() => {
     setModel(activeProvider?.model || activeProvider?.defaultModel || '');
     setBaseUrl(activeProvider?.baseUrl || activeProvider?.defaultBaseUrl || '');
+    setReasoningEffort(activeProvider?.reasoningEffort || snapshot?.effective.reasoningEffort || 'medium');
     setApiKey('');
     setModels([]);
     setChallenge(null);
     setError(null);
-  }, [activeProvider?.baseUrl, activeProvider?.defaultBaseUrl, activeProvider?.defaultModel, activeProvider?.id, activeProvider?.model]);
+  }, [activeProvider?.baseUrl, activeProvider?.defaultBaseUrl, activeProvider?.defaultModel, activeProvider?.id, activeProvider?.model, activeProvider?.reasoningEffort, snapshot?.effective.reasoningEffort]);
 
   const runProviderAction = async (action: () => Promise<void>) => {
     if (!sessionToken || !activeProvider) {
@@ -1191,7 +1218,11 @@ function ProviderSettingsDialog({
   const useModel = () => runProviderAction(async () => {
     await requestJson(`/api/llm/providers/${activeProvider!.id}/select`, {
       method: 'POST',
-      body: JSON.stringify({ model, baseUrl: baseUrl || undefined }),
+      body: JSON.stringify({
+        model,
+        baseUrl: baseUrl || undefined,
+        reasoningEffort: activeProvider?.supportsReasoningEffort ? reasoningEffort : undefined,
+      }),
       headers: authHeaders(sessionToken!),
     });
     onClose();
@@ -1229,6 +1260,16 @@ function ProviderSettingsDialog({
               <span className="muted">Model</span>
               <input value={model} onChange={(event) => setModel(event.target.value)} placeholder={activeProvider.defaultModel} />
             </label>
+            {activeProvider.supportsReasoningEffort ? (
+              <label>
+                <span className="muted">Reasoning effort</span>
+                <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}>
+                  {reasoningEffortOptions.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
             <div className="model-list">
               {models.length ? models.map((candidate) => (
                 <button key={candidate} className={candidate === model ? 'model-option active' : 'model-option'} onClick={() => setModel(candidate)}>
@@ -1264,6 +1305,7 @@ function ProviderSettingsDialog({
                   <span className="provider-badges">
                     {provider.selected ? <small className="status-pill ready">Selected</small> : null}
                     {provider.credentialSource ? <small className="status-pill ready">{provider.credentialSource}</small> : null}
+                    {provider.reasoningEffort ? <small className="status-pill">Reasoning {provider.reasoningEffort}</small> : null}
                     {provider.oauth ? <small className="status-pill">OAuth</small> : null}
                     {provider.requiresApiKey ? <small className="status-pill">API key</small> : null}
                   </span>
@@ -1307,6 +1349,16 @@ function ProviderSettingsDialog({
                 <span className="muted">Model</span>
                 <input value={model} onChange={(event) => setModel(event.target.value)} placeholder={activeProvider.defaultModel} />
               </label>
+              {activeProvider.supportsReasoningEffort ? (
+                <label>
+                  <span className="muted">Reasoning effort</span>
+                  <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}>
+                    {reasoningEffortOptions.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
               {activeProvider.requiresBaseUrl ? (
                 <label>
                   <span className="muted">Base URL</span>
@@ -1336,7 +1388,12 @@ function ProviderSettingsDialog({
                 onClick={() => runProviderAction(async () => {
                   const result = await requestJson<{ challenge?: Omit<DeviceChallenge, 'provider'> }>(`/api/llm/providers/${activeProvider.id}/connect`, {
                     method: 'POST',
-                    body: JSON.stringify({ apiKey: apiKey || undefined, model, baseUrl: baseUrl || undefined }),
+                    body: JSON.stringify({
+                      apiKey: apiKey || undefined,
+                      model,
+                      baseUrl: baseUrl || undefined,
+                      reasoningEffort: activeProvider.supportsReasoningEffort ? reasoningEffort : undefined,
+                    }),
                     headers: authHeaders(sessionToken!),
                   });
                   if (result.challenge) {
@@ -1361,7 +1418,11 @@ function ProviderSettingsDialog({
                   onClick={() => runProviderAction(async () => {
                     await requestJson(`/api/llm/providers/${activeProvider.id}/device/complete`, {
                       method: 'POST',
-                      body: JSON.stringify({ ...challenge, model }),
+                      body: JSON.stringify({
+                        ...challenge,
+                        model,
+                        reasoningEffort: activeProvider.supportsReasoningEffort ? reasoningEffort : undefined,
+                      }),
                       headers: authHeaders(sessionToken!),
                     });
                     setChallenge(null);
