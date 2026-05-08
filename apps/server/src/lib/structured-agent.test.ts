@@ -50,6 +50,9 @@ test('searchTranscript returns matching spoken segments', () => {
   const hits = searchTranscript(createDocument(), 'config section');
   assert.equal(hits.length, 1);
   assert.equal(hits[0].segmentId, 's2');
+  assert.equal(hits[0].matches[0]?.startWordId, 'w6');
+  assert.equal(hits[0].matches[0]?.endWordId, 'w7');
+  assert.deepEqual(hits[0].words.map((word) => word.id), ['w4', 'w5', 'w6', 'w7']);
 });
 
 test('buildFillerSuggestions detects kept filler words', () => {

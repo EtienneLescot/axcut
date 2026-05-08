@@ -659,7 +659,7 @@ export function App() {
           </div>
           <div className="preview-actions">
             <button className="secondary" onClick={() => setTranscriptModal('source')} disabled={!sourceTranscriptName}>Source transcript</button>
-            <button className="secondary" onClick={() => setTranscriptModal('edited')} disabled={!document?.transcript}>Edited transcript</button>
+            <button className="secondary" onClick={() => setTranscriptModal('edited')} disabled={!document?.transcript}>Timeline transcript</button>
             <button onClick={() => exportVideo.mutate()} disabled={!document?.timeline.clips.length || !sessionToken || exportBusy}>
               {exportBusy ? 'Exporting...' : 'Export'}
             </button>
@@ -726,10 +726,10 @@ export function App() {
 
       {transcriptModal ? (
         <TranscriptDialog
-          title={transcriptModal === 'source' ? 'Source Transcript' : 'Edited Transcript'}
+          title={transcriptModal === 'source' ? 'Source Transcript' : 'Timeline Transcript'}
           subtitle={transcriptModal === 'source'
             ? sourceTranscriptName ?? 'No transcript artifact available yet.'
-            : 'Reconstructed from the current Axcut timeline.'}
+            : 'Reconstructed from the current timeline clips using source word timestamps.'}
           content={transcriptModal === 'source'
             ? sourceTranscriptQuery.data ?? ''
             : editedTranscript}

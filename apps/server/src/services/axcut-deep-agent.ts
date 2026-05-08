@@ -49,6 +49,9 @@ const suggestionDecisionToolSchema = z.object({
   reason: nullableString,
 }).strict();
 
+const MAX_CONTEXT_SEGMENTS = 240;
+const MAX_CONTEXT_WORDS = 800;
+
 type TimelineOperationToolInput = z.infer<typeof timelineOperationToolSchema>;
 
 function withDefault<T>(value: T | null | undefined, defaultValue: T): T {
@@ -184,14 +187,16 @@ export function buildAgentInputMessages(prompt: string, history: AgentConversati
 export function buildAxcutInvocationPrompt(document: AxcutDocument, prompt: string): string {
   const speechKeepIntervals = buildSpeechKeepIntervals(document);
   const firstSpeechRange = findFirstCurrentSpeechRange(document);
-  const transcriptSegments = document.transcript?.segments.slice(0, 240).map((segment) => ({
+  const transcriptSegments = document.transcript?.segments.slice(0, MAX_CONTEXT_SEGMENTS).map((segment) => ({
     id: segment.id,
     kind: segment.kind,
     startSec: segment.startSec,
     endSec: segment.endSec,
     text: segment.text,
+    wordIds: segment.wordIds,
   })) ?? [];
   const transcriptTruncated = (document.transcript?.segments.length ?? 0) > transcriptSegments.length;
+  const wordContext = buildCurrentTimelineWordContext(document);
   const context = {
     project: document.project,
     assets: document.assets.map((asset) => ({
@@ -215,6 +220,9 @@ export function buildAxcutInvocationPrompt(document: AxcutDocument, prompt: stri
           wordCount: document.transcript.words.length,
           truncated: transcriptTruncated,
           segments: transcriptSegments,
+          words: wordContext.words,
+          wordsScope: 'current_timeline_source_words',
+          wordsTruncated: wordContext.truncated,
         }
       : null,
     suggestions: document.agent.suggestions,
@@ -232,11 +240,36 @@ export function buildAxcutInvocationPrompt(document: AxcutDocument, prompt: stri
     '- The LLM must decide whether an edit is appropriate. Do not edit unless the user requested it.',
     '- For removing non-speaking/silence ranges, call apply_timeline_operation with type "replace_timeline" and intervalsJson set to operationHints.speechKeepIntervalsForNonSpeakingRemoval.',
     '- For removing the first phrase/first spoken segment, call apply_timeline_operation with type "drop_range" using operationHints.firstCurrentSpeechRange.',
-    '- If the requested edit is not covered by operationHints, derive the minimal operation from the timeline/transcript context or use search_transcript first.',
+    '- For removing exact words or phrases, use transcript.words or search_transcript word ids/timestamps, then call apply_timeline_operation with type "drop_word_range" using startWordId and endWordId.',
+    '- search_transcript returns source transcript segments plus word ids/timestamps and exact phrase matches when available.',
+    '- The transcript context is the canonical source transcript with source timestamps. The UI timeline transcript is only a reconstruction of the current clips.',
+    '- If the requested edit is not covered by operationHints, derive the minimal operation from the source timeline/transcript context or use search_transcript first.',
     '',
     'User request:',
     prompt,
   ].join('\n');
+}
+
+function buildCurrentTimelineWordContext(document: AxcutDocument): { words: Array<{ id: string; segmentId: string; startSec: number; endSec: number; text: string }>; truncated: boolean } {
+  const transcript = document.transcript;
+  if (!transcript) {
+    return { words: [], truncated: false };
+  }
+
+  const intervals = timelineIntervals(document);
+  const scopedWords = intervals.length > 0
+    ? transcript.words.filter((word) => intervals.some((interval) => word.endSec > interval.startSec && word.startSec < interval.endSec))
+    : transcript.words;
+  return {
+    words: scopedWords.slice(0, MAX_CONTEXT_WORDS).map((word) => ({
+      id: word.id,
+      segmentId: word.segmentId,
+      startSec: word.startSec,
+      endSec: word.endSec,
+      text: word.text,
+    })),
+    truncated: scopedWords.length > MAX_CONTEXT_WORDS,
+  };
 }
 
 function buildSpeechKeepIntervals(document: AxcutDocument): Array<{ startSec: number; endSec: number }> {
@@ -344,7 +377,7 @@ export class AxcutDeepAgentService {
       return searchTranscript(document, query, withDefault(limit, 8));
     }, {
       name: 'search_transcript',
-      description: 'Search the transcript for passages relevant to the user request.',
+      description: 'Search the current timeline scope of the source transcript. Returns matching segments, word ids, source word timestamps, and exact phrase matches when available.',
       schema: searchTranscriptToolSchema,
     });
 

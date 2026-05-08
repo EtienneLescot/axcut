@@ -30,6 +30,19 @@ export type TranscriptSearchHit = {
   endSec: number;
   text: string;
   score: number;
+  words: Array<{
+    id: string;
+    startSec: number;
+    endSec: number;
+    text: string;
+  }>;
+  matches: Array<{
+    startWordId: string;
+    endWordId: string;
+    startSec: number;
+    endSec: number;
+    text: string;
+  }>;
 };
 
 export function searchTranscript(document: AxcutDocument, query: string, limit = 8): TranscriptSearchHit[] {
@@ -41,9 +54,11 @@ export function searchTranscript(document: AxcutDocument, query: string, limit =
   if (tokens.length === 0) {
     return [];
   }
+  const currentIntervals = timelineIntervals(document);
 
   return transcript.segments
     .filter((segment) => segment.kind === 'speech')
+    .filter((segment) => currentIntervals.length === 0 || overlapsCurrentTimeline(currentIntervals, segment.startSec, segment.endSec))
     .map((segment) => scoreSegment(segment, transcript.words, tokens))
     .filter((hit): hit is TranscriptSearchHit => hit !== null)
     .sort((left, right) => right.score - left.score)
@@ -132,6 +147,7 @@ function scoreSegment(
     return null;
   }
   const segmentWords = words.filter((word) => word.segmentId === segment.id);
+  const matches = findPhraseMatches(segmentWords, tokens);
   return {
     segmentId: segment.id,
     startWordId: segmentWords[0]?.id,
@@ -140,7 +156,43 @@ function scoreSegment(
     endSec: segment.endSec,
     text: segment.text,
     score,
+    words: segmentWords.map((word) => ({
+      id: word.id,
+      startSec: word.startSec,
+      endSec: word.endSec,
+      text: word.text,
+    })),
+    matches,
   };
+}
+
+function findPhraseMatches(words: AxcutWord[], tokens: string[]): TranscriptSearchHit['matches'] {
+  if (tokens.length === 0 || words.length === 0) {
+    return [];
+  }
+
+  const normalizedWords = words.map((word) => normalizeToken(word.text));
+  const matches: TranscriptSearchHit['matches'] = [];
+  for (let index = 0; index <= normalizedWords.length - tokens.length; index += 1) {
+    const matched = tokens.every((token, offset) => normalizedWords[index + offset] === token);
+    if (!matched) {
+      continue;
+    }
+    const span = words.slice(index, index + tokens.length);
+    const first = span[0];
+    const last = span.at(-1);
+    if (!first || !last) {
+      continue;
+    }
+    matches.push({
+      startWordId: first.id,
+      endWordId: last.id,
+      startSec: first.startSec,
+      endSec: last.endSec,
+      text: span.map((word) => word.text).join(' '),
+    });
+  }
+  return matches;
 }
 
 function tokenize(value: string): string[] {

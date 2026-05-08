@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import { createEmptyDocument, type AxcutDocument } from '@axcut/schema';
 import { AIMessage, HumanMessage } from 'langchain';
 
-import { buildAgentInputMessages } from './axcut-deep-agent.js';
+import { buildTimelineFromIntervals } from '../lib/timeline.js';
+import { buildAgentInputMessages, buildAxcutInvocationPrompt } from './axcut-deep-agent.js';
 
 test('buildAgentInputMessages rehydrates session history without duplicating current user prompt', () => {
   const messages = buildAgentInputMessages('follow up', [
@@ -27,4 +29,33 @@ test('buildAgentInputMessages appends current prompt when history is stale', () 
   assert.equal(messages.length, 2);
   assert.ok(HumanMessage.isInstance(messages[1]));
   assert.equal(messages[1].content, 'new prompt');
+});
+
+test('buildAxcutInvocationPrompt includes source word timestamps for precise edits', () => {
+  const base = createEmptyDocument({ projectId: 'proj_words', title: 'Words' });
+  const transcript: NonNullable<AxcutDocument['transcript']> = {
+    assetId: 'asset_1',
+    language: 'en',
+    segments: [{ id: 's1', kind: 'speech', startSec: 0, endSec: 1, text: 'for me', wordIds: ['w1', 'w2'] }],
+    words: [
+      { id: 'w1', segmentId: 's1', startSec: 0.1, endSec: 0.3, text: 'for' },
+      { id: 'w2', segmentId: 's1', startSec: 0.31, endSec: 0.55, text: 'me' },
+    ],
+  };
+  const document: AxcutDocument = {
+    ...base,
+    project: { ...base.project, primaryAssetId: 'asset_1' },
+    assets: [{ id: 'asset_1', kind: 'video', label: 'clip.mp4', originalPath: '/tmp/clip.mp4', durationSec: 1 }],
+    transcript,
+    timeline: {
+      ...base.timeline,
+      clips: buildTimelineFromIntervals('asset_1', [{ startSec: 0, endSec: 1 }], { origin: 'system', reason: 'test', transcript }),
+    },
+  };
+
+  const prompt = buildAxcutInvocationPrompt(document, 'remove for me');
+  assert.match(prompt, /"wordsScope":"current_timeline_source_words"/);
+  assert.match(prompt, /"id":"w1"/);
+  assert.match(prompt, /"startSec":0.1/);
+  assert.match(prompt, /drop_word_range/);
 });
