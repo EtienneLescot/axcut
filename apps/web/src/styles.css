@@ -512,6 +512,22 @@ code {
   width: min(980px, 100%);
 }
 
+.transcript-toolbar {
+  display: grid;
+  grid-template-columns: auto minmax(180px, 240px) auto;
+  gap: 0.75rem;
+  align-items: end;
+  padding: 0.85rem;
+  border-radius: 16px;
+  background: #0b1120;
+  border: 1px solid #1e293b;
+}
+
+.transcript-toolbar label {
+  display: grid;
+  gap: 0.35rem;
+}
+
 .load-video-modal {
   width: min(620px, 100%);
 }
@@ -690,7 +706,8 @@ code {
 
   .preview-controls,
   .session-item,
-  .rename-form {
+  .rename-form,
+  .transcript-toolbar {
     grid-template-columns: 1fr;
   }
 

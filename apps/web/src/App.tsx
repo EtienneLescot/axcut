@@ -102,6 +102,22 @@ type DeviceChallenge = {
   expiresAt: number;
 };
 
+const transcriptLanguageOptions = [
+  { value: 'auto', label: 'Auto' },
+  { value: 'en', label: 'English' },
+  { value: 'fr', label: 'French' },
+  { value: 'de', label: 'German' },
+  { value: 'es', label: 'Spanish' },
+  { value: 'it', label: 'Italian' },
+  { value: 'pt', label: 'Portuguese' },
+  { value: 'nl', label: 'Dutch' },
+  { value: 'ja', label: 'Japanese' },
+  { value: 'ko', label: 'Korean' },
+  { value: 'zh', label: 'Chinese' },
+] as const;
+
+type TranscriptLanguageSelection = typeof transcriptLanguageOptions[number]['value'];
+
 async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers ?? {});
   if (init?.body && !headers.has('Content-Type')) {
@@ -175,26 +191,29 @@ function buildEditedTranscript(document: AxcutDocument): string {
 }
 
 function getSttStatus(document: AxcutDocument | undefined, jobs: JobSummary[] | undefined) {
-  const ingestJob = jobs?.find((job) => job.kind === 'ingest_asset') ?? null;
+  const sttJob = jobs?.find((job) => job.kind === 'transcribe_asset' || job.kind === 'ingest_asset') ?? null;
   if (!document?.assets.length) {
     return { label: 'STT idle', detail: 'Load a video to start transcription.', progress: 0, tone: 'idle' as const };
   }
-  if (document.transcript) {
-    return { label: 'STT complete', detail: `${document.transcript.segments.length} segments · ${document.transcript.words.length} words`, progress: 1, tone: 'ready' as const };
+  if (sttJob?.status === 'queued' || sttJob?.status === 'running') {
+    const inSttPhase = sttJob.kind === 'transcribe_asset' || sttJob.progress >= 0.7 || /transcrib/i.test(sttJob.message);
+    return {
+      label: inSttPhase ? 'STT running' : 'Preparing STT',
+      detail: sttJob.message,
+      progress: Math.max(0, Math.min(1, sttJob.progress)),
+      tone: 'running' as const,
+    };
   }
-  if (!ingestJob) {
+  if (sttJob?.status === 'failed') {
+    return { label: 'STT failed', detail: sttJob.message, progress: sttJob.progress, tone: 'error' as const };
+  }
+  if (document.transcript) {
+    return { label: 'STT complete', detail: `${document.transcript.segments.length} segments · ${document.transcript.words.length} words · ${document.transcript.language}`, progress: 1, tone: 'ready' as const };
+  }
+  if (!sttJob) {
     return { label: 'STT waiting', detail: 'Waiting for ingest job.', progress: 0, tone: 'idle' as const };
   }
-  if (ingestJob.status === 'failed') {
-    return { label: 'STT failed', detail: ingestJob.message, progress: ingestJob.progress, tone: 'error' as const };
-  }
-  const inSttPhase = ingestJob.progress >= 0.7 || /transcrib/i.test(ingestJob.message);
-  return {
-    label: inSttPhase ? 'STT running' : 'Preparing STT',
-    detail: ingestJob.message,
-    progress: Math.max(0, Math.min(1, ingestJob.progress)),
-    tone: 'running' as const,
-  };
+  return { label: 'STT waiting', detail: sttJob.message, progress: sttJob.progress, tone: 'idle' as const };
 }
 
 function getExportStatus(job: JobSummary | null, busy: boolean, error: unknown) {
@@ -280,6 +299,7 @@ export function App() {
   const [providerOpen, setProviderOpen] = useState(false);
   const [loadVideoOpen, setLoadVideoOpen] = useState(false);
   const [transcriptModal, setTranscriptModal] = useState<'source' | 'edited' | null>(null);
+  const [transcriptLanguage, setTranscriptLanguage] = useState<TranscriptLanguageSelection>('auto');
   const [virtualTimeSec, setVirtualTimeSec] = useState(0);
   const [seekTarget, setSeekTarget] = useState<{ timeSec: number; requestId: number } | null>(null);
 
@@ -341,7 +361,14 @@ export function App() {
     void queryClient.invalidateQueries({ queryKey: ['projects'] });
   }, [projectId, queryClient]);
 
-  useProjectEvents(projectId, sessionToken, invalidateProject);
+  const handleProjectEvent = useCallback((event: ProjectStreamEvent) => {
+    invalidateProject();
+    if (event.type === 'project.transcript.updated') {
+      void queryClient.invalidateQueries({ queryKey: ['source-transcript'] });
+    }
+  }, [invalidateProject, queryClient]);
+
+  useProjectEvents(projectId, sessionToken, handleProjectEvent);
 
   const createSession = useMutation({
     mutationFn: async () => {
@@ -452,6 +479,23 @@ export function App() {
     },
   });
 
+  const regenerateTranscript = useMutation({
+    mutationFn: async () => {
+      if (!projectId || !sessionToken) {
+        throw new Error('No active project.');
+      }
+      return requestJson<{ job: JobSummary }>(`/api/projects/${projectId}/transcribe`, {
+        method: 'POST',
+        body: JSON.stringify({ language: transcriptLanguage }),
+        headers: authHeaders(sessionToken),
+      });
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['source-transcript'] });
+      invalidateProject();
+    },
+  });
+
   const snapshot = snapshotQuery.data;
   const document = snapshot?.document;
   const activeSession = snapshot?.sessions.find((session) => session.id === snapshot.activeSessionId) ?? snapshot?.sessions[0];
@@ -500,6 +544,13 @@ export function App() {
   });
   const editedTranscript = useMemo(() => document ? buildEditedTranscript(document) : 'No project is loaded.', [document]);
   const sttStatus = getSttStatus(document, snapshot?.jobs);
+  const sourceTranscriptError = transcriptModal === 'source'
+    ? sourceTranscriptQuery.error instanceof Error
+      ? sourceTranscriptQuery.error.message
+      : regenerateTranscript.error instanceof Error
+        ? regenerateTranscript.error.message
+        : null
+    : null;
 
   return (
     <div className="app-shell">
@@ -683,7 +734,14 @@ export function App() {
             ? sourceTranscriptQuery.data ?? ''
             : editedTranscript}
           loading={transcriptModal === 'source' && sourceTranscriptQuery.isLoading}
-          error={transcriptModal === 'source' && sourceTranscriptQuery.error instanceof Error ? sourceTranscriptQuery.error.message : null}
+          error={sourceTranscriptError}
+          detectedLanguage={transcriptModal === 'source' ? document?.transcript?.language : undefined}
+          language={transcriptLanguage}
+          languageOptions={transcriptLanguageOptions}
+          regenerateLabel={transcriptModal === 'source' ? 'Regenerate transcript' : undefined}
+          regenerating={regenerateTranscript.isPending}
+          onLanguageChange={setTranscriptLanguage}
+          onRegenerate={transcriptModal === 'source' ? () => regenerateTranscript.mutate() : undefined}
           onClose={() => setTranscriptModal(null)}
         />
       ) : null}
@@ -728,6 +786,13 @@ function TranscriptDialog({
   content,
   loading,
   error,
+  detectedLanguage,
+  language,
+  languageOptions,
+  regenerateLabel,
+  regenerating,
+  onLanguageChange,
+  onRegenerate,
   onClose,
 }: {
   title: string;
@@ -735,8 +800,16 @@ function TranscriptDialog({
   content: string;
   loading: boolean;
   error: string | null;
+  detectedLanguage?: string;
+  language: TranscriptLanguageSelection;
+  languageOptions: typeof transcriptLanguageOptions;
+  regenerateLabel?: string;
+  regenerating: boolean;
+  onLanguageChange: (language: TranscriptLanguageSelection) => void;
+  onRegenerate?: () => void;
   onClose: () => void;
 }) {
+  const showControls = Boolean(onRegenerate);
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true">
       <section className="modal panel transcript-modal">
@@ -747,6 +820,26 @@ function TranscriptDialog({
           </div>
           <button className="secondary" onClick={onClose}>Close</button>
         </div>
+        {showControls ? (
+          <div className="transcript-toolbar">
+            <span className="status-pill ready">Detected language: {detectedLanguage || 'unknown'}</span>
+            <label>
+              <span className="muted">Regenerate as</span>
+              <select
+                value={language}
+                onChange={(event) => onLanguageChange(event.target.value as TranscriptLanguageSelection)}
+                disabled={regenerating}
+              >
+                {languageOptions.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+            <button onClick={onRegenerate} disabled={regenerating}>
+              {regenerating ? 'Regenerating...' : regenerateLabel}
+            </button>
+          </div>
+        ) : null}
         {error ? <p className="error-copy">{error}</p> : null}
         <pre className="transcript-viewer">{loading ? 'Loading transcript...' : content || 'Transcript is empty.'}</pre>
       </section>

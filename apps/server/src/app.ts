@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { applyOperationInputSchema, exportInputSchema } from '@axcut/schema';
+import { applyOperationInputSchema, exportInputSchema, transcribeInputSchema } from '@axcut/schema';
 import cors from '@fastify/cors';
 import Fastify from 'fastify';
 import { ZodError } from 'zod';
@@ -264,13 +264,15 @@ export async function createServer() {
 
   fastify.post('/api/projects/:projectId/transcribe', async (request, reply) => {
     const { projectId } = request.params as { projectId: string };
+    const payload = transcribeInputSchema.parse(request.body ?? {});
+    const language = payload.language === 'auto' ? undefined : payload.language;
     const document = documents.readDocument(projectId);
     const asset = document.assets.find((item) => item.id === document.project.primaryAssetId) ?? document.assets[0];
     if (!asset) {
       reply.code(400);
       return { error: 'No asset available to transcribe.' };
     }
-    const job = jobs.enqueueAssetIngest(projectId, asset.id, { autoTranscribe: true });
+    const job = jobs.enqueueTranscription(projectId, asset.id, { language });
     reply.code(202);
     return { job };
   });

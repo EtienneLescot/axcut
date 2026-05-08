@@ -18,11 +18,20 @@ export class JobService {
     private readonly events: EventBus,
   ) {}
 
-  enqueueAssetIngest(projectId: string, assetId: string, options: { autoTranscribe: boolean }): JobRow {
-    const job = this.db.createJob(projectId, 'ingest_asset', { assetId, autoTranscribe: options.autoTranscribe });
+  enqueueAssetIngest(projectId: string, assetId: string, options: { autoTranscribe: boolean; language?: string }): JobRow {
+    const job = this.db.createJob(projectId, 'ingest_asset', { assetId, autoTranscribe: options.autoTranscribe, language: options.language ?? 'auto' });
     this.events.emit(projectId, 'job.queued', { jobId: job.id, kind: job.kind });
     queueMicrotask(() => {
-      void this.runAssetIngest(job.id, projectId, assetId, options.autoTranscribe);
+      void this.runAssetIngest(job.id, projectId, assetId, options.autoTranscribe, options.language);
+    });
+    return job;
+  }
+
+  enqueueTranscription(projectId: string, assetId: string, options: { language?: string }): JobRow {
+    const job = this.db.createJob(projectId, 'transcribe_asset', { assetId, language: options.language ?? 'auto' });
+    this.events.emit(projectId, 'job.queued', { jobId: job.id, kind: job.kind });
+    queueMicrotask(() => {
+      void this.runAssetTranscription(job.id, projectId, assetId, options.language);
     });
     return job;
   }
@@ -36,7 +45,7 @@ export class JobService {
     return job;
   }
 
-  private async runAssetIngest(jobId: string, projectId: string, assetId: string, autoTranscribe: boolean): Promise<void> {
+  private async runAssetIngest(jobId: string, projectId: string, assetId: string, autoTranscribe: boolean, language?: string): Promise<void> {
     try {
       this.update(jobId, projectId, { status: 'running', progress: 0.05, message: 'Preparing asset ingest' });
       const snapshot = this.documents.getSnapshot(projectId).document;
@@ -59,12 +68,7 @@ export class JobService {
       this.events.emit(projectId, 'preview.ready', { assetId, proxyPath });
 
       if (autoTranscribe) {
-        const dslOutput = path.join(artifactsRoot, `${assetId}-transcript.axcut`);
-        const jsonOutput = path.join(artifactsRoot, `${assetId}-transcript.json`);
-        this.update(jobId, projectId, { status: 'running', progress: 0.7, message: 'Transcribing media' });
-        const transcript = await this.worker.transcribe(asset.originalPath, assetId, dslOutput, jsonOutput);
-        this.documents.updateTranscript(projectId, transcript.data.transcript as AxcutTranscript, 'Transcript imported');
-        this.events.emit(projectId, 'project.transcript.updated', { assetId });
+        await this.transcribeAsset(jobId, projectId, assetId, asset.originalPath, 0.7, language);
       }
 
       this.update(jobId, projectId, { status: 'completed', progress: 1, message: 'Asset ingest completed', resultJson: JSON.stringify({ assetId }) });
@@ -73,6 +77,35 @@ export class JobService {
       this.update(jobId, projectId, { status: 'failed', progress: 1, message: error instanceof Error ? error.message : String(error) });
       this.events.emit(projectId, 'job.failed', { jobId, kind: 'ingest_asset', error: error instanceof Error ? error.message : String(error) });
     }
+  }
+
+  private async runAssetTranscription(jobId: string, projectId: string, assetId: string, language?: string): Promise<void> {
+    try {
+      this.update(jobId, projectId, { status: 'running', progress: 0.05, message: 'Preparing transcription' });
+      const document = this.documents.getSnapshot(projectId).document;
+      const asset = document.assets.find((item) => item.id === assetId);
+      if (!asset) {
+        throw new Error(`Unknown asset ${assetId}`);
+      }
+
+      await this.transcribeAsset(jobId, projectId, assetId, asset.originalPath, 0.15, language);
+      this.update(jobId, projectId, { status: 'completed', progress: 1, message: 'Transcript regenerated', resultJson: JSON.stringify({ assetId, language: language ?? 'auto' }) });
+      this.events.emit(projectId, 'job.completed', { jobId, kind: 'transcribe_asset' });
+    } catch (error) {
+      this.update(jobId, projectId, { status: 'failed', progress: 1, message: error instanceof Error ? error.message : String(error) });
+      this.events.emit(projectId, 'job.failed', { jobId, kind: 'transcribe_asset', error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  private async transcribeAsset(jobId: string, projectId: string, assetId: string, originalPath: string, progress: number, language?: string): Promise<void> {
+    const artifactsRoot = projectArtifactsRoot(projectId);
+    const dslOutput = path.join(artifactsRoot, `${assetId}-transcript.axcut`);
+    const jsonOutput = path.join(artifactsRoot, `${assetId}-transcript.json`);
+    const languageLabel = language ? language : 'auto-detect';
+    this.update(jobId, projectId, { status: 'running', progress, message: `Transcribing media (${languageLabel})` });
+    const transcript = await this.worker.transcribe(originalPath, assetId, dslOutput, jsonOutput, language);
+    this.documents.updateTranscript(projectId, transcript.data.transcript as AxcutTranscript, 'Transcript imported');
+    this.events.emit(projectId, 'project.transcript.updated', { assetId });
   }
 
   private async runExport(jobId: string, projectId: string, preset: string): Promise<void> {

@@ -23,8 +23,15 @@ export class PythonWorker {
     return this.runJson(['proxy', '--video', videoPath, '--output', outputPath]);
   }
 
-  async transcribe(videoPath: string, assetId: string, dslOutput: string, jsonOutput: string): Promise<WorkerResponse<Record<string, unknown>>> {
-    return this.runJson(['transcribe', '--video', videoPath, '--asset-id', assetId, '--dsl-output', dslOutput, '--json-output', jsonOutput]);
+  async transcribe(videoPath: string, assetId: string, dslOutput: string, jsonOutput: string, language?: string): Promise<WorkerResponse<Record<string, unknown>>> {
+    return this.runJson([
+      'transcribe',
+      '--video', videoPath,
+      '--asset-id', assetId,
+      '--dsl-output', dslOutput,
+      '--json-output', jsonOutput,
+      ...(language ? ['--language', language] : []),
+    ]);
   }
 
   async exportVideo(videoPath: string, intervalsPath: string, outputPath: string): Promise<WorkerResponse<Record<string, unknown>>> {

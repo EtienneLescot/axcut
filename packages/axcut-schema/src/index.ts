@@ -208,6 +208,12 @@ export const chatInputSchema = z.object({
   message: z.string().trim().min(1),
 });
 
+export const transcriptLanguageSchema = z.enum(['auto', 'en', 'fr', 'de', 'es', 'it', 'pt', 'nl', 'ja', 'ko', 'zh']);
+
+export const transcribeInputSchema = z.object({
+  language: transcriptLanguageSchema.default('auto'),
+});
+
 export const exportInputSchema = z.object({
   preset: exportStateSchema.shape.preset.default('final-balanced'),
 });
@@ -231,6 +237,7 @@ export type AxcutDocument = z.infer<typeof documentSchema>;
 export type CreateProjectInput = z.infer<typeof createProjectInputSchema>;
 export type AddAssetInput = z.infer<typeof addAssetInputSchema>;
 export type ChatInput = z.infer<typeof chatInputSchema>;
+export type TranscribeInput = z.infer<typeof transcribeInputSchema>;
 export type ExportInput = z.infer<typeof exportInputSchema>;
 export type ApplyOperationInput = z.infer<typeof applyOperationInputSchema>;
 
