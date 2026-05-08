@@ -29,13 +29,13 @@ const searchTranscriptToolSchema = z.object({
 }).strict();
 
 const suggestCutsToolSchema = z.object({
-  kind: z.enum(['filler', 'pause']).describe('Suggestion category to generate.'),
+  kind: z.string().min(1).describe('Suggestion category to generate: "filler" or "pause".'),
   minDurationSec: z.number().positive().max(5).nullable().default(null),
   limit: z.number().int().positive().max(12).nullable().default(null),
 }).strict();
 
 const timelineOperationToolSchema = z.object({
-  type: z.enum(['replace_timeline', 'drop_range', 'drop_word_range', 'restore_full_timeline']),
+  type: z.string().min(1).describe('Operation type: "replace_timeline", "drop_range", "drop_word_range", or "restore_full_timeline".'),
   reason: nullableString,
   intervalsJson: nullableString.describe('For replace_timeline only: JSON array like [{"startSec":0,"endSec":12.5}] or [[0,12.5]].'),
   startSec: z.number().nonnegative().nullable().default(null).describe('For drop_range only.'),
@@ -89,6 +89,8 @@ function buildTimelineOperationFromToolInput(input: TimelineOperationToolInput):
         type: 'restore_full_timeline',
         reason,
       };
+    default:
+      throw new Error(`Unknown timeline operation type "${input.type}".`);
   }
 }
 
@@ -348,6 +350,9 @@ export class AxcutDeepAgentService {
 
     const suggestCuts = tool(async ({ kind, minDurationSec, limit }) => {
       const document = getProject();
+      if (kind !== 'filler' && kind !== 'pause') {
+        throw new Error(`Unknown suggestion kind "${kind}". Use "filler" or "pause".`);
+      }
       const suggestions = (kind === 'filler'
         ? buildFillerSuggestions(document)
         : buildPauseSuggestions(document, withDefault(minDurationSec, 0.6)))

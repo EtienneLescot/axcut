@@ -232,6 +232,7 @@ function useProjectEvents(
     }
     const source = new EventSource(`/api/projects/${projectId}/stream?token=${encodeURIComponent(sessionToken)}`);
     const eventNames = [
+      'ready',
       'job.progress',
       'job.queued',
       'job.completed',

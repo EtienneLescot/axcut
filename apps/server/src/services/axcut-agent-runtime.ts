@@ -19,7 +19,7 @@ export class AxcutAgentRuntime {
   constructor(
     private readonly documents: DocumentService,
     private readonly events: EventBus,
-    llmConfig: LlmConfigService,
+    private readonly llmConfig: LlmConfigService,
   ) {
     this.deepAgent = new AxcutDeepAgentService(documents, events, llmConfig);
   }

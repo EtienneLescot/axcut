@@ -183,6 +183,41 @@ export class DatabaseService {
     return next;
   }
 
+  markInterruptedJobs(message = 'Interrupted by server restart. Start the job again.'): JobRow[] {
+    const rows = this.db.prepare(`
+      SELECT id, project_id AS projectId, kind, status, progress, message, payload_json AS payloadJson, result_json AS resultJson, created_at AS createdAt, updated_at AS updatedAt
+      FROM jobs
+      WHERE status IN ('queued', 'running')
+    `).all() as JobRow[];
+    if (rows.length === 0) {
+      return [];
+    }
+
+    const now = new Date().toISOString();
+    const update = this.db.prepare(`
+      UPDATE jobs
+      SET status = 'failed',
+          progress = 1,
+          message = @message,
+          updated_at = @updatedAt
+      WHERE id = @id
+    `);
+    const run = this.db.transaction((jobs: JobRow[]) => {
+      for (const job of jobs) {
+        update.run({ id: job.id, message, updatedAt: now });
+      }
+    });
+    run(rows);
+
+    return rows.map((row) => ({
+      ...row,
+      status: 'failed',
+      progress: 1,
+      message,
+      updatedAt: now,
+    }));
+  }
+
   getJob(jobId: string): JobRow | undefined {
     const row = this.db.prepare(`SELECT id, project_id AS projectId, kind, status, progress, message, payload_json AS payloadJson, result_json AS resultJson, created_at AS createdAt, updated_at AS updatedAt FROM jobs WHERE id = ?`).get(jobId);
     return row as JobRow | undefined;

@@ -87,6 +87,10 @@ export async function createServer() {
 
   const events = new EventBus();
   const db = new DatabaseService(databasePath);
+  const interruptedJobs = db.markInterruptedJobs();
+  if (interruptedJobs.length > 0) {
+    fastify.log.warn({ jobIds: interruptedJobs.map((job) => job.id) }, 'Marked interrupted jobs as failed');
+  }
   const documents = new DocumentService(db);
   const llmConfig = new LlmConfigService();
   const worker = new PythonWorker();
