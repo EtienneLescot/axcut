@@ -1,0 +1,17 @@
+services:
+  axcut:
+    build: .
+    ports:
+      - "5173:5173"
+    environment:
+      AXCUT_MODEL_CACHE: /app/.cache/axcut/models
+    volumes:
+      - axcut-data:/app/.axcut-data
+      - axcut-model-cache:/app/.cache/axcut/models
+      - yagr-config:/root/.config/yagr
+      - ./:/workspace:ro
+
+volumes:
+  axcut-data:
+  axcut-model-cache:
+  yagr-config:

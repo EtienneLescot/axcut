@@ -41,9 +41,43 @@ Axcut is split into a TypeScript control plane and a Python media worker:
 - Internet access the first time Whisper downloads its model.
 - An LLM provider if you want to use chat-based editing.
 
+If you use Docker Compose, Docker provides Python, Node.js, `uv`, `ffmpeg`, and `ffprobe` for you.
+
 ## Quickstart
 
-### 1. Install System Dependencies
+### Docker Compose
+
+The easiest first-phase packaging path is Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+Open the web UI at:
+
+```text
+http://127.0.0.1:5173
+```
+
+Compose persists Axcut projects, Whisper models, and provider credentials in Docker volumes. The repository is mounted read-only at `/workspace` so local media in the repo can be imported with container paths, for example:
+
+```text
+/workspace/rushs/example.mp4
+```
+
+Configure the LLM provider from the web UI after startup. Provider credentials are stored in the `yagr-config` Docker volume.
+
+If you prefer environment variables, add them under the `axcut.environment` section in `docker-compose.yml`, or export them in your shell and mirror the variable names there. `.env.example` lists the common names.
+
+You can stop the app with `Ctrl+C`. To remove the persisted Docker volumes as well:
+
+```bash
+docker compose down --volumes
+```
+
+### Manual Local Setup
+
+#### 1. Install System Dependencies
 
 Install `ffmpeg` for your platform. On Debian or Ubuntu:
 
@@ -58,7 +92,7 @@ ffmpeg -version
 ffprobe -version
 ```
 
-### 2. Create The Python Environment
+#### 2. Create The Python Environment
 
 The server expects the local Python environment at `.venv` in the repository root.
 
@@ -70,13 +104,13 @@ uv pip install -e .
 
 This installs the Python worker and its dependencies, including `faster-whisper` and `huggingface-hub`.
 
-### 3. Install The Web App Dependencies
+#### 3. Install The Web App Dependencies
 
 ```bash
 npm install
 ```
 
-### 4. Configure Environment Variables
+#### 4. Configure Environment Variables
 
 Create a local environment file:
 
@@ -98,7 +132,7 @@ npm run llm:setup
 
 The setup wizard can configure API-key providers and account-based providers such as ChatGPT/OpenAI OAuth where available.
 
-### 5. Start Axcut
+#### 5. Start Axcut
 
 ```bash
 npm run dev
@@ -116,7 +150,7 @@ The local API runs at:
 http://127.0.0.1:4010
 ```
 
-### 6. Create Your First Edit
+### Create Your First Edit
 
 1. Create a project in the web UI.
 2. Configure an LLM provider in the sidebar if one is not ready yet.

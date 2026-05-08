@@ -8,6 +8,7 @@
   ],
   "scripts": {
     "dev": "concurrently -n server,web -c magenta,cyan \"npm run dev:server\" \"npm run dev:web\"",
+    "dev:docker": "concurrently -n server,web -c magenta,cyan \"npm run dev:server\" \"npm run dev:web -- --host 0.0.0.0\"",
     "dev:server": "npm run dev --workspace @axcut/server",
     "dev:web": "npm run dev --workspace @axcut/web",
     "assets:generate": "node scripts/generate-assets.mjs",
