@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
+import type { CSSProperties, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
 import type { AxcutClip } from '@axcut/schema';
 
@@ -37,6 +37,7 @@ type CutDragState = {
 
 const MIN_CUT_DURATION_SEC = 0.1;
 const SEGMENT_MIN_WIDTH_PX = 42;
+const CUT_EDGE_HIT_ZONE_PX = 18;
 
 type TimelineItem =
   | { type: 'clip'; startSec: number; endSec: number; range: SourceRange }
@@ -88,8 +89,15 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
     return () => activeDragCleanupRef.current?.();
   }, []);
 
-  const startCutResize = (cut: SourceRange, edge: 'start' | 'end', event: ReactPointerEvent<HTMLElement>) => {
+  const startCutResize = (
+    cut: SourceRange,
+    edge: 'start' | 'end',
+    event: ReactPointerEvent<HTMLElement> | ReactMouseEvent<HTMLElement>,
+  ) => {
     if (busy) {
+      return;
+    }
+    if (dragStateRef.current) {
       return;
     }
     const track = trackRef.current;
@@ -98,6 +106,14 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
     }
     event.preventDefault();
     event.stopPropagation();
+    const pointerId = 'pointerId' in event ? event.pointerId : undefined;
+    if (pointerId !== undefined && 'setPointerCapture' in event.currentTarget) {
+      try {
+        event.currentTarget.setPointerCapture(pointerId);
+      } catch {
+        // The browser can reject capture if the pointer is already released.
+      }
+    }
     activeDragCleanupRef.current?.();
     onPreviewSource(edge === 'start' ? cut.startSec : cut.endSec);
     const dragId = dragSequenceRef.current + 1;
@@ -119,12 +135,12 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
     dragStateRef.current = initialState;
     setDragState(initialState);
 
-    const handlePointerMove = (moveEvent: PointerEvent) => {
+    const updateDrag = (clientX: number) => {
       const current = dragStateRef.current;
       if (!current) {
         return;
       }
-      const deltaSec = (moveEvent.clientX - current.startClientX) * current.secondsPerPixel;
+      const deltaSec = (clientX - current.startClientX) * current.secondsPerPixel;
       const nextState = current.edge === 'start'
         ? { ...current, currentStartSec: clamp(current.originalStartSec + deltaSec, 0, current.currentEndSec - MIN_CUT_DURATION_SEC) }
         : { ...current, currentEndSec: clamp(current.originalEndSec + deltaSec, current.currentStartSec + MIN_CUT_DURATION_SEC, current.sourceDuration) };
@@ -139,6 +155,9 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
       callbacksRef.current.onPreviewSource(boundarySourceSec);
       callbacksRef.current.onSeek(sourceToVirtualTime(nextIntervals, boundarySourceSec));
     };
+
+    const handlePointerMove = (moveEvent: PointerEvent) => updateDrag(moveEvent.clientX);
+    const handleMouseMove = (moveEvent: MouseEvent) => updateDrag(moveEvent.clientX);
 
     const endDrag = () => {
       const current = dragStateRef.current;
@@ -162,6 +181,9 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
       globalThis.window.removeEventListener('pointermove', handlePointerMove);
       globalThis.window.removeEventListener('pointerup', endDrag);
       globalThis.window.removeEventListener('pointercancel', endDrag);
+      globalThis.window.removeEventListener('mousemove', handleMouseMove);
+      globalThis.window.removeEventListener('mouseup', endDrag);
+      globalThis.document.removeEventListener('mouseup', endDrag);
       activeDragCleanupRef.current = null;
     };
     activeDragCleanupRef.current = cleanup;
@@ -169,6 +191,26 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
     globalThis.window.addEventListener('pointermove', handlePointerMove);
     globalThis.window.addEventListener('pointerup', endDrag, { once: true });
     globalThis.window.addEventListener('pointercancel', endDrag, { once: true });
+    globalThis.window.addEventListener('mousemove', handleMouseMove);
+    globalThis.window.addEventListener('mouseup', endDrag, { once: true });
+    globalThis.document.addEventListener('mouseup', endDrag, { once: true });
+  };
+
+  const startCutResizeFromEdge = (cut: SourceRange, event: ReactPointerEvent<HTMLElement> | ReactMouseEvent<HTMLElement>) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest('.cut-delete, .cut-resize-handle')) {
+      return;
+    }
+    const rect = event.currentTarget.getBoundingClientRect();
+    const distanceFromLeft = event.clientX - rect.left;
+    const distanceFromRight = rect.right - event.clientX;
+    if (distanceFromLeft <= CUT_EDGE_HIT_ZONE_PX) {
+      startCutResize(cut, 'start', event);
+      return;
+    }
+    if (distanceFromRight <= CUT_EDGE_HIT_ZONE_PX) {
+      startCutResize(cut, 'end', event);
+    }
   };
 
   const deleteCut = (cut: SourceRange) => {
@@ -229,6 +271,8 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
                   style={itemStyle}
                   title={`Cut source ${formatSeconds(item.startSec)}-${formatSeconds(item.endSec)}`}
                   data-cut-trigger="true"
+                  onPointerDown={(event) => startCutResizeFromEdge(item.range, event)}
+                  onMouseDown={(event) => startCutResizeFromEdge(item.range, event)}
                 >
                   <span
                     className="cut-resize-handle start"
@@ -236,6 +280,7 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
                     aria-orientation="vertical"
                     aria-label="Adjust cut start"
                     onPointerDown={(event) => startCutResize(item.range, 'start', event)}
+                    onMouseDown={(event) => startCutResize(item.range, 'start', event)}
                   />
                   <span className="cut-label">cut</span>
                   <small>{formatSeconds(item.startSec)}-{formatSeconds(item.endSec)}</small>
@@ -258,6 +303,7 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
                     aria-orientation="vertical"
                     aria-label="Adjust cut end"
                     onPointerDown={(event) => startCutResize(item.range, 'end', event)}
+                    onMouseDown={(event) => startCutResize(item.range, 'end', event)}
                   />
                 </div>
               );
