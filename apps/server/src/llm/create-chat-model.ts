@@ -6,6 +6,15 @@ import { buildLangChainReasoningOptions, shouldDisableModelStreamingForToolCalli
 import { createLocalProviderLangChainModel } from './provider-runtime/create-langchain-model.js';
 import type { LlmConfigService } from '../services/llm-config-service.js';
 
+export const OPENAI_COMPATIBLE_NO_AUTH_API_KEY = 'axcut-openai-compatible-no-auth';
+
+export function resolveOpenAIChatApiKey(provider: string, apiKey?: string) {
+  if (apiKey) {
+    return apiKey;
+  }
+  return provider === 'openai-compatible' ? OPENAI_COMPATIBLE_NO_AUTH_API_KEY : undefined;
+}
+
 export async function createAxcutChatModel(configService: LlmConfigService) {
   const config = configService.getRuntimeConfig();
   const reasoningOptions = buildLangChainReasoningOptions(config.provider, config.model, config.reasoningEffort);
@@ -38,8 +47,9 @@ export async function createAxcutChatModel(configService: LlmConfigService) {
     : config.provider === 'google'
       ? config.baseUrl || 'https://generativelanguage.googleapis.com/v1beta/openai'
       : config.baseUrl;
+  const apiKey = resolveOpenAIChatApiKey(config.provider, config.apiKey);
   return new ChatOpenAI({
-    ...(config.apiKey ? { apiKey: config.apiKey } : {}),
+    ...(apiKey ? { apiKey } : {}),
     model: config.model,
     ...(reasoningOptions.reasoning ? { reasoning: reasoningOptions.reasoning } : {}),
     ...(reasoningOptions.useResponsesApi ? { useResponsesApi: true } : {}),
