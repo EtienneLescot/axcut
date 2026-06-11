@@ -24,6 +24,7 @@ type TimelinePaneProps = {
 type CutDragState = {
   id: number;
   cut: SourceRange;
+  baseCutRanges: SourceRange[];
   edge: 'start' | 'end';
   startClientX: number;
   originalStartSec: number;
@@ -31,6 +32,7 @@ type CutDragState = {
   currentStartSec: number;
   currentEndSec: number;
   secondsPerPixel: number;
+  sourceDuration: number;
 };
 
 const MIN_CUT_DURATION_SEC = 0.1;
@@ -44,6 +46,9 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
   const trackRef = useRef<HTMLDivElement | null>(null);
   const dragSequenceRef = useRef(0);
   const committedDragRef = useRef<number | null>(null);
+  const dragStateRef = useRef<CutDragState | null>(null);
+  const activeDragCleanupRef = useRef<(() => void) | null>(null);
+  const callbacksRef = useRef({ onSeek, onPreviewSource, onReplaceTimeline });
   const [trackWidthPx, setTrackWidthPx] = useState(0);
   const durationSec = totalVirtualDuration(clips);
   const activePosition = locateVirtualPosition(clips, currentTimeSec);
@@ -64,6 +69,10 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
   const timelineItems = useMemo(() => buildTimelineItems(visibleKeptIntervals, visibleCutRanges), [visibleKeptIntervals, visibleCutRanges]);
 
   useEffect(() => {
+    callbacksRef.current = { onSeek, onPreviewSource, onReplaceTimeline };
+  }, [onPreviewSource, onReplaceTimeline, onSeek]);
+
+  useEffect(() => {
     const track = trackRef.current;
     if (!track) {
       return;
@@ -76,58 +85,8 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
   }, []);
 
   useEffect(() => {
-    if (!dragState) {
-      return;
-    }
-    const handlePointerMove = (event: PointerEvent) => {
-      const deltaSec = (event.clientX - dragState.startClientX) * dragState.secondsPerPixel;
-      setDragState((current) => {
-        if (!current) {
-          return current;
-        }
-        let nextState: CutDragState;
-        if (current.edge === 'start') {
-          const currentStartSec = clamp(current.originalStartSec + deltaSec, 0, current.currentEndSec - MIN_CUT_DURATION_SEC);
-          nextState = { ...current, currentStartSec };
-        } else {
-          const currentEndSec = clamp(current.originalEndSec + deltaSec, current.currentStartSec + MIN_CUT_DURATION_SEC, sourceDuration);
-          nextState = { ...current, currentEndSec };
-        }
-        const nextCuts = normalizeSourceRanges(sourceDuration, [
-          ...cutRanges.filter((cut) => cut.id !== nextState.cut.id),
-          { id: nextState.cut.id, startSec: nextState.currentStartSec, endSec: nextState.currentEndSec },
-        ]);
-        const nextIntervals = invertCutRanges(nextCuts, sourceDuration);
-        const boundarySourceSec = nextState.edge === 'start' ? nextState.currentStartSec : nextState.currentEndSec;
-        onPreviewSource(boundarySourceSec);
-        onSeek(sourceToVirtualTime(nextIntervals, boundarySourceSec));
-        return nextState;
-      });
-    };
-    const handlePointerUp = () => {
-      setDragState((current) => {
-        if (current && committedDragRef.current !== current.id) {
-          committedDragRef.current = current.id;
-          commitCutChange(
-            cutRanges,
-            sourceDuration,
-            current.cut,
-            { startSec: current.currentStartSec, endSec: current.currentEndSec },
-            onReplaceTimeline,
-          );
-        }
-        return null;
-      });
-    };
-    globalThis.document.body.classList.add('resizing-cut');
-    globalThis.window.addEventListener('pointermove', handlePointerMove);
-    globalThis.window.addEventListener('pointerup', handlePointerUp, { once: true });
-    return () => {
-      globalThis.document.body.classList.remove('resizing-cut');
-      globalThis.window.removeEventListener('pointermove', handlePointerMove);
-      globalThis.window.removeEventListener('pointerup', handlePointerUp);
-    };
-  }, [cutRanges, dragState, onPreviewSource, onReplaceTimeline, onSeek, sourceDuration]);
+    return () => activeDragCleanupRef.current?.();
+  }, []);
 
   const startCutResize = (cut: SourceRange, edge: 'start' | 'end', event: ReactPointerEvent<HTMLElement>) => {
     if (busy) {
@@ -139,13 +98,15 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
     }
     event.preventDefault();
     event.stopPropagation();
+    activeDragCleanupRef.current?.();
     onPreviewSource(edge === 'start' ? cut.startSec : cut.endSec);
     const dragId = dragSequenceRef.current + 1;
     dragSequenceRef.current = dragId;
     committedDragRef.current = null;
-    setDragState({
+    const initialState: CutDragState = {
       id: dragId,
       cut,
+      baseCutRanges: cutRanges,
       edge,
       startClientX: event.clientX,
       originalStartSec: cut.startSec,
@@ -153,7 +114,61 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
       currentStartSec: cut.startSec,
       currentEndSec: cut.endSec,
       secondsPerPixel: trackTotal / Math.max(1, track.clientWidth),
-    });
+      sourceDuration,
+    };
+    dragStateRef.current = initialState;
+    setDragState(initialState);
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      const current = dragStateRef.current;
+      if (!current) {
+        return;
+      }
+      const deltaSec = (moveEvent.clientX - current.startClientX) * current.secondsPerPixel;
+      const nextState = current.edge === 'start'
+        ? { ...current, currentStartSec: clamp(current.originalStartSec + deltaSec, 0, current.currentEndSec - MIN_CUT_DURATION_SEC) }
+        : { ...current, currentEndSec: clamp(current.originalEndSec + deltaSec, current.currentStartSec + MIN_CUT_DURATION_SEC, current.sourceDuration) };
+      dragStateRef.current = nextState;
+      setDragState(nextState);
+      const nextCuts = normalizeSourceRanges(current.sourceDuration, [
+        ...current.baseCutRanges.filter((item) => item.id !== nextState.cut.id),
+        { id: nextState.cut.id, startSec: nextState.currentStartSec, endSec: nextState.currentEndSec },
+      ]);
+      const nextIntervals = invertCutRanges(nextCuts, current.sourceDuration);
+      const boundarySourceSec = nextState.edge === 'start' ? nextState.currentStartSec : nextState.currentEndSec;
+      callbacksRef.current.onPreviewSource(boundarySourceSec);
+      callbacksRef.current.onSeek(sourceToVirtualTime(nextIntervals, boundarySourceSec));
+    };
+
+    const endDrag = () => {
+      const current = dragStateRef.current;
+      if (current && committedDragRef.current !== current.id) {
+        committedDragRef.current = current.id;
+        commitCutChange(
+          current.baseCutRanges,
+          current.sourceDuration,
+          current.cut,
+          { startSec: current.currentStartSec, endSec: current.currentEndSec },
+          callbacksRef.current.onReplaceTimeline,
+        );
+      }
+      dragStateRef.current = null;
+      setDragState(null);
+      activeDragCleanupRef.current?.();
+    };
+
+    const cleanup = () => {
+      globalThis.document.body.classList.remove('resizing-cut');
+      globalThis.window.removeEventListener('pointermove', handlePointerMove);
+      globalThis.window.removeEventListener('pointerup', endDrag);
+      globalThis.window.removeEventListener('pointercancel', endDrag);
+      activeDragCleanupRef.current = null;
+    };
+    activeDragCleanupRef.current = cleanup;
+    globalThis.document.body.classList.add('resizing-cut');
+    globalThis.window.addEventListener('pointermove', handlePointerMove);
+    globalThis.window.addEventListener('pointerup', endDrag, { once: true });
+    globalThis.window.addEventListener('pointercancel', endDrag, { once: true });
   };
 
   const deleteCut = (cut: SourceRange) => {
