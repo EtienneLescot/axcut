@@ -17,9 +17,8 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present"
   },
-  "dependencies": {},
   "devDependencies": {
-    "concurrently": "^9.2.1",
+    "concurrently": "^10.0.3",
     "sharp": "^0.34.5",
     "tsx": "^4.20.6",
     "typescript": "^5.8.3"
