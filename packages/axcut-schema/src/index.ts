@@ -220,6 +220,8 @@ export const exportInputSchema = z.object({
 
 export const applyOperationInputSchema = z.object({
   operation: operationSchema,
+  sessionId: z.string().min(1).optional(),
+  conversationMessage: z.string().min(1).optional(),
 });
 
 export type AxcutWord = z.infer<typeof wordSchema>;

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ButtonHTMLAttributes, CSSProperties, ReactNode } from 'react';
+import type { ButtonHTMLAttributes, CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import type { AxcutDocument } from '@axcut/schema';
+import type { QueryKey } from '@tanstack/react-query';
+import type { AxcutClip, AxcutDocument } from '@axcut/schema';
 import {
   ArrowLeft,
   Brain,
@@ -12,6 +13,7 @@ import {
   Eye,
   FileText,
   FolderOpen,
+  GitBranch,
   History,
   LogIn,
   MessageSquarePlus,
@@ -47,6 +49,35 @@ type Message = {
   role: 'user' | 'assistant' | 'system';
   content: string;
   createdAt: string;
+  checkpointId: string | null;
+};
+
+type ContextUsage = {
+  promptTokens: number;
+  completionTokens: number;
+  contextWindowTokens: number;
+  fillPercent: number;
+  source: 'api' | 'estimated';
+};
+
+type CheckpointSummary = {
+  id: string;
+  sessionId: string;
+  createdAt: string;
+  messageCount: number;
+  summary?: string;
+  reason?: string;
+  label?: string;
+  restoredAt?: string;
+};
+
+type WorktreeInfo = {
+  path: string;
+  head: string;
+  branch?: string;
+  bare: boolean;
+  detached: boolean;
+  locked: boolean;
 };
 
 type SessionSummary = {
@@ -56,6 +87,8 @@ type SessionSummary = {
   updatedAt: string;
   closedAt?: string;
   messageCount: number;
+  checkpointCount: number;
+  contextUsage?: ContextUsage;
   active: boolean;
 };
 
@@ -65,7 +98,27 @@ type ProjectSnapshot = {
   jobs: JobSummary[];
   activeSessionId: string;
   sessions: SessionSummary[];
+  checkpoints: CheckpointSummary[];
+  contextUsage?: ContextUsage;
+  activeWorktree?: WorktreeInfo;
+  availableWorktrees: WorktreeInfo[];
 };
+
+type PendingTimelineEdit = {
+  requestId: number;
+  projectId: string;
+  intervals: Array<{ startSec: number; endSec: number }>;
+  reason: string;
+};
+
+type ReplaceTimelineInput = PendingTimelineEdit & {
+  sessionId: string;
+  controller: AbortController;
+};
+
+type ReplaceTimelineResult =
+  | { aborted?: false; document: AxcutDocument; revisionId: string; message: Message | null }
+  | { aborted: true };
 
 type JobSummary = {
   id: string;
@@ -134,8 +187,35 @@ const providerUserDescriptions: Record<string, string> = {
   'openai-oauth': 'Sign in with your ChatGPT account.',
 };
 
+const CHAT_WIDTH_STORAGE_KEY = 'axcut.workbench.chatWidthPx';
+const TIMELINE_HEIGHT_STORAGE_KEY = 'axcut.workbench.timelineHeightPx';
+const DEFAULT_CHAT_WIDTH = 610;
+const DEFAULT_TIMELINE_HEIGHT = 170;
+
+function readStoredNumber(key: string, fallback: number): number {
+  if (typeof window === 'undefined') {
+    return fallback;
+  }
+  const value = Number(window.localStorage.getItem(key));
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
 function getProviderUserDescription(provider: Pick<LlmProviderState, 'id' | 'defaultModel'>) {
   return providerUserDescriptions[provider.id] ?? '';
+}
+
+function displayMessageRole(role: Message['role']): string {
+  if (role === 'user') {
+    return 'you';
+  }
+  if (role === 'assistant') {
+    return 'Axcut';
+  }
+  return role;
 }
 
 type DeviceChallenge = {
@@ -200,6 +280,21 @@ function popoverStyle(anchor: PopoverAnchor | null, width: number): CSSPropertie
   return {
     left,
     bottom: Math.max(margin, window.innerHeight - anchor.top + 6),
+    width: `min(${width}px, calc(100vw - ${margin * 2}px))`,
+  };
+}
+
+function popdownStyle(anchor: PopoverAnchor | null, width: number): CSSProperties | undefined {
+  if (!anchor || typeof window === 'undefined') {
+    return undefined;
+  }
+  const margin = 8;
+  const preferredLeft = anchor.left + anchor.width - width;
+  const left = Math.min(Math.max(preferredLeft, margin), Math.max(margin, window.innerWidth - width - margin));
+  const top = Math.min(Math.max(anchor.top + 6, margin), Math.max(margin, window.innerHeight - 130));
+  return {
+    left,
+    top,
     width: `min(${width}px, calc(100vw - ${margin * 2}px))`,
   };
 }
@@ -303,6 +398,96 @@ function buildEditedTranscript(document: AxcutDocument): string {
   return lines.join('\n').trimEnd();
 }
 
+function buildOptimisticTimelineDocument(
+  document: AxcutDocument,
+  intervals: Array<{ startSec: number; endSec: number }>,
+  reason: string,
+): AxcutDocument {
+  const assetId = document.project.primaryAssetId ?? document.assets[0]?.id;
+  if (!assetId) {
+    return document;
+  }
+  const asset = document.assets.find((item) => item.id === assetId);
+  const normalized = normalizeTimelineIntervals(asset?.durationSec ?? 0, intervals);
+  return {
+    ...document,
+    project: {
+      ...document.project,
+      updatedAt: new Date().toISOString(),
+    },
+    timeline: {
+      ...document.timeline,
+      clips: buildOptimisticClips(document, assetId, normalized, reason),
+      gaps: [],
+    },
+    preview: {
+      ...document.preview,
+      revision: document.preview.revision + 1,
+    },
+  };
+}
+
+function normalizeTimelineIntervals(durationSec: number, intervals: Array<{ startSec: number; endSec: number }>): Array<{ startSec: number; endSec: number }> {
+  const bounded = intervals
+    .map((interval) => ({
+      startSec: Math.max(0, Math.min(durationSec, interval.startSec)),
+      endSec: Math.max(0, Math.min(durationSec, interval.endSec)),
+    }))
+    .filter((interval) => interval.endSec > interval.startSec)
+    .sort((a, b) => a.startSec - b.startSec);
+  const merged: Array<{ startSec: number; endSec: number }> = [];
+  for (const interval of bounded) {
+    const previous = merged.at(-1);
+    if (!previous || interval.startSec > previous.endSec) {
+      merged.push({ ...interval });
+      continue;
+    }
+    previous.endSec = Math.max(previous.endSec, interval.endSec);
+  }
+  return merged;
+}
+
+function buildOptimisticClips(
+  document: AxcutDocument,
+  assetId: string,
+  intervals: Array<{ startSec: number; endSec: number }>,
+  reason: string,
+): AxcutClip[] {
+  let cursor = 0;
+  return intervals.map((interval, index) => {
+    const duration = interval.endSec - interval.startSec;
+    const clip: AxcutClip = {
+      id: `clip_${index + 1}`,
+      assetId,
+      sourceStartSec: interval.startSec,
+      sourceEndSec: interval.endSec,
+      timelineStartSec: cursor,
+      timelineEndSec: cursor + duration,
+      wordRefs: collectOptimisticWordRefs(document, interval.startSec, interval.endSec),
+      origin: 'user',
+      reason,
+    };
+    cursor = clip.timelineEndSec;
+    return clip;
+  });
+}
+
+function collectOptimisticWordRefs(document: AxcutDocument, startSec: number, endSec: number): string[] {
+  return document.transcript?.words
+    .filter((word) => word.endSec > startSec && word.startSec < endSec)
+    .map((word) => word.id) ?? [];
+}
+
+function applyPendingTimelineEdit(snapshot: ProjectSnapshot, pendingEdit: PendingTimelineEdit | null): ProjectSnapshot {
+  if (!pendingEdit || snapshot.document.project.id !== pendingEdit.projectId) {
+    return snapshot;
+  }
+  return {
+    ...snapshot,
+    document: buildOptimisticTimelineDocument(snapshot.document, pendingEdit.intervals, pendingEdit.reason),
+  };
+}
+
 function getSttStatus(document: AxcutDocument | undefined, jobs: JobSummary[] | undefined) {
   const sttJob = jobs?.find((job) => job.kind === 'transcribe_asset' || job.kind === 'ingest_asset') ?? null;
   if (!document?.assets.length) {
@@ -384,7 +569,7 @@ function LiveRunFeed({ state }: { state: LiveRunState }) {
       {state.assistantDraft ? (
         <article className="message assistant streaming">
           <div className="message-meta">
-            <strong className="message-role assistant">assistant</strong>
+            <strong className="message-role assistant">{displayMessageRole('assistant')}</strong>
             <span className="muted">streaming</span>
           </div>
           <p>{state.assistantDraft}</p>
@@ -453,6 +638,9 @@ function useProjectEvents(
       'agent.thinking.delta',
       'agent.operation',
       'agent.compaction',
+      'agent.checkpoint.saved',
+      'agent.checkpoint.restored',
+      'agent.checkpoint.deleted',
       'agent.session.created',
       'agent.session.updated',
       'agent.session.deleted',
@@ -483,21 +671,91 @@ export function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [message, setMessage] = useState('');
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [worktreeOpen, setWorktreeOpen] = useState(false);
   const [providerOpen, setProviderOpen] = useState(false);
   const [providerInitialScreen, setProviderInitialScreen] = useState<'models' | 'providers' | 'settings' | 'provider-form'>('models');
   const [providerAnchor, setProviderAnchor] = useState<PopoverAnchor | null>(null);
   const [reasoningOpen, setReasoningOpen] = useState(false);
   const [reasoningAnchor, setReasoningAnchor] = useState<PopoverAnchor | null>(null);
+  const [rewindConfirmation, setRewindConfirmation] = useState<{ messageId: string; anchor: PopoverAnchor } | null>(null);
   const [loadVideoOpen, setLoadVideoOpen] = useState(false);
   const [transcriptModal, setTranscriptModal] = useState<'source' | 'edited' | null>(null);
   const [transcriptLanguage, setTranscriptLanguage] = useState<TranscriptLanguageSelection>('auto');
   const [virtualTimeSec, setVirtualTimeSec] = useState(0);
   const [seekTarget, setSeekTarget] = useState<{ timeSec: number; requestId: number } | null>(null);
+  const [sourcePreviewTarget, setSourcePreviewTarget] = useState<{ sourceTimeSec: number; requestId: number } | null>(null);
   const [liveRun, setLiveRun] = useState<LiveRunState>(emptyLiveRunState);
   const [autoScrollMessages, setAutoScrollMessages] = useState(true);
+  const [chatPanelWidth, setChatPanelWidth] = useState(() => readStoredNumber(CHAT_WIDTH_STORAGE_KEY, DEFAULT_CHAT_WIDTH));
+  const [timelinePanelHeight, setTimelinePanelHeight] = useState(() => readStoredNumber(TIMELINE_HEIGHT_STORAGE_KEY, DEFAULT_TIMELINE_HEIGHT));
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const providerButtonRef = useRef<HTMLButtonElement | null>(null);
   const reasoningButtonRef = useRef<HTMLButtonElement | null>(null);
+  const replaceTimelineRequestRef = useRef<{ id: number; controller: AbortController } | null>(null);
+  const pendingTimelineEditRef = useRef<PendingTimelineEdit | null>(null);
+
+  const layoutStyle = useMemo(() => ({
+    '--chat-panel-width': `${chatPanelWidth}px`,
+    '--timeline-panel-height': `${timelinePanelHeight}px`,
+  }) as CSSProperties, [chatPanelWidth, timelinePanelHeight]);
+
+  const startChatResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (window.innerWidth <= 980) {
+      return;
+    }
+    event.preventDefault();
+    const shell = event.currentTarget.closest<HTMLElement>('.app-shell');
+    if (!shell) {
+      return;
+    }
+    const rect = shell.getBoundingClientRect();
+    let nextWidth = chatPanelWidth;
+    const update = (clientX: number) => {
+      const maxWidth = Math.max(320, rect.width - 430);
+      nextWidth = Math.round(clamp(clientX - rect.left, 320, maxWidth));
+      setChatPanelWidth(nextWidth);
+    };
+    const onMove = (moveEvent: PointerEvent) => update(moveEvent.clientX);
+    const onUp = () => {
+      window.localStorage.setItem(CHAT_WIDTH_STORAGE_KEY, String(nextWidth));
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      globalThis.document.body.classList.remove('resizing-chat');
+    };
+    globalThis.document.body.classList.add('resizing-chat');
+    update(event.clientX);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp, { once: true });
+  }, [chatPanelWidth]);
+
+  const startTimelineResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (window.innerWidth <= 980) {
+      return;
+    }
+    event.preventDefault();
+    const shell = event.currentTarget.closest<HTMLElement>('.app-shell');
+    if (!shell) {
+      return;
+    }
+    const rect = shell.getBoundingClientRect();
+    let nextHeight = timelinePanelHeight;
+    const update = (clientY: number) => {
+      const maxHeight = Math.max(120, rect.height - 340);
+      nextHeight = Math.round(clamp(rect.bottom - clientY, 120, maxHeight));
+      setTimelinePanelHeight(nextHeight);
+    };
+    const onMove = (moveEvent: PointerEvent) => update(moveEvent.clientY);
+    const onUp = () => {
+      window.localStorage.setItem(TIMELINE_HEIGHT_STORAGE_KEY, String(nextHeight));
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      globalThis.document.body.classList.remove('resizing-timeline');
+    };
+    globalThis.document.body.classList.add('resizing-timeline');
+    update(event.clientY);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp, { once: true });
+  }, [timelinePanelHeight]);
 
   const sessionQuery = useQuery({
     queryKey: ['session'],
@@ -537,9 +795,10 @@ export function App() {
     queryKey: ['project', projectId, activeSessionId],
     queryFn: () => {
       const sessionQueryPart = activeSessionId ? `?sessionId=${encodeURIComponent(activeSessionId)}` : '';
+      const pendingEdit = pendingTimelineEditRef.current;
       return requestJson<ProjectSnapshot>(`/api/projects/${projectId}${sessionQueryPart}`, {
         headers: authHeaders(sessionToken!),
-      });
+      }).then((snapshot) => applyPendingTimelineEdit(snapshot, pendingEdit));
     },
   });
 
@@ -551,6 +810,10 @@ export function App() {
 
   const invalidateProject = useCallback(() => {
     if (!projectId) {
+      return;
+    }
+    if (pendingTimelineEditRef.current?.projectId === projectId) {
+      void queryClient.invalidateQueries({ queryKey: ['projects'] });
       return;
     }
     void queryClient.invalidateQueries({ queryKey: ['project', projectId] });
@@ -584,6 +847,7 @@ export function App() {
 
   const handleMessagesScroll = useCallback(() => {
     setAutoScrollMessages(isMessagesNearBottom());
+    setRewindConfirmation(null);
   }, [isMessagesNearBottom]);
 
   useEffect(() => {
@@ -596,6 +860,30 @@ export function App() {
     }
     element.scrollTop = element.scrollHeight;
   }, [autoScrollMessages, liveRun, snapshotQuery.data?.messages.length]);
+
+  useEffect(() => {
+    if (!rewindConfirmation) {
+      return;
+    }
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest('[data-rewind-confirmation="true"], [data-rewind-trigger="true"]')) {
+        return;
+      }
+      setRewindConfirmation(null);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setRewindConfirmation(null);
+      }
+    };
+    globalThis.document.addEventListener('pointerdown', handlePointerDown);
+    globalThis.document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      globalThis.document.removeEventListener('pointerdown', handlePointerDown);
+      globalThis.document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [rewindConfirmation]);
 
   const createSession = useMutation({
     mutationFn: async () => {
@@ -689,6 +977,196 @@ export function App() {
     },
   });
 
+  const rewindMessage = useMutation({
+    mutationFn: async (messageId: string) => {
+      if (!projectId || !sessionToken || !activeSessionId) {
+        throw new Error('No active conversation.');
+      }
+      return requestJson<{ prompt: string; snapshot: ProjectSnapshot }>(`/api/projects/${projectId}/sessions/${activeSessionId}/messages/${messageId}/rewind`, {
+        method: 'POST',
+        headers: authHeaders(sessionToken),
+      });
+    },
+    onSuccess: async (result) => {
+      setLiveRun(emptyLiveRunState);
+      setMessage(result.prompt);
+      await queryClient.invalidateQueries({ queryKey: ['project', projectId] });
+    },
+  });
+
+  const replaceTimeline = useMutation({
+    mutationFn: async (input: ReplaceTimelineInput) => {
+      if (!sessionToken) {
+        throw new Error('No active conversation.');
+      }
+      return requestJson<ReplaceTimelineResult>(`/api/projects/${input.projectId}/operations`, {
+        method: 'POST',
+        body: JSON.stringify({
+          sessionId: input.sessionId,
+          conversationMessage: `Timeline edit: ${input.reason}`,
+          operation: {
+            type: 'replace_timeline',
+            reason: input.reason,
+            intervals: input.intervals,
+          },
+        }),
+        headers: authHeaders(sessionToken),
+        signal: input.controller.signal,
+      });
+    },
+    onMutate: async (input) => {
+      const pendingEdit: PendingTimelineEdit = {
+        requestId: input.requestId,
+        projectId: input.projectId,
+        intervals: input.intervals,
+        reason: input.reason,
+      };
+      pendingTimelineEditRef.current = pendingEdit;
+      await queryClient.cancelQueries({ queryKey: ['project', input.projectId] });
+      const previousSnapshots = queryClient.getQueriesData<ProjectSnapshot>({ queryKey: ['project', input.projectId] });
+      queryClient.setQueriesData<ProjectSnapshot>({ queryKey: ['project', input.projectId] }, (current) => (
+        current ? applyPendingTimelineEdit(current, pendingEdit) : current
+      ));
+      return { requestId: input.requestId, projectId: input.projectId, previousSnapshots };
+    },
+    onError: async (error, _input, context) => {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        return;
+      }
+      if (!context || context.requestId !== replaceTimelineRequestRef.current?.id) {
+        return;
+      }
+      await queryClient.cancelQueries({ queryKey: ['project', context.projectId] });
+      pendingTimelineEditRef.current = null;
+      replaceTimelineRequestRef.current = null;
+      for (const [queryKey, snapshot] of context.previousSnapshots) {
+        queryClient.setQueryData(queryKey, snapshot);
+      }
+    },
+    onSuccess: async (result, _input, context) => {
+      if (context.requestId !== replaceTimelineRequestRef.current?.id) {
+        return;
+      }
+      await queryClient.cancelQueries({ queryKey: ['project', context.projectId] });
+      if ('aborted' in result && result.aborted) {
+        pendingTimelineEditRef.current = null;
+        replaceTimelineRequestRef.current = null;
+        for (const [queryKey, snapshot] of context.previousSnapshots) {
+          queryClient.setQueryData(queryKey, snapshot);
+        }
+        return;
+      }
+      queryClient.setQueriesData<ProjectSnapshot>({ queryKey: ['project', context.projectId] }, (current) => {
+        if (!current) {
+          return current;
+        }
+        const message = result.message;
+        const shouldAppendMessage = Boolean(
+          message
+          && current.activeSessionId === message.sessionId
+          && !current.messages.some((item) => item.id === message.id),
+        );
+        return {
+          ...current,
+          document: result.document,
+          messages: shouldAppendMessage && message ? [...current.messages, message] : current.messages,
+        };
+      });
+      pendingTimelineEditRef.current = null;
+      replaceTimelineRequestRef.current = null;
+      setAutoScrollMessages(true);
+      await queryClient.invalidateQueries({ queryKey: ['project', context.projectId] });
+      await queryClient.invalidateQueries({ queryKey: ['projects'] });
+    },
+  });
+
+  const queueReplaceTimeline = useCallback((intervals: Array<{ startSec: number; endSec: number }>, reason: string) => {
+    if (!projectId || !activeSessionId) {
+      return;
+    }
+    replaceTimelineRequestRef.current?.controller.abort();
+    const requestId = (replaceTimelineRequestRef.current?.id ?? 0) + 1;
+    const controller = new AbortController();
+    replaceTimelineRequestRef.current = { id: requestId, controller };
+    pendingTimelineEditRef.current = {
+      requestId,
+      projectId,
+      intervals,
+      reason,
+    };
+    replaceTimeline.mutate({
+      requestId,
+      projectId,
+      sessionId: activeSessionId,
+      intervals,
+      reason,
+      controller,
+    });
+  }, [activeSessionId, projectId, replaceTimeline]);
+
+  const compactContext = useMutation({
+    mutationFn: async () => {
+      if (!projectId || !sessionToken || !activeSessionId) {
+        throw new Error('No active conversation.');
+      }
+      return requestJson<{ snapshot: ProjectSnapshot }>(`/api/projects/${projectId}/sessions/${activeSessionId}/compact`, {
+        method: 'POST',
+        headers: authHeaders(sessionToken),
+      });
+    },
+    onSuccess: async () => {
+      setLiveRun(emptyLiveRunState);
+      await queryClient.invalidateQueries({ queryKey: ['project', projectId] });
+    },
+  });
+
+  const createWorktree = useMutation({
+    mutationFn: async () => {
+      if (!projectId || !sessionToken || !activeSessionId) {
+        throw new Error('No active conversation.');
+      }
+      return requestJson<{ snapshot: ProjectSnapshot }>(`/api/projects/${projectId}/sessions/${activeSessionId}/worktrees`, {
+        method: 'POST',
+        headers: authHeaders(sessionToken),
+      });
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['project', projectId] });
+    },
+  });
+
+  const selectWorktree = useMutation({
+    mutationFn: async (path: string | null) => {
+      if (!projectId || !sessionToken || !activeSessionId) {
+        throw new Error('No active conversation.');
+      }
+      return requestJson<{ snapshot: ProjectSnapshot }>(`/api/projects/${projectId}/sessions/${activeSessionId}/worktrees/select`, {
+        method: 'POST',
+        body: JSON.stringify({ path: path ?? '' }),
+        headers: authHeaders(sessionToken),
+      });
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['project', projectId] });
+    },
+  });
+
+  const removeWorktree = useMutation({
+    mutationFn: async (path: string) => {
+      if (!projectId || !sessionToken || !activeSessionId) {
+        throw new Error('No active conversation.');
+      }
+      return requestJson<{ snapshot: ProjectSnapshot }>(`/api/projects/${projectId}/sessions/${activeSessionId}/worktrees`, {
+        method: 'DELETE',
+        body: JSON.stringify({ path }),
+        headers: authHeaders(sessionToken),
+      });
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['project', projectId] });
+    },
+  });
+
   const updateReasoning = useMutation({
     mutationFn: async (reasoningEffort: ReasoningEffort) => {
       const effective = llmConfigQuery.data?.effective;
@@ -756,6 +1234,8 @@ export function App() {
   const snapshot = snapshotQuery.data;
   const document = snapshot?.document;
   const activeSession = snapshot?.sessions.find((session) => session.id === snapshot.activeSessionId) ?? snapshot?.sessions[0];
+  const contextUsage = snapshot?.contextUsage;
+  const activeWorktreeLabel = snapshot?.activeWorktree?.branch?.replace(/^refs\/heads\//, '') || artifactName(snapshot?.activeWorktree?.path);
   const primaryAsset = useMemo(
     () => document?.assets.find((asset) => asset.id === document.project.primaryAssetId) ?? document?.assets[0],
     [document],
@@ -809,7 +1289,7 @@ export function App() {
     : null;
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" style={layoutStyle}>
       <aside className="left-rail panel">
         <header className="chat-header">
           <div className="chat-title-block">
@@ -823,6 +1303,19 @@ export function App() {
             </h1>
           </div>
           <div className="header-actions">
+            {contextUsage ? (
+              <span className="context-pill" title={`${contextUsage.promptTokens} estimated prompt tokens of ${contextUsage.contextWindowTokens}`}>
+                {contextUsage.fillPercent}% context
+              </span>
+            ) : null}
+            {activeWorktreeLabel ? (
+              <button className="worktree-pill active" onClick={() => setWorktreeOpen(true)} type="button" title={snapshot?.activeWorktree?.path}>
+                <GitBranch size={14} aria-hidden="true" />
+                <span>{activeWorktreeLabel}</span>
+              </button>
+            ) : null}
+            <IconButton icon={GitBranch} label="Worktrees" className="secondary" onClick={() => setWorktreeOpen(true)} disabled={!projectId || !activeSessionId} />
+            <IconButton icon={Brain} label="Compact context" className="secondary" onClick={() => compactContext.mutate()} disabled={!activeSessionId || compactContext.isPending || sendChat.isPending} />
             <IconButton
               icon={Settings}
               label="Settings"
@@ -841,18 +1334,72 @@ export function App() {
 
         <div className="messages" ref={messagesRef} onScroll={handleMessagesScroll}>
           {snapshot?.messages.length ? snapshot.messages.map((item) => (
-            <article key={item.id} className={`message ${item.role}`}>
-              <div className="message-meta">
-                <strong className={`message-role ${item.role}`}>{item.role}</strong>
-                <span className="muted">{new Date(item.createdAt).toLocaleTimeString()}</span>
+            <div key={item.id} className={`message-group ${item.role}`}>
+              <article className={`message ${item.role}`}>
+                <div className="message-meta">
+                  <strong className={`message-role ${item.role}`}>{displayMessageRole(item.role)}</strong>
+                  <span className="muted">{new Date(item.createdAt).toLocaleTimeString()}</span>
+                </div>
+                <p>{item.content}</p>
+              </article>
+              <div className="message-actions">
+                {item.role === 'user' && item.checkpointId ? (
+                  <IconButton
+                    icon={ArrowLeft}
+                    label="Rewind to before this message"
+                    className="secondary"
+                    data-rewind-trigger="true"
+                    aria-expanded={rewindConfirmation?.messageId === item.id}
+                    onClick={(event) => {
+                      const rect = event.currentTarget.getBoundingClientRect();
+                      setRewindConfirmation({
+                        messageId: item.id,
+                        anchor: {
+                          left: rect.left,
+                          top: rect.bottom,
+                          width: rect.width,
+                        },
+                      });
+                    }}
+                    disabled={sendChat.isPending || rewindMessage.isPending}
+                  />
+                ) : null}
+                <IconButton icon={Copy} label="Copy message" className="secondary" onClick={() => void navigator.clipboard.writeText(item.content)} />
               </div>
-              <p>{item.content}</p>
-            </article>
+            </div>
           )) : (
             <div className="message-empty muted">
               {projectId ? 'No messages in this conversation yet.' : 'Start the server with AXCUT_VIDEO_PATH set to a local video file.'}
             </div>
           )}
+          {rewindConfirmation ? (
+            <div
+              className="confirm-popover rewind-confirm-popover"
+              data-rewind-confirmation="true"
+              role="dialog"
+              aria-label="Confirm rewind"
+              style={popdownStyle(rewindConfirmation.anchor, 260)}
+            >
+              <strong>Rewind here?</strong>
+              <p className="muted">Project, conversation, and agent state will be restored.</p>
+              <div className="confirm-popover-actions">
+                <button type="button" className="secondary" onClick={() => setRewindConfirmation(null)}>
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const messageId = rewindConfirmation.messageId;
+                    setRewindConfirmation(null);
+                    rewindMessage.mutate(messageId);
+                  }}
+                  disabled={sendChat.isPending || rewindMessage.isPending}
+                >
+                  Rewind
+                </button>
+              </div>
+            </div>
+          ) : null}
           <LiveRunFeed state={liveRun} />
         </div>
 
@@ -929,21 +1476,24 @@ export function App() {
         </form>
       </aside>
 
+      <div
+        className="chat-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize chat panel"
+        onPointerDown={startChatResize}
+      />
+
       <main className="preview-pane panel">
         <div className="preview-header">
           <div>
             <h2>{document?.project.title ?? 'Video Preview'}</h2>
-            <p className="muted">
-              {primaryAsset
-                ? `${primaryAsset.label}${primaryAsset.proxyPath ? ' · proxy ready' : ' · loading original source'}`
-                : 'Waiting for configured video source'}
-            </p>
-          </div>
-          <div className="preview-statuses">
-            <StatusChip label={sttStatus.label} detail={sttStatus.detail} tone={sttStatus.tone} />
-            {exportStatus ? <StatusChip label={exportStatus.label} detail={exportStatus.detail} tone={exportStatus.tone} href={exportHref} /> : null}
           </div>
           <div className="preview-actions">
+            <div className="preview-statuses">
+              <StatusChip label={sttStatus.label} detail={sttStatus.detail} tone={sttStatus.tone} />
+              {exportStatus ? <StatusChip label={exportStatus.label} detail={exportStatus.detail} tone={exportStatus.tone} href={exportHref} /> : null}
+            </div>
             <div className="preview-project-controls">
               {projectCount > 1 ? (
                 <select
@@ -979,6 +1529,7 @@ export function App() {
             clips={document.timeline.clips}
             revision={document.preview.revision}
             seekTarget={seekTarget}
+            sourcePreviewTarget={sourcePreviewTarget}
             onTimeChange={setVirtualTimeSec}
           />
         ) : (
@@ -986,10 +1537,22 @@ export function App() {
         )}
       </main>
 
+      <div
+        className="timeline-resizer"
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="Resize timeline panel"
+        onPointerDown={startTimelineResize}
+      />
+
       <TimelinePane
         clips={document?.timeline.clips ?? []}
         currentTimeSec={virtualTimeSec}
+        sourceDurationSec={primaryAsset?.durationSec ?? 0}
+        busy={!activeSessionId || sendChat.isPending}
         onSeek={(timeSec) => setSeekTarget({ timeSec, requestId: Date.now() })}
+        onPreviewSource={(sourceTimeSec) => setSourcePreviewTarget({ sourceTimeSec, requestId: Date.now() })}
+        onReplaceTimeline={queueReplaceTimeline}
       />
 
       {historyOpen ? (
@@ -1004,6 +1567,18 @@ export function App() {
           }}
           onDelete={(sessionId) => deleteSession.mutate(sessionId)}
           onRename={(sessionId, title) => renameSession.mutate({ sessionId, title })}
+        />
+      ) : null}
+
+      {worktreeOpen ? (
+        <WorktreeDialog
+          activeWorktree={snapshot?.activeWorktree}
+          worktrees={snapshot?.availableWorktrees ?? []}
+          busy={createWorktree.isPending || selectWorktree.isPending || removeWorktree.isPending}
+          onClose={() => setWorktreeOpen(false)}
+          onCreate={() => createWorktree.mutate()}
+          onSelect={(worktreePath) => selectWorktree.mutate(worktreePath)}
+          onRemove={(worktreePath) => removeWorktree.mutate(worktreePath)}
         />
       ) : null}
 
@@ -1294,6 +1869,7 @@ function ReasoningPopover({
         <div className="reasoning-option-list">
           {reasoningEffortOptions.map((option) => (
             <button
+              type="button"
               key={option.value}
               className={option.value === selected ? 'model-option active' : 'model-option'}
               onClick={() => onSelect(option.value)}
@@ -1306,6 +1882,68 @@ function ReasoningPopover({
               {option.value === selected ? <span className="muted">Active</span> : null}
             </button>
           ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function WorktreeDialog({
+  activeWorktree,
+  worktrees,
+  busy,
+  onClose,
+  onCreate,
+  onSelect,
+  onRemove,
+}: {
+  activeWorktree?: WorktreeInfo;
+  worktrees: WorktreeInfo[];
+  busy: boolean;
+  onClose: () => void;
+  onCreate: () => void;
+  onSelect: (path: string | null) => void;
+  onRemove: (path: string) => void;
+}) {
+  const activePath = activeWorktree?.path;
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <section className="modal panel history-modal">
+        <div className="modal-header">
+          <div>
+            <h2>Worktrees</h2>
+            <p className="muted">Use an isolated branch for agent changes.</p>
+          </div>
+          <div className="header-actions">
+            <IconButton icon={GitBranch} label="Create worktree" onClick={onCreate} disabled={busy}>Create</IconButton>
+            <IconButton icon={X} label="Close" className="secondary" onClick={onClose} />
+          </div>
+        </div>
+        <div className="session-list">
+          <article className={!activePath ? 'session-item active' : 'session-item'}>
+            <button className="session-main" onClick={() => onSelect(null)} disabled={busy}>
+              <strong>Main workspace</strong>
+              <span className="muted">Use the current repository checkout.</span>
+            </button>
+            <div className="session-actions">{!activePath ? <span className="status-pill ready">Active</span> : null}</div>
+          </article>
+          {worktrees.map((worktree) => {
+            const branch = worktree.branch?.replace(/^refs\/heads\//, '') || artifactName(worktree.path) || 'worktree';
+            const isActive = activePath === worktree.path;
+            return (
+              <article key={worktree.path} className={isActive ? 'session-item active' : 'session-item'}>
+                <button className="session-main" onClick={() => onSelect(worktree.path)} disabled={busy}>
+                  <strong>{branch}</strong>
+                  <span className="muted">{worktree.path}</span>
+                </button>
+                <div className="session-actions">
+                  {isActive ? <span className="status-pill ready">Active</span> : null}
+                  {worktree.locked ? <span className="status-pill">Locked</span> : null}
+                  <IconButton icon={Trash2} label="Remove" className="danger" onClick={() => onRemove(worktree.path)} disabled={busy || worktree.locked} />
+                </div>
+              </article>
+            );
+          })}
         </div>
       </section>
     </div>
@@ -1613,6 +2251,7 @@ function ProviderSettingsDialog({
 	              <div className="model-list" role="listbox" aria-label={`${activeProvider.label} models`}>
 	                {filteredModels.map((candidate) => (
 	                  <button
+	                    type="button"
 	                    key={candidate}
 	                    className={candidate === model ? 'model-option active' : 'model-option'}
 	                    onClick={() => selectModel(candidate)}
@@ -1654,6 +2293,7 @@ function ProviderSettingsDialog({
             <div className="provider-grid">
               {connectedProviders.map((provider) => (
                 <button
+                  type="button"
                   key={provider.id}
                   className={provider.id === providerId ? 'provider-row active' : 'provider-row'}
                   onClick={() => {
@@ -1713,6 +2353,7 @@ function ProviderSettingsDialog({
                 const description = getProviderUserDescription(provider);
                 return (
                   <button
+                    type="button"
                     key={provider.id}
                     className="provider-choice-item"
                     onClick={() => openProviderForm(provider.id, 'create')}

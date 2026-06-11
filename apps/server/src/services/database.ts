@@ -20,6 +20,7 @@ export type MessageRow = {
   role: 'user' | 'assistant' | 'system';
   content: string;
   revisionId: string | null;
+  checkpointId: string | null;
   createdAt: string;
 };
 
@@ -63,6 +64,7 @@ export class DatabaseService {
         role TEXT NOT NULL,
         content TEXT NOT NULL,
         revision_id TEXT,
+        checkpoint_id TEXT,
         created_at TEXT NOT NULL
       );
 
@@ -89,6 +91,9 @@ export class DatabaseService {
       this.db.prepare(`ALTER TABLE messages ADD COLUMN session_id TEXT`).run();
       this.db.prepare(`UPDATE messages SET session_id = project_id WHERE session_id IS NULL`).run();
     }
+    if (!messageColumns.some((column) => column.name === 'checkpoint_id')) {
+      this.db.prepare(`ALTER TABLE messages ADD COLUMN checkpoint_id TEXT`).run();
+    }
     this.db.prepare(`CREATE INDEX IF NOT EXISTS idx_messages_project_session_created ON messages(project_id, session_id, created_at)`).run();
   }
 
@@ -114,7 +119,7 @@ export class DatabaseService {
     return row;
   }
 
-  insertMessage(input: Omit<MessageRow, 'id' | 'createdAt'> & { id?: string; createdAt?: string }): MessageRow {
+  insertMessage(input: Omit<MessageRow, 'id' | 'createdAt' | 'checkpointId'> & { id?: string; createdAt?: string; checkpointId?: string | null }): MessageRow {
     const row: MessageRow = {
       id: input.id ?? createId('msg'),
       projectId: input.projectId,
@@ -122,17 +127,35 @@ export class DatabaseService {
       role: input.role,
       content: input.content,
       revisionId: input.revisionId ?? null,
+      checkpointId: input.checkpointId ?? null,
       createdAt: input.createdAt ?? new Date().toISOString(),
     };
-    this.db.prepare(`INSERT INTO messages (id, project_id, session_id, role, content, revision_id, created_at) VALUES (@id, @projectId, @sessionId, @role, @content, @revisionId, @createdAt)`).run(row);
+    this.db.prepare(`INSERT INTO messages (id, project_id, session_id, role, content, revision_id, checkpoint_id, created_at) VALUES (@id, @projectId, @sessionId, @role, @content, @revisionId, @checkpointId, @createdAt)`).run(row);
     return row;
   }
 
   listMessages(projectId: string, sessionId?: string): MessageRow[] {
     const rows = sessionId
-      ? this.db.prepare(`SELECT id, project_id AS projectId, session_id AS sessionId, role, content, revision_id AS revisionId, created_at AS createdAt FROM messages WHERE project_id = ? AND session_id = ? ORDER BY created_at ASC`).all(projectId, sessionId)
-      : this.db.prepare(`SELECT id, project_id AS projectId, session_id AS sessionId, role, content, revision_id AS revisionId, created_at AS createdAt FROM messages WHERE project_id = ? ORDER BY created_at ASC`).all(projectId);
+      ? this.db.prepare(`SELECT id, project_id AS projectId, session_id AS sessionId, role, content, revision_id AS revisionId, checkpoint_id AS checkpointId, created_at AS createdAt FROM messages WHERE project_id = ? AND session_id = ? ORDER BY created_at ASC`).all(projectId, sessionId)
+      : this.db.prepare(`SELECT id, project_id AS projectId, session_id AS sessionId, role, content, revision_id AS revisionId, checkpoint_id AS checkpointId, created_at AS createdAt FROM messages WHERE project_id = ? ORDER BY created_at ASC`).all(projectId);
     return rows as MessageRow[];
+  }
+
+  replaceMessagesForSession(projectId: string, sessionId: string, messages: MessageRow[]): void {
+    const insert = this.db.prepare(`INSERT INTO messages (id, project_id, session_id, role, content, revision_id, checkpoint_id, created_at) VALUES (@id, @projectId, @sessionId, @role, @content, @revisionId, @checkpointId, @createdAt)`);
+    const run = this.db.transaction((rows: MessageRow[]) => {
+      this.db.prepare(`DELETE FROM messages WHERE project_id = ? AND session_id = ?`).run(projectId, sessionId);
+      for (const message of rows) {
+        insert.run({
+          ...message,
+          projectId,
+          sessionId,
+          revisionId: message.revisionId ?? null,
+          checkpointId: message.checkpointId ?? null,
+        });
+      }
+    });
+    run(messages);
   }
 
   countMessagesBySession(projectId: string): Record<string, number> {

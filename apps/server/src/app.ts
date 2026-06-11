@@ -2,13 +2,13 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { applyOperationInputSchema, exportInputSchema, transcribeInputSchema } from '@axcut/schema';
+import { applyOperationInputSchema, exportInputSchema, transcribeInputSchema, type ApplyOperationInput } from '@axcut/schema';
 import cors from '@fastify/cors';
 import Fastify from 'fastify';
 import { ZodError } from 'zod';
 
 import { streamFile } from './lib/media-stream.js';
-import { databasePath, projectArtifactsRoot, runtimeRoot } from './lib/paths.js';
+import { databasePath, dataRoot, projectArtifactsRoot, repoRoot, runtimeRoot } from './lib/paths.js';
 import { AxcutAgentRuntime } from './services/axcut-agent-runtime.js';
 import { ChatService } from './services/chat-service.js';
 import { DatabaseService } from './services/database.js';
@@ -17,6 +17,7 @@ import { EventBus } from './services/event-bus.js';
 import { JobService } from './services/job-service.js';
 import { LlmConfigService } from './services/llm-config-service.js';
 import { PythonWorker } from './services/python-worker.js';
+import { WorktreeService, type WorktreeInfo } from './services/worktree-service.js';
 
 async function ensureConfiguredProject(documents: DocumentService, jobs: JobService, logger: ReturnType<typeof Fastify>['log']): Promise<void> {
   const configuredVideoPath = process.env.AXCUT_VIDEO_PATH?.trim();
@@ -63,6 +64,28 @@ function resolveSessionToken(): string {
   return token;
 }
 
+function worktreeStatePath(): string {
+  return path.join(runtimeRoot, 'active-worktrees.json');
+}
+
+function readActiveWorktrees(): Record<string, string | null> {
+  try {
+    return JSON.parse(fs.readFileSync(worktreeStatePath(), 'utf-8')) as Record<string, string | null>;
+  } catch {
+    return {};
+  }
+}
+
+function writeActiveWorktrees(value: Record<string, string | null>): void {
+  fs.mkdirSync(runtimeRoot, { recursive: true });
+  fs.writeFileSync(worktreeStatePath(), `${JSON.stringify(value, null, 2)}\n`, 'utf-8');
+}
+
+function resolveActiveWorktree(worktrees: WorktreeInfo[], sessionId: string): WorktreeInfo | undefined {
+  const activePath = readActiveWorktrees()[sessionId];
+  return activePath ? worktrees.find((worktree) => path.resolve(worktree.path) === path.resolve(activePath)) : undefined;
+}
+
 export async function createServer() {
   const fastify = Fastify({ logger: true });
   await fastify.register(cors, {
@@ -95,8 +118,9 @@ export async function createServer() {
   const llmConfig = new LlmConfigService();
   const worker = new PythonWorker();
   const jobs = new JobService(db, documents, worker, events);
-  const agentRuntime = new AxcutAgentRuntime(documents, events, llmConfig);
+  const agentRuntime = new AxcutAgentRuntime(db, documents, events, llmConfig);
   const chat = new ChatService(db, documents, agentRuntime, events);
+  const worktrees = new WorktreeService(repoRoot, dataRoot);
 
   const buildSessionSummary = (projectId: string, activeSessionId?: string) => {
     const counts = db.countMessagesBySession(projectId);
@@ -107,18 +131,25 @@ export async function createServer() {
       updatedAt: session.updatedAt,
       closedAt: session.closedAt,
       messageCount: counts[session.id] ?? 0,
+      checkpointCount: agentRuntime.listCheckpoints(projectId, session.id).length,
+      contextUsage: agentRuntime.getContextUsage(projectId, session.id),
       active: session.id === activeSessionId,
     }));
   };
 
-  const buildProjectSnapshot = (projectId: string, requestedSessionId?: string) => {
+  const buildProjectSnapshot = async (projectId: string, requestedSessionId?: string) => {
     const activeSession = requestedSessionId
       ? agentRuntime.getSession(projectId, requestedSessionId)
       : agentRuntime.getOrCreateSession(projectId);
+    const availableWorktrees = await worktrees.listWorktrees();
     return {
       ...documents.getSnapshot(projectId, activeSession.id),
       activeSessionId: activeSession.id,
       sessions: buildSessionSummary(projectId, activeSession.id),
+      checkpoints: agentRuntime.listCheckpoints(projectId, activeSession.id),
+      contextUsage: agentRuntime.getContextUsage(projectId, activeSession.id),
+      activeWorktree: resolveActiveWorktree(availableWorktrees, activeSession.id),
+      availableWorktrees,
     };
   };
 
@@ -216,7 +247,7 @@ export async function createServer() {
     reply.code(201);
     return {
       session,
-      snapshot: buildProjectSnapshot(projectId, session.id),
+      snapshot: await buildProjectSnapshot(projectId, session.id),
     };
   });
 
@@ -254,6 +285,111 @@ export async function createServer() {
       activeSessionId: activeSession.id,
       sessions: buildSessionSummary(projectId, activeSession.id),
     };
+  });
+
+  fastify.post('/api/projects/:projectId/sessions/:sessionId/checkpoints', async (request, reply) => {
+    const { projectId, sessionId } = request.params as { projectId: string; sessionId: string };
+    const checkpoint = await agentRuntime.saveCheckpoint(projectId, sessionId, {
+      reason: 'manual',
+      label: 'Manual checkpoint',
+      summary: 'Manual checkpoint from the Workbench.',
+    });
+    reply.code(201);
+    return {
+      checkpoint,
+      snapshot: await buildProjectSnapshot(projectId, sessionId),
+    };
+  });
+
+  fastify.post('/api/projects/:projectId/sessions/:sessionId/checkpoints/:checkpointId/restore', async (request) => {
+    const { projectId, sessionId, checkpointId } = request.params as { projectId: string; sessionId: string; checkpointId: string };
+    const restored = await agentRuntime.restoreCheckpoint(projectId, sessionId, checkpointId);
+    return {
+      ...restored,
+      snapshot: await buildProjectSnapshot(projectId, sessionId),
+    };
+  });
+
+  fastify.delete('/api/projects/:projectId/sessions/:sessionId/checkpoints/:checkpointId', async (request) => {
+    const { projectId, sessionId, checkpointId } = request.params as { projectId: string; sessionId: string; checkpointId: string };
+    await agentRuntime.deleteCheckpoint(projectId, sessionId, checkpointId);
+    return { snapshot: await buildProjectSnapshot(projectId, sessionId) };
+  });
+
+  fastify.post('/api/projects/:projectId/sessions/:sessionId/messages/:messageId/rewind', async (request) => {
+    const { projectId, sessionId, messageId } = request.params as { projectId: string; sessionId: string; messageId: string };
+    const result = await agentRuntime.rewindToMessage(projectId, sessionId, messageId);
+    return {
+      ...result,
+      snapshot: await buildProjectSnapshot(projectId, sessionId),
+    };
+  });
+
+  fastify.post('/api/projects/:projectId/sessions/:sessionId/compact', async (request) => {
+    const { projectId, sessionId } = request.params as { projectId: string; sessionId: string };
+    const result = await agentRuntime.compactSession(projectId, sessionId);
+    return {
+      ...result,
+      snapshot: await buildProjectSnapshot(projectId, sessionId),
+    };
+  });
+
+  fastify.get('/api/projects/:projectId/sessions/:sessionId/worktrees', async (request) => {
+    const { sessionId } = request.params as { projectId: string; sessionId: string };
+    const availableWorktrees = await worktrees.listWorktrees();
+    return {
+      activeWorktree: resolveActiveWorktree(availableWorktrees, sessionId),
+      availableWorktrees,
+    };
+  });
+
+  fastify.post('/api/projects/:projectId/sessions/:sessionId/worktrees', async (request) => {
+    const { projectId, sessionId } = request.params as { projectId: string; sessionId: string };
+    const body = request.body as { branchName?: unknown; baseBranch?: unknown; detach?: unknown } | undefined;
+    const worktree = await worktrees.createWorktree({
+      branchName: typeof body?.branchName === 'string' ? body.branchName : undefined,
+      baseBranch: typeof body?.baseBranch === 'string' ? body.baseBranch : undefined,
+      detach: Boolean(body?.detach),
+    });
+    const active = readActiveWorktrees();
+    active[sessionId] = worktree.path;
+    writeActiveWorktrees(active);
+    return {
+      worktree,
+      snapshot: await buildProjectSnapshot(projectId, sessionId),
+    };
+  });
+
+  fastify.post('/api/projects/:projectId/sessions/:sessionId/worktrees/select', async (request) => {
+    const { projectId, sessionId } = request.params as { projectId: string; sessionId: string };
+    const worktreePath = typeof (request.body as { path?: unknown } | undefined)?.path === 'string'
+      ? (request.body as { path: string }).path
+      : '';
+    const availableWorktrees = await worktrees.listWorktrees();
+    if (worktreePath && !availableWorktrees.some((worktree) => path.resolve(worktree.path) === path.resolve(worktreePath))) {
+      throw new Error('Unknown worktree path.');
+    }
+    const active = readActiveWorktrees();
+    active[sessionId] = worktreePath || null;
+    writeActiveWorktrees(active);
+    return { snapshot: await buildProjectSnapshot(projectId, sessionId) };
+  });
+
+  fastify.delete('/api/projects/:projectId/sessions/:sessionId/worktrees', async (request) => {
+    const { projectId, sessionId } = request.params as { projectId: string; sessionId: string };
+    const worktreePath = typeof (request.body as { path?: unknown } | undefined)?.path === 'string'
+      ? (request.body as { path: string }).path
+      : '';
+    if (!worktreePath) {
+      throw new Error('Worktree path is required.');
+    }
+    await worktrees.removeWorktree(worktreePath);
+    const active = readActiveWorktrees();
+    if (active[sessionId] && path.resolve(active[sessionId]) === path.resolve(worktreePath)) {
+      active[sessionId] = null;
+      writeActiveWorktrees(active);
+    }
+    return { snapshot: await buildProjectSnapshot(projectId, sessionId) };
   });
 
   fastify.get('/api/projects/:projectId', async (request) => {
@@ -300,10 +436,31 @@ export async function createServer() {
 
   fastify.post('/api/projects/:projectId/operations', async (request) => {
     const { projectId } = request.params as { projectId: string };
-    const payload = applyOperationInputSchema.parse(request.body);
+    const payload = applyOperationInputSchema.parse(request.body) as ApplyOperationInput & { sessionId?: string; conversationMessage?: string };
+    const session = payload.sessionId ? agentRuntime.getSession(projectId, payload.sessionId) : null;
+    const summary = payload.operation.reason || 'Manual timeline update';
+    const checkpoint = session ? await agentRuntime.saveCheckpoint(projectId, session.id, {
+      reason: 'before-message',
+      label: 'Before timeline edit',
+      summary: `Before manual timeline edit: ${summary}`,
+    }) : null;
+    if (request.raw.aborted || request.raw.destroyed) {
+      return { aborted: true };
+    }
     const result = documents.applyOperation(projectId, payload.operation, payload.operation.reason || 'Manual timeline update', 'user');
+    const message = session ? db.insertMessage({
+      projectId,
+      sessionId: session.id,
+      role: 'user',
+      content: payload.conversationMessage || summary,
+      revisionId: result.revisionId,
+      checkpointId: checkpoint?.id ?? null,
+    }) : null;
     events.emit(projectId, 'project.revision.created', { revisionId: result.revisionId });
-    return result;
+    if (message) {
+      events.emit(projectId, 'agent.message.user', { sessionId: session!.id, messageId: message.id, content: message.content });
+    }
+    return { ...result, message };
   });
 
   fastify.post('/api/projects/:projectId/export', async (request, reply) => {

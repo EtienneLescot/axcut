@@ -18,7 +18,12 @@ export class ChatService {
     const session = payload.sessionId
       ? this.runtime.getSession(projectId, payload.sessionId)
       : this.runtime.getOrCreateSession(projectId);
-    const userMessage = this.db.insertMessage({ projectId, sessionId: session.id, role: 'user', content: payload.message, revisionId: null });
+    const beforeMessageCheckpoint = await this.runtime.saveCheckpoint(projectId, session.id, {
+      reason: 'before-message',
+      label: 'Before user message',
+      summary: payload.message.length > 96 ? `Before "${payload.message.slice(0, 93).trim()}..."` : `Before "${payload.message}"`,
+    });
+    const userMessage = this.db.insertMessage({ projectId, sessionId: session.id, role: 'user', content: payload.message, revisionId: null, checkpointId: beforeMessageCheckpoint.id });
     this.events.emit(projectId, 'agent.message.user', { sessionId: session.id, messageId: userMessage.id, content: userMessage.content });
     const result = await this.runtime.run(projectId, session.id, payload.message, dbMessagesToAgentHistory(this.db.listMessages(projectId, session.id)));
 
@@ -28,6 +33,11 @@ export class ChatService {
       role: 'assistant',
       content: result.summary,
       revisionId: result.revisionId,
+    });
+    await this.runtime.saveCheckpoint(projectId, session.id, {
+      reason: 'after-run',
+      label: 'After agent response',
+      summary: 'Checkpoint after the agent response.',
     });
     if (result.revisionId) {
       this.events.emit(projectId, 'project.revision.created', { sessionId: session.id, revisionId: result.revisionId });

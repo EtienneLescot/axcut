@@ -56,6 +56,15 @@ export class DocumentService {
     return documentSchema.parse(JSON.parse(raw));
   }
 
+  restoreDocument(projectId: string, snapshot: AxcutDocument, summary: string): AxcutDocument {
+    if (snapshot.project.id !== projectId) {
+      throw new Error(`Checkpoint document belongs to ${snapshot.project.id}, not ${projectId}.`);
+    }
+    const document = documentSchema.parse(snapshot);
+    this.writeDocument(document, summary);
+    return document;
+  }
+
   addAsset(projectId: string, input: unknown): { document: AxcutDocument; asset: AxcutAsset } {
     const payload = addAssetInputSchema.parse(input);
     const resolvedPath = path.resolve(payload.path);

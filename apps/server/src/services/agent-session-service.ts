@@ -14,6 +14,9 @@ import {
   type PendingWrite,
 } from '@langchain/langgraph-checkpoint';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { AxcutDocument } from '@axcut/schema';
+
+import type { MessageRow } from './database.js';
 
 export type DeepAgentSessionScope = {
   kind: string;
@@ -30,12 +33,44 @@ export type DeepAgentSessionRecord = {
   restoredRuntimeCheckpointId?: string;
 };
 
-type SessionCheckpointMetadata = {
+export type CheckpointReason = 'manual' | 'auto' | 'before-message' | 'after-run' | 'before-compaction' | 'after-compaction';
+
+export type SessionCheckpointPayload = {
+  version: 1;
+  projectId: string;
+  document: AxcutDocument;
+  messages: MessageRow[];
+  compactedContext?: string;
+};
+
+export type SessionCheckpointMetadata = {
   id: string;
   sessionId: string;
   createdAt: string;
   messageCount: number;
+  summary?: string;
+  reason?: CheckpointReason;
+  label?: string;
+  restoredAt?: string;
   runtimeCheckpointId?: string;
+  payloadState?: { payload?: SessionCheckpointPayload };
+};
+
+export type SaveCheckpointOptions = {
+  messageCount?: number;
+  summary?: string;
+  reason?: CheckpointReason;
+  label?: string;
+  runtimeCheckpointId?: string;
+  payload?: SessionCheckpointPayload;
+};
+
+export type RestoreCheckpointResult = {
+  checkpoint: SessionCheckpointMetadata;
+  payload?: SessionCheckpointPayload;
+  langGraphRestored: boolean;
+  restoredAt: string;
+  warnings: string[];
 };
 
 type SerializedCheckpoint = [unknown, unknown, string | undefined];
@@ -116,6 +151,17 @@ export class AgentSessionService {
     await this.checkpointer?.deleteThread(sessionId);
   }
 
+  async resetRuntimeThread(sessionId: string): Promise<void> {
+    await this.checkpointer?.deleteThread(sessionId);
+    const record = this.get(sessionId);
+    if (!record?.restoredRuntimeCheckpointId) {
+      return;
+    }
+    const { restoredRuntimeCheckpointId: _unused, ...next } = record;
+    void _unused;
+    this.writeRecord({ ...next, updatedAt: new Date().toISOString() });
+  }
+
   buildSessionConfig(sessionId: string): RunnableConfig {
     const record = this.get(sessionId);
     const checkpointId = record?.restoredRuntimeCheckpointId;
@@ -132,15 +178,19 @@ export class AgentSessionService {
     };
   }
 
-  async saveCheckpoint(sessionId: string): Promise<SessionCheckpointMetadata> {
+  async saveCheckpoint(sessionId: string, options: SaveCheckpointOptions = {}): Promise<SessionCheckpointMetadata> {
     const createdAt = new Date().toISOString();
     const runtimeCheckpointId = await this.getLatestRuntimeCheckpointId(sessionId);
     const checkpoint: SessionCheckpointMetadata = {
       id: randomUUID(),
       sessionId,
       createdAt,
-      messageCount: 0,
-      runtimeCheckpointId,
+      messageCount: options.messageCount ?? options.payload?.messages.length ?? 0,
+      summary: options.summary,
+      reason: options.reason,
+      label: options.label,
+      runtimeCheckpointId: options.runtimeCheckpointId ?? runtimeCheckpointId,
+      payloadState: options.payload ? { payload: options.payload } : undefined,
     };
     fs.mkdirSync(this.sessionCheckpointDir(sessionId), { recursive: true });
     this.writeJson(this.checkpointPath(sessionId, checkpoint.id), checkpoint);
@@ -159,17 +209,36 @@ export class AgentSessionService {
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   }
 
-  async restoreCheckpoint(sessionId: string, checkpointId: string): Promise<void> {
+  async restoreCheckpoint(sessionId: string, checkpointId: string): Promise<RestoreCheckpointResult> {
     const checkpoint = this.readJson<SessionCheckpointMetadata>(this.checkpointPath(sessionId, checkpointId));
-    if (!checkpoint?.runtimeCheckpointId) {
-      return;
+    if (!checkpoint) {
+      throw new Error(`Checkpoint not found: ${checkpointId}`);
     }
-    const record = this.ensure(sessionId);
-    this.writeRecord({
-      ...record,
-      restoredRuntimeCheckpointId: checkpoint.runtimeCheckpointId,
-      updatedAt: new Date().toISOString(),
-    });
+    const warnings: string[] = [];
+    const restoredAt = new Date().toISOString();
+    if (!checkpoint?.runtimeCheckpointId) {
+      warnings.push('This checkpoint does not include a runtime checkpoint.');
+    } else {
+      const record = this.ensure(sessionId);
+      this.writeRecord({
+        ...record,
+        restoredRuntimeCheckpointId: checkpoint.runtimeCheckpointId,
+        updatedAt: restoredAt,
+      });
+    }
+    const restoredCheckpoint = { ...checkpoint, restoredAt };
+    this.writeJson(this.checkpointPath(sessionId, checkpointId), restoredCheckpoint);
+    return {
+      checkpoint: restoredCheckpoint,
+      payload: checkpoint.payloadState?.payload,
+      langGraphRestored: Boolean(checkpoint.runtimeCheckpointId),
+      restoredAt,
+      warnings,
+    };
+  }
+
+  async deleteCheckpoint(sessionId: string, checkpointId: string): Promise<void> {
+    fs.rmSync(this.checkpointPath(sessionId, checkpointId), { force: true });
   }
 
   private create(options: { id?: string; title?: string; scope?: DeepAgentSessionScope } = {}): DeepAgentSessionRecord {

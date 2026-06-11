@@ -99,3 +99,42 @@ test('transient thinking operations are hidden when complete', () => {
   assert.equal(thinking.operations.length, 1);
   assert.equal(done.operations.length, 0);
 });
+
+test('assistant final message clears live operations so the conversation ends on the answer', () => {
+  const started = reduceLiveRunState(emptyLiveRunState, event({ type: 'agent.message.user', payload: { content: 'Cut silence' } }));
+  const withOperation = reduceLiveRunState(started, event({
+    type: 'agent.operation',
+    payload: {
+      operation: {
+        operationId: 'op_1',
+        label: 'Apply Timeline Operation',
+        category: 'tool',
+        status: 'done',
+        summary: 'Tool completed.',
+        startedAt: 1,
+        endedAt: 2,
+      },
+    },
+  }));
+  const finalized = reduceLiveRunState(withOperation, event({
+    type: 'agent.message.assistant',
+    payload: { content: 'I cut the silent parts.' },
+  }));
+  const lateOperation = reduceLiveRunState(finalized, event({
+    type: 'agent.operation',
+    payload: {
+      operation: {
+        operationId: 'op_1',
+        label: 'Apply Timeline Operation',
+        category: 'tool',
+        status: 'done',
+        startedAt: 1,
+        endedAt: 2,
+      },
+    },
+  }));
+
+  assert.equal(withOperation.operations.length, 1);
+  assert.deepEqual(finalized, emptyLiveRunState);
+  assert.deepEqual(lateOperation, emptyLiveRunState);
+});
