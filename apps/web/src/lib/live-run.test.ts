@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { emptyLiveRunState, reduceLiveRunState, type ProjectStreamEvent } from '@yagr/webui-surface';
+import { emptyLiveRunState, reduceLiveRunState, type ProjectStreamEvent } from './live-run.js';
 
 function event(input: Partial<ProjectStreamEvent> & Pick<ProjectStreamEvent, 'type'>): ProjectStreamEvent {
   return {
@@ -65,4 +65,37 @@ test('operation events are upserted by operation id', () => {
   assert.equal(done.operations.length, 1);
   assert.equal(done.operations[0].status, 'done');
   assert.equal(done.operations[0].summary, 'Prepared 6 suggestions');
+});
+
+test('transient thinking operations are hidden when complete', () => {
+  const started = reduceLiveRunState(emptyLiveRunState, event({ type: 'agent.message.user', payload: { content: 'Say hi' } }));
+  const thinking = reduceLiveRunState(started, event({
+    type: 'agent.operation',
+    payload: {
+      operation: {
+        operationId: 'thinking:1',
+        label: 'Thinking',
+        category: 'thinking',
+        status: 'running',
+        summary: 'Model is planning the next step.',
+        startedAt: 1,
+      },
+    },
+  }));
+  const done = reduceLiveRunState(thinking, event({
+    type: 'agent.operation',
+    payload: {
+      operation: {
+        operationId: 'thinking:1',
+        label: 'Thinking',
+        category: 'thinking',
+        status: 'done',
+        startedAt: 1,
+        endedAt: 2,
+      },
+    },
+  }));
+
+  assert.equal(thinking.operations.length, 1);
+  assert.equal(done.operations.length, 0);
 });

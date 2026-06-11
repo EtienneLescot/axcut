@@ -8,10 +8,8 @@ services:
     volumes:
       - axcut-data:/app/.axcut-data
       - axcut-model-cache:/app/.cache/axcut/models
-      - yagr-config:/root/.config/yagr
       - ./:/workspace:ro
 
 volumes:
   axcut-data:
   axcut-model-cache:
-  yagr-config:

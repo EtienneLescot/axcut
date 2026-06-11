@@ -65,7 +65,7 @@ Compose persists Axcut projects, Whisper models, and provider credentials in Doc
 /workspace/rushs/example.mp4
 ```
 
-Configure the LLM provider from the web UI after startup. Provider credentials are stored in the `yagr-config` Docker volume.
+Configure the LLM provider from the web UI after startup. Provider credentials are stored in the `axcut-data` Docker volume.
 
 If you prefer environment variables, add them under the `axcut.environment` section in `docker-compose.yml`, or export them in your shell and mirror the variable names there. `.env.example` lists the common names.
 
@@ -124,13 +124,7 @@ You can start without editing `.env` and configure the LLM provider from the web
 OPENAI_API_KEY=sk-...
 ```
 
-Axcut also supports provider setup through Yagr:
-
-```bash
-npm run llm:setup
-```
-
-The setup wizard can configure API-key providers and account-based providers such as ChatGPT/OpenAI OAuth where available.
+The setup panel can configure API-key providers and account-based providers such as ChatGPT/OpenAI OAuth where available.
 
 #### 5. Start Axcut
 
@@ -196,13 +190,9 @@ The first transcription can take a while because the model must be downloaded an
 
 ## LLM Providers
 
-The LLM is used for editing decisions and chat, not for local transcription. Axcut can be configured from the web UI or with:
+The LLM is used for editing decisions and chat, not for local transcription. Axcut can be configured from the web UI.
 
-```bash
-npm run llm:setup
-```
-
-Supported provider options depend on the installed Yagr provider runtime, and can include OpenAI, Anthropic, Google, Mistral, OpenRouter, OpenAI-compatible endpoints, GitHub Copilot, and OpenAI account authentication.
+Supported provider options include OpenAI, Anthropic, Google, Mistral, OpenRouter, OpenAI-compatible endpoints, GitHub Copilot, MiniMax, and OpenAI account authentication.
 
 Environment variables are also supported for common providers, for example:
 
@@ -227,7 +217,7 @@ npm run test
 
 Axcut stores the editing source of truth in a versioned `.axcut` JSON document.
 
-The transcript DSL remains an ingest/export artifact, while timeline edits flow through structured operations on the project document and the Yagr-backed agent runtime.
+The transcript DSL remains an ingest/export artifact, while timeline edits flow through structured operations on the project document and the native DeepAgentJS-backed agent runtime.
 
 ## Status
 

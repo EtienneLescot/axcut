@@ -1,17 +1,17 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-import { MemorySaver } from '@langchain/langgraph';
-import { SessionService, deriveSessionTitle, type DeepAgentSessionRecord } from '@yagr/session-service';
-import { AIMessage, HumanMessage, SystemMessage, createAgent, tool } from 'langchain';
+import { createDeepAgent } from 'deepagents';
+import { AIMessage, HumanMessage, SystemMessage, tool } from 'langchain';
 import { z } from 'zod';
 
 import type { AxcutDocument, AxcutOperation, AxcutSuggestion } from '@axcut/schema';
 
 import { buildFillerSuggestions, buildPauseSuggestions, searchTranscript } from '../lib/structured-agent.js';
 import { normalizeIntervals, timelineIntervals } from '../lib/timeline.js';
-import { agentSessionsRoot, dataRoot } from '../lib/paths.js';
+import { agentSessionsRoot } from '../lib/paths.js';
 import { createAxcutChatModel } from '../llm/create-chat-model.js';
+import { AgentSessionService, deriveSessionTitle, PersistentFileCheckpointSaver, type DeepAgentSessionRecord } from './agent-session-service.js';
 import type { DocumentService } from './document-service.js';
 import type { EventBus } from './event-bus.js';
 import type { LlmConfigService } from './llm-config-service.js';
@@ -353,11 +353,8 @@ function primaryDuration(document: AxcutDocument): number {
 }
 
 export class AxcutDeepAgentService {
-  private readonly checkpointer = new MemorySaver();
-  private readonly sessions = new SessionService({
-    sessionsDir: agentSessionsRoot,
-    webUiSessionsDir: path.join(dataRoot, 'ui-sessions'),
-  });
+  private readonly checkpointer = new PersistentFileCheckpointSaver(path.join(agentSessionsRoot, 'langgraph-checkpoints'));
+  private readonly sessions = new AgentSessionService(agentSessionsRoot);
 
   constructor(
     private readonly documents: DocumentService,
@@ -488,7 +485,7 @@ export class AxcutDeepAgentService {
       schema: suggestionDecisionToolSchema,
     });
 
-    return createAgent({
+    return createDeepAgent({
       model: await createAxcutChatModel(this.llmConfig),
       checkpointer: this.checkpointer,
       tools: [
@@ -514,11 +511,10 @@ export class AxcutDeepAgentService {
     const config = this.sessions.buildSessionConfig(sessionId);
     let result: unknown = null;
     let streamedResponse = '';
-    const thinkingOperationId = randomUUID();
-    let thinkingStartedAt = 0;
+    let thinkingOperationId = '';
 
     if (typeof (agent as { streamEvents?: unknown }).streamEvents === 'function') {
-      const stream = (agent as { streamEvents: (agentInput: unknown, config: Record<string, unknown>) => AsyncIterable<Record<string, unknown>> }).streamEvents(input, config);
+      const stream = (agent as { streamEvents: (agentInput: unknown, config: unknown) => AsyncIterable<Record<string, unknown>> }).streamEvents(input, config);
       for await (const event of stream) {
         const eventType = typeof event.event === 'string' ? event.event : '';
         const name = typeof event.name === 'string' ? event.name : '';
@@ -526,7 +522,7 @@ export class AxcutDeepAgentService {
         const data = event.data && typeof event.data === 'object' ? event.data as Record<string, unknown> : {};
 
         if (eventType === 'on_chat_model_start') {
-          thinkingStartedAt = Date.now();
+          thinkingOperationId = `thinking:${runId}`;
           this.events.emit(projectId, 'agent.operation', {
             sessionId,
             operation: {
@@ -535,7 +531,7 @@ export class AxcutDeepAgentService {
               category: 'thinking',
               status: 'running',
               summary: name || 'Model is planning the next step.',
-              startedAt: thinkingStartedAt,
+              startedAt: Date.now(),
             },
           });
           continue;
@@ -550,7 +546,7 @@ export class AxcutDeepAgentService {
           continue;
         }
 
-        if (eventType === 'on_chat_model_end' && thinkingStartedAt) {
+        if (eventType === 'on_chat_model_end' && thinkingOperationId) {
           this.events.emit(projectId, 'agent.operation', {
             sessionId,
             operation: {
@@ -558,11 +554,11 @@ export class AxcutDeepAgentService {
               label: 'Thinking',
               category: 'thinking',
               status: 'done',
-              summary: 'Model step completed.',
-              startedAt: thinkingStartedAt,
+              startedAt: Date.now(),
               endedAt: Date.now(),
             },
           });
+          thinkingOperationId = '';
           continue;
         }
 

@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ButtonHTMLAttributes, ReactNode } from 'react';
+import type { ButtonHTMLAttributes, CSSProperties, ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { AxcutDocument } from '@axcut/schema';
-import { emptyLiveRunState, reduceLiveRunState, type LiveOperation, type LiveRunState } from '@yagr/webui-surface';
 import {
   ArrowLeft,
   Brain,
   Check,
+  Copy,
   Download,
+  ExternalLink,
   Eye,
   FileText,
   FolderOpen,
@@ -15,11 +16,13 @@ import {
   LogIn,
   MessageSquarePlus,
   Pencil,
+  Plus,
   Plug,
   Power,
   RefreshCw,
   SendHorizontal,
-  Settings2,
+  Settings,
+  SlidersHorizontal,
   Terminal,
   Trash2,
   Upload,
@@ -30,6 +33,7 @@ import type { LucideIcon } from 'lucide-react';
 
 import { TimelinePane } from './components/TimelinePane.js';
 import { VirtualPreview } from './components/VirtualPreview.js';
+import { emptyLiveRunState, reduceLiveRunState, type LiveOperation, type LiveRunState, type ProjectStreamEvent } from './lib/live-run.js';
 
 type ProjectSummary = {
   id: string;
@@ -96,7 +100,7 @@ type LlmProviderState = {
   baseUrl?: string;
   supportsReasoningEffort: boolean;
   reasoningEffort?: ReasoningEffort;
-  credentialSource: 'yagr' | 'environment' | null;
+  credentialSource: 'stored' | 'environment' | null;
 };
 
 type LlmStatus = {
@@ -125,12 +129,14 @@ const reasoningEffortOptions = [
   { value: 'xhigh', label: 'Extra high' },
 ] as const satisfies ReadonlyArray<{ value: ReasoningEffort; label: string }>;
 
-type ProjectStreamEvent = {
-  type: string;
-  projectId: string;
-  payload: Record<string, unknown>;
-  createdAt: string;
+const providerUserDescriptions: Record<string, string> = {
+  'copilot-proxy': 'Sign in with your GitHub account.',
+  'openai-oauth': 'Sign in with your ChatGPT account.',
 };
+
+function getProviderUserDescription(provider: Pick<LlmProviderState, 'id' | 'defaultModel'>) {
+  return providerUserDescriptions[provider.id] ?? '';
+}
 
 type DeviceChallenge = {
   provider: string;
@@ -141,6 +147,12 @@ type DeviceChallenge = {
   deviceCode?: string;
   intervalMs: number;
   expiresAt: number;
+};
+
+type PopoverAnchor = {
+  left: number;
+  top: number;
+  width: number;
 };
 
 const transcriptLanguageOptions = [
@@ -169,7 +181,7 @@ function IconButton({ icon: Icon, label, className, children, ...props }: IconBu
   return (
     <button
       {...props}
-      className={['icon-action', className].filter(Boolean).join(' ')}
+      className={['icon-action', children ? 'has-text' : '', className].filter(Boolean).join(' ')}
       aria-label={props['aria-label'] ?? label}
       title={props.title ?? label}
     >
@@ -177,6 +189,19 @@ function IconButton({ icon: Icon, label, className, children, ...props }: IconBu
       {children ? <span className="button-text">{children}</span> : <span className="sr-only">{label}</span>}
     </button>
   );
+}
+
+function popoverStyle(anchor: PopoverAnchor | null, width: number): CSSProperties | undefined {
+  if (!anchor || typeof window === 'undefined') {
+    return undefined;
+  }
+  const margin = 8;
+  const left = Math.min(Math.max(anchor.left, margin), Math.max(margin, window.innerWidth - width - margin));
+  return {
+    left,
+    bottom: Math.max(margin, window.innerHeight - anchor.top + 6),
+    width: `min(${width}px, calc(100vw - ${margin * 2}px))`,
+  };
 }
 
 async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
@@ -189,9 +214,36 @@ async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T
     headers,
   });
   if (!response.ok) {
-    throw new Error(await response.text());
+    throw await ApiRequestError.fromResponse(response);
   }
   return response.json() as Promise<T>;
+}
+
+class ApiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+    readonly reconnectRequired = false,
+  ) {
+    super(message);
+    this.name = 'ApiRequestError';
+  }
+
+  static async fromResponse(response: Response): Promise<ApiRequestError> {
+    const text = await response.text();
+    try {
+      const payload = JSON.parse(text) as { error?: unknown; code?: unknown; reconnectRequired?: unknown };
+      return new ApiRequestError(
+        typeof payload.error === 'string' && payload.error.trim() ? payload.error : response.statusText,
+        response.status,
+        typeof payload.code === 'string' ? payload.code : undefined,
+        Boolean(payload.reconnectRequired),
+      );
+    } catch {
+      return new ApiRequestError(text || response.statusText, response.status);
+    }
+  }
 }
 
 async function requestText(input: RequestInfo, init?: RequestInit): Promise<string> {
@@ -432,6 +484,10 @@ export function App() {
   const [message, setMessage] = useState('');
   const [historyOpen, setHistoryOpen] = useState(false);
   const [providerOpen, setProviderOpen] = useState(false);
+  const [providerInitialScreen, setProviderInitialScreen] = useState<'models' | 'providers' | 'settings' | 'provider-form'>('models');
+  const [providerAnchor, setProviderAnchor] = useState<PopoverAnchor | null>(null);
+  const [reasoningOpen, setReasoningOpen] = useState(false);
+  const [reasoningAnchor, setReasoningAnchor] = useState<PopoverAnchor | null>(null);
   const [loadVideoOpen, setLoadVideoOpen] = useState(false);
   const [transcriptModal, setTranscriptModal] = useState<'source' | 'edited' | null>(null);
   const [transcriptLanguage, setTranscriptLanguage] = useState<TranscriptLanguageSelection>('auto');
@@ -440,6 +496,8 @@ export function App() {
   const [liveRun, setLiveRun] = useState<LiveRunState>(emptyLiveRunState);
   const [autoScrollMessages, setAutoScrollMessages] = useState(true);
   const messagesRef = useRef<HTMLDivElement | null>(null);
+  const providerButtonRef = useRef<HTMLButtonElement | null>(null);
+  const reasoningButtonRef = useRef<HTMLButtonElement | null>(null);
 
   const sessionQuery = useQuery({
     queryKey: ['session'],
@@ -631,6 +689,28 @@ export function App() {
     },
   });
 
+  const updateReasoning = useMutation({
+    mutationFn: async (reasoningEffort: ReasoningEffort) => {
+      const effective = llmConfigQuery.data?.effective;
+      if (!sessionToken || !effective?.provider || !effective.model) {
+        throw new Error('No configured model.');
+      }
+      return requestJson(`/api/llm/providers/${effective.provider}/select`, {
+        method: 'POST',
+        body: JSON.stringify({
+          model: effective.model,
+          baseUrl: effective.baseUrl || undefined,
+          reasoningEffort,
+        }),
+        headers: authHeaders(sessionToken),
+      });
+    },
+    onSuccess: async () => {
+      setReasoningOpen(false);
+      await queryClient.invalidateQueries({ queryKey: ['llm-config'] });
+    },
+  });
+
   const submitChat = useCallback(() => {
     const text = message.trim();
     if (!text || sendChat.isPending) {
@@ -703,15 +783,14 @@ export function App() {
     : null;
   const exportBusy = exportVideo.isPending || latestExportJob?.status === 'queued' || latestExportJob?.status === 'running';
   const exportStatus = getExportStatus(latestExportJob, exportVideo.isPending, exportVideo.error);
-  const providerLabel = llmConfigQuery.data?.ready
+  const effectiveLlm = llmConfigQuery.data?.effective;
+  const providerLabel = llmConfigQuery.data?.ready && effectiveLlm
     ? [
-        llmConfigQuery.data.effective.providerLabel,
-        llmConfigQuery.data.effective.model,
-        llmConfigQuery.data.effective.supportsReasoningEffort
-          ? `reasoning ${llmConfigQuery.data.effective.reasoningEffort || 'default'}`
-          : null,
-      ].filter(Boolean).join(' · ')
+        effectiveLlm.provider || effectiveLlm.providerLabel,
+        effectiveLlm.model,
+      ].filter(Boolean).join(' / ')
     : 'LLM not configured';
+  const agentResponsePending = sendChat.isPending && liveRun.active && !liveRun.assistantDraft;
   const projectCount = projectsQuery.data?.projects.length ?? 0;
   const sourceTranscriptName = artifactName(document?.transcript?.sourceDslPath ?? document?.transcript?.sourceJsonPath);
   const sourceTranscriptQuery = useQuery({
@@ -744,6 +823,17 @@ export function App() {
             </h1>
           </div>
           <div className="header-actions">
+            <IconButton
+              icon={Settings}
+              label="Settings"
+              className="secondary"
+              onClick={() => {
+                setProviderInitialScreen('settings');
+                setProviderAnchor(null);
+                setReasoningOpen(false);
+                setProviderOpen(true);
+              }}
+            />
             <IconButton icon={History} label="History" className="secondary" onClick={() => setHistoryOpen(true)} disabled={!projectId} />
             <IconButton icon={MessageSquarePlus} label="New chat" onClick={() => createSession.mutate()} disabled={!projectId || createSession.isPending} />
           </div>
@@ -786,11 +876,48 @@ export function App() {
             placeholder="Describe the edit you want."
           />
           <div className="composer-footer">
-            <button type="button" className={llmConfigQuery.data?.ready ? 'provider-pill compact ready' : 'provider-pill compact'} onClick={() => setProviderOpen(true)}>
-              <Settings2 size={14} strokeWidth={1.8} aria-hidden="true" />
+            <button
+              ref={providerButtonRef}
+              type="button"
+              className={llmConfigQuery.data?.ready ? 'provider-pill compact ready' : 'provider-pill compact'}
+              onClick={() => {
+                setProviderInitialScreen(llmConfigQuery.data?.ready ? 'models' : 'providers');
+                const rect = providerButtonRef.current?.getBoundingClientRect();
+                setProviderAnchor(rect ? { left: rect.left, top: rect.top, width: rect.width } : null);
+                setReasoningOpen(false);
+                setProviderOpen(true);
+              }}
+            >
+              <SlidersHorizontal size={14} strokeWidth={1.8} aria-hidden="true" />
               <span>{providerLabel}</span>
             </button>
-            {sendChat.isPending ? <span className="muted">Waiting for the agent response...</span> : null}
+            {llmConfigQuery.data?.ready && effectiveLlm?.supportsReasoningEffort ? (
+              <button
+                ref={reasoningButtonRef}
+                type="button"
+                className="reasoning-pill"
+                onClick={() => {
+                  const rect = reasoningButtonRef.current?.getBoundingClientRect();
+                  setReasoningAnchor(rect ? { left: rect.left, top: rect.top, width: rect.width } : null);
+                  setProviderOpen(false);
+                  setReasoningOpen(true);
+                }}
+                disabled={updateReasoning.isPending}
+                aria-label="Reasoning effort"
+              >
+                Reasoning {effectiveLlm.reasoningEffort || 'medium'}
+              </button>
+            ) : null}
+            {reasoningOpen && effectiveLlm?.supportsReasoningEffort ? (
+              <ReasoningPopover
+                anchor={reasoningAnchor}
+                selected={effectiveLlm.reasoningEffort || 'medium'}
+                busy={updateReasoning.isPending}
+                onClose={() => setReasoningOpen(false)}
+                onSelect={(nextReasoning) => updateReasoning.mutate(nextReasoning)}
+              />
+            ) : null}
+            {agentResponsePending ? <span className="muted">Waiting for the agent response...</span> : null}
             <IconButton
               type="submit"
               icon={SendHorizontal}
@@ -871,7 +998,6 @@ export function App() {
           activeSessionId={snapshot?.activeSessionId ?? activeSessionId}
           busy={createSession.isPending || deleteSession.isPending || renameSession.isPending}
           onClose={() => setHistoryOpen(false)}
-          onCreate={() => createSession.mutate()}
           onSelect={(sessionId) => {
             setActiveSessionId(sessionId);
             setHistoryOpen(false);
@@ -885,6 +1011,8 @@ export function App() {
         <ProviderSettingsDialog
           snapshot={llmConfigQuery.data}
           sessionToken={sessionToken}
+          initialScreen={providerInitialScreen}
+          anchor={providerAnchor}
           onClose={() => setProviderOpen(false)}
           onChanged={async () => {
             await queryClient.invalidateQueries({ queryKey: ['llm-config'] });
@@ -1014,7 +1142,6 @@ function SessionHistoryDialog({
   activeSessionId,
   busy,
   onClose,
-  onCreate,
   onSelect,
   onDelete,
   onRename,
@@ -1023,7 +1150,6 @@ function SessionHistoryDialog({
   activeSessionId: string | null;
   busy: boolean;
   onClose: () => void;
-  onCreate: () => void;
   onSelect: (sessionId: string) => void;
   onDelete: (sessionId: string) => void;
   onRename: (sessionId: string, title: string) => void;
@@ -1037,11 +1163,10 @@ function SessionHistoryDialog({
         <div className="modal-header">
           <div>
             <h2>Conversation History</h2>
-            <p className="muted">Switch sessions or start a clean chat.</p>
+            <p className="muted">Switch sessions or manage existing conversations.</p>
           </div>
           <IconButton icon={X} label="Close" className="secondary" onClick={onClose} />
         </div>
-        <IconButton icon={MessageSquarePlus} label="New chat" onClick={onCreate} disabled={busy} />
         <div className="session-list">
           {sessions.map((session) => (
             <article key={session.id} className={session.id === activeSessionId ? 'session-item active' : 'session-item'}>
@@ -1138,37 +1263,103 @@ function LoadVideoDialog({
   );
 }
 
+function ReasoningPopover({
+  anchor,
+  selected,
+  busy,
+  onClose,
+  onSelect,
+}: {
+  anchor: PopoverAnchor | null;
+  selected: ReasoningEffort;
+  busy: boolean;
+  onClose: () => void;
+  onSelect: (reasoningEffort: ReasoningEffort) => void;
+}) {
+  return (
+    <div
+      className="llm-popover-backdrop"
+      role="dialog"
+      aria-modal="true"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+    >
+      <section className="llm-popover reasoning-popover" style={popoverStyle(anchor, 240)}>
+        <div className="llm-popover-header">
+          <strong>Reasoning</strong>
+        </div>
+        <div className="reasoning-option-list">
+          {reasoningEffortOptions.map((option) => (
+            <button
+              key={option.value}
+              className={option.value === selected ? 'model-option active' : 'model-option'}
+              onClick={() => onSelect(option.value)}
+              disabled={busy}
+            >
+              <span>
+                <strong>{option.label}</strong>
+                <small className="muted">Reasoning effort</small>
+              </span>
+              {option.value === selected ? <span className="muted">Active</span> : null}
+            </button>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function ProviderSettingsDialog({
   snapshot,
   sessionToken,
+  initialScreen,
+  anchor,
   onClose,
   onChanged,
 }: {
   snapshot?: LlmStatus;
   sessionToken?: string;
+  initialScreen?: 'models' | 'providers' | 'settings' | 'provider-form' | 'provider-create-select';
+  anchor: PopoverAnchor | null;
   onClose: () => void;
   onChanged: () => Promise<void>;
 }) {
-  const [screen, setScreen] = useState<'models' | 'providers' | 'settings'>('models');
+  const [screen, setScreen] = useState<'models' | 'providers' | 'settings' | 'provider-form' | 'provider-create-select'>(initialScreen ?? 'models');
+  const [surface, setSurface] = useState<'popover' | 'modal'>(initialScreen === 'settings' || initialScreen === 'provider-form' ? 'modal' : 'popover');
   const [providerId, setProviderId] = useState(snapshot?.effective.provider ?? snapshot?.connectedProviders[0]?.id ?? snapshot?.providers[0]?.id ?? 'openai');
   const activeProvider = snapshot?.providers.find((provider) => provider.id === providerId) ?? snapshot?.providers[0];
   const [apiKey, setApiKey] = useState('');
-  const [model, setModel] = useState(activeProvider?.model || activeProvider?.defaultModel || '');
+  const [model, setModel] = useState(activeProvider?.model || '');
   const [baseUrl, setBaseUrl] = useState(activeProvider?.baseUrl || activeProvider?.defaultBaseUrl || '');
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(activeProvider?.reasoningEffort || snapshot?.effective.reasoningEffort || 'medium');
   const [models, setModels] = useState<string[]>([]);
   const [challenge, setChallenge] = useState<DeviceChallenge | null>(null);
   const [busy, setBusy] = useState(false);
+  const [completingAuth, setCompletingAuth] = useState(false);
+  const [copiedAuthCode, setCopiedAuthCode] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [reconnectRequired, setReconnectRequired] = useState(false);
+  const [providerFormMode, setProviderFormMode] = useState<'create' | 'edit'>('edit');
+  const [modelSearch, setModelSearch] = useState('');
+  const connectedProviders = snapshot?.connectedProviders ?? [];
+  const addableProviders = snapshot?.providers.filter((provider) => !provider.connected) ?? [];
+  const providerCreateOptions = addableProviders.length ? addableProviders : (snapshot?.providers ?? []);
 
   useEffect(() => {
-    setModel(activeProvider?.model || activeProvider?.defaultModel || '');
+    setModel(activeProvider?.model || '');
     setBaseUrl(activeProvider?.baseUrl || activeProvider?.defaultBaseUrl || '');
     setReasoningEffort(activeProvider?.reasoningEffort || snapshot?.effective.reasoningEffort || 'medium');
     setApiKey('');
     setModels([]);
+    setModelSearch('');
     setChallenge(null);
+    setCompletingAuth(false);
+    setCopiedAuthCode(false);
     setError(null);
+    setReconnectRequired(false);
   }, [activeProvider?.baseUrl, activeProvider?.defaultBaseUrl, activeProvider?.defaultModel, activeProvider?.id, activeProvider?.model, activeProvider?.reasoningEffort, snapshot?.effective.reasoningEffort]);
 
   const runProviderAction = async (action: () => Promise<void>) => {
@@ -1177,10 +1368,13 @@ function ProviderSettingsDialog({
     }
     setBusy(true);
     setError(null);
+    setReconnectRequired(false);
     try {
       await action();
       await onChanged();
+      setReconnectRequired(false);
     } catch (incoming) {
+      setReconnectRequired(incoming instanceof ApiRequestError && (incoming.reconnectRequired || incoming.code === 'provider_auth_expired'));
       setError(incoming instanceof Error ? incoming.message : String(incoming));
     } finally {
       setBusy(false);
@@ -1193,14 +1387,26 @@ function ProviderSettingsDialog({
     }
     setBusy(true);
     setError(null);
+    setReconnectRequired(false);
     try {
       const params = baseUrl ? `?baseUrl=${encodeURIComponent(baseUrl)}` : '';
       const result = await requestJson<{ models: string[] }>(`/api/llm/providers/${activeProvider.id}/models${params}`, {
         headers: authHeaders(sessionToken),
       });
       setModels(result.models);
-      setModel((current) => current || result.models[0] || activeProvider.defaultModel);
+      setModel((current) => {
+        if (current && result.models.includes(current)) {
+          return current;
+        }
+        if (activeProvider.model && result.models.includes(activeProvider.model)) {
+          return activeProvider.model;
+        }
+        return result.models[0] || '';
+      });
     } catch (incoming) {
+      setModels([]);
+      setModel('');
+      setReconnectRequired(incoming instanceof ApiRequestError && (incoming.reconnectRequired || incoming.code === 'provider_auth_expired'));
       setError(incoming instanceof Error ? incoming.message : String(incoming));
     } finally {
       setBusy(false);
@@ -1208,18 +1414,56 @@ function ProviderSettingsDialog({
   };
 
   useEffect(() => {
-    if (screen === 'models' && activeProvider?.connected) {
+    if ((screen === 'models' || screen === 'provider-form') && activeProvider?.connected) {
       void loadModels();
     }
     // Load once per selected provider; base URL changes still have the explicit reload button.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProvider?.id, screen]);
 
-  const useModel = () => runProviderAction(async () => {
+  const openProviderForm = (providerIdToEdit: string, mode: 'create' | 'edit') => {
+    setProviderId(providerIdToEdit);
+    setProviderFormMode(mode);
+    setSurface('modal');
+    setScreen('provider-form');
+  };
+
+  const openCreateProviderForm = () => {
+    setProviderFormMode('create');
+    setSurface('modal');
+    setScreen('provider-create-select');
+  };
+
+  const goBack = () => {
+    if (screen === 'models') {
+      setScreen('providers');
+      return;
+    }
+    if (screen === 'providers') {
+      setScreen('models');
+      return;
+    }
+    if (screen === 'provider-form') {
+      setSurface('modal');
+      setScreen(providerFormMode === 'create' ? 'provider-create-select' : 'settings');
+      return;
+    }
+    if (screen === 'provider-create-select') {
+      setSurface('modal');
+      setScreen('settings');
+      return;
+    }
+    setScreen('models');
+  };
+
+  const selectModel = (nextModel = model) => runProviderAction(async () => {
+    if (!nextModel) {
+      return;
+    }
     await requestJson(`/api/llm/providers/${activeProvider!.id}/select`, {
       method: 'POST',
       body: JSON.stringify({
-        model,
+        model: nextModel,
         baseUrl: baseUrl || undefined,
         reasoningEffort: activeProvider?.supportsReasoningEffort ? reasoningEffort : undefined,
       }),
@@ -1227,71 +1471,188 @@ function ProviderSettingsDialog({
     });
     onClose();
   });
+  const useModel = () => selectModel(model);
+  const startProviderConnection = () => runProviderAction(async () => {
+    const result = await requestJson<{ challenge?: Omit<DeviceChallenge, 'provider'> }>(`/api/llm/providers/${activeProvider!.id}/connect`, {
+      method: 'POST',
+      body: JSON.stringify({
+        apiKey: apiKey || undefined,
+        model: model || undefined,
+        baseUrl: baseUrl || undefined,
+        reasoningEffort: activeProvider?.supportsReasoningEffort ? reasoningEffort : undefined,
+      }),
+      headers: authHeaders(sessionToken!),
+    });
+    if (result.challenge) {
+      const nextChallenge = { provider: activeProvider!.id, ...result.challenge };
+      setChallenge(nextChallenge);
+      setCopiedAuthCode(false);
+      void completeProviderLogin(nextChallenge);
+      return;
+    }
+    setScreen(providerFormMode === 'create' || screen === 'provider-form' ? 'settings' : 'models');
+    await loadModels();
+  });
+  const completeProviderLogin = async (nextChallenge: DeviceChallenge) => {
+    if (!sessionToken || !activeProvider) {
+      return;
+    }
+    setCompletingAuth(true);
+    setError(null);
+    setReconnectRequired(false);
+    try {
+      await requestJson(`/api/llm/providers/${nextChallenge.provider}/device/complete`, {
+        method: 'POST',
+        body: JSON.stringify({
+          ...nextChallenge,
+          model: model || undefined,
+          reasoningEffort: activeProvider.supportsReasoningEffort ? reasoningEffort : undefined,
+        }),
+        headers: authHeaders(sessionToken),
+      });
+      setChallenge(null);
+      setScreen(providerFormMode === 'create' || screen === 'provider-form' ? 'settings' : 'models');
+      await onChanged();
+      await loadModels();
+    } catch (incoming) {
+      setReconnectRequired(incoming instanceof ApiRequestError && (incoming.reconnectRequired || incoming.code === 'provider_auth_expired'));
+      setError(incoming instanceof Error ? incoming.message : String(incoming));
+    } finally {
+      setCompletingAuth(false);
+    }
+  };
+  const copyAuthCode = async () => {
+    if (!challenge) {
+      return;
+    }
+    await navigator.clipboard.writeText(challenge.userCode);
+    setCopiedAuthCode(true);
+    window.setTimeout(() => setCopiedAuthCode(false), 1400);
+  };
+  const modelIsSelectable = Boolean(model && models.includes(model));
+  const filteredModels = modelSearch.trim()
+    ? models.filter((candidate) => candidate.toLowerCase().includes(modelSearch.trim().toLowerCase()))
+    : models;
+
+  const openProviderSettings = () => {
+    setSurface('modal');
+    setScreen('settings');
+  };
+
+  const isModalSurface = surface === 'modal';
 
   return (
-    <div className="modal-backdrop" role="dialog" aria-modal="true">
-      <section className="modal panel provider-modal">
+    <div
+      className={isModalSurface ? 'modal-backdrop' : 'llm-popover-backdrop'}
+      role="dialog"
+      aria-modal="true"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+    >
+      <section
+        className={isModalSurface ? 'modal panel provider-modal provider-settings-modal' : 'llm-popover provider-modal'}
+        style={isModalSurface ? undefined : popoverStyle(anchor, 390)}
+      >
         <div className="modal-header">
-          {screen === 'models' ? (
-            <IconButton icon={ArrowLeft} label="Change provider" className="secondary" onClick={() => setScreen('providers')} />
-          ) : (
-            <IconButton icon={ArrowLeft} label="Back" className="secondary" onClick={() => setScreen(screen === 'providers' ? 'models' : 'providers')} />
-          )}
-          <div>
-            <h2>{screen === 'models' ? 'Select Model' : screen === 'providers' ? 'Connected Providers' : 'Provider Settings'}</h2>
-            <p className="muted">
-              {screen === 'models'
-                ? `${activeProvider?.label ?? 'Provider'} models`
-                : screen === 'providers'
-                  ? 'Choose one of your connected providers.'
-                  : 'Connect or disconnect providers.'}
-            </p>
+          <div className="modal-title-row">
+            <IconButton icon={ArrowLeft} label={screen === 'models' ? 'Change provider' : 'Back'} className="secondary" onClick={goBack} />
+            <div>
+              <h2>{screen === 'models' ? 'Model' : screen === 'providers' ? 'Providers' : screen === 'provider-create-select' ? 'Add Provider' : screen === 'provider-form' ? (providerFormMode === 'create' ? 'Provider Settings' : 'Edit Provider') : 'Provider Settings'}</h2>
+              <p className="muted">
+                {screen === 'models'
+                  ? `${activeProvider?.label ?? 'Provider'} model selection`
+                  : screen === 'providers'
+                    ? 'Choose one of your connected providers.'
+                    : screen === 'provider-create-select'
+                      ? 'Choose a provider to connect.'
+                      : screen === 'provider-form'
+                      ? providerFormMode === 'create' ? 'Configure this provider connection.' : 'Update provider credentials and defaults.'
+                      : 'Manage configured providers.'}
+              </p>
+            </div>
           </div>
           <IconButton icon={X} label="Close" className="secondary" onClick={onClose} />
         </div>
 
         {screen === 'models' && activeProvider ? (
           <div className="model-picker-screen">
-            <div>
-              <h3>{activeProvider.label}</h3>
-              <p className="muted">Current model: {snapshot?.effective.model || activeProvider.defaultModel || 'Not selected'}</p>
-            </div>
-            <label>
-              <span className="muted">Model</span>
-              <input value={model} onChange={(event) => setModel(event.target.value)} placeholder={activeProvider.defaultModel} />
+            <div className="model-screen-header">
+              <div>
+                <h3>{activeProvider.label}</h3>
+                <p className="muted">Current model: {snapshot?.effective.model || activeProvider.defaultModel || 'Not selected'}</p>
+              </div>
+	              {!challenge && reconnectRequired ? (
+	                <div className="provider-actions model-actions">
+	                  <IconButton icon={RefreshCw} label="Reconnect provider" className="secondary" onClick={startProviderConnection} disabled={busy}>Reconnect</IconButton>
+	                </div>
+	              ) : null}
+	            </div>
+            <label className="model-search-field">
+              <span className="muted">Models</span>
+              <input
+                value={modelSearch}
+                onChange={(event) => setModelSearch(event.target.value)}
+                placeholder={busy ? 'Loading models...' : 'Search models...'}
+                disabled={busy || !models.length}
+              />
             </label>
-            {activeProvider.supportsReasoningEffort ? (
-              <label>
-                <span className="muted">Reasoning effort</span>
-                <select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}>
-                  {reasoningEffortOptions.map((option) => (
-                    <option key={option.value} value={option.value}>{option.label}</option>
-                  ))}
-                </select>
-              </label>
+	            {!models.length ? (
+	              <div className="model-list">
+	                <div className="message-empty muted">
+                  {busy
+                    ? 'Loading models...'
+                    : reconnectRequired
+                      ? 'The saved login has expired. Reconnect this provider to load its live model list.'
+	                      : 'No models available from this provider. Check credentials or provider settings.'}
+	                </div>
+	              </div>
+	            ) : (
+	              <div className="model-list" role="listbox" aria-label={`${activeProvider.label} models`}>
+	                {filteredModels.map((candidate) => (
+	                  <button
+	                    key={candidate}
+	                    className={candidate === model ? 'model-option active' : 'model-option'}
+	                    onClick={() => selectModel(candidate)}
+	                    disabled={busy}
+	                  >
+	                    <span>
+	                      <strong>{candidate}</strong>
+	                      <small className="muted">{activeProvider.label}</small>
+	                    </span>
+	                    {candidate === model ? <span className="muted">Active</span> : null}
+	                  </button>
+	                ))}
+	                {filteredModels.length ? null : <div className="message-empty muted">No models match this search.</div>}
+	              </div>
+	            )}
+            {challenge ? (
+              <div className="device-challenge auth-panel">
+                <div>
+                  <strong>Browser login pending</strong>
+                  <p className="muted">{completingAuth ? 'Waiting for authorization...' : 'Open the login page and enter this code.'}</p>
+                </div>
+                <div className="auth-code-row">
+                  <code>{challenge.userCode}</code>
+                  <IconButton icon={copiedAuthCode ? Check : Copy} label={copiedAuthCode ? 'Copied' : 'Copy code'} className="secondary" onClick={() => void copyAuthCode()} />
+                </div>
+                <div className="provider-actions">
+                  <a className="button-link secondary" href={challenge.verificationUriComplete || challenge.verificationUri} target="_blank" rel="noreferrer">
+                    <ExternalLink size={16} /> Open login page
+                  </a>
+                </div>
+              </div>
             ) : null}
-            <div className="model-list">
-              {models.length ? models.map((candidate) => (
-                <button key={candidate} className={candidate === model ? 'model-option active' : 'model-option'} onClick={() => setModel(candidate)}>
-                  {candidate}
-                </button>
-              )) : (
-                <div className="message-empty muted">{busy ? 'Loading models...' : 'No model list loaded. Use the model field or reload models.'}</div>
-              )}
-            </div>
             {error ? <p className="error-copy">{error}</p> : null}
-            <div className="provider-actions">
-              <IconButton icon={Check} label="Use model" onClick={useModel} disabled={busy || !model.trim()} />
-              <IconButton icon={RefreshCw} label="Reload models" className="secondary" onClick={() => void loadModels()} disabled={busy} />
-              <IconButton icon={Settings2} label="Provider settings" className="secondary" onClick={() => setScreen('settings')} />
-            </div>
           </div>
         ) : null}
 
         {screen === 'providers' ? (
           <div className="provider-section">
             <div className="provider-grid">
-              {(snapshot?.connectedProviders ?? []).map((provider) => (
+              {connectedProviders.map((provider) => (
                 <button
                   key={provider.id}
                   className={provider.id === providerId ? 'provider-row active' : 'provider-row'}
@@ -1302,52 +1663,97 @@ function ProviderSettingsDialog({
                 >
                   <strong>{provider.label}</strong>
                   <span className="muted">{provider.model || provider.defaultModel || 'Custom model'}</span>
-                  <span className="provider-badges">
-                    {provider.selected ? <small className="status-pill ready">Selected</small> : null}
-                    {provider.credentialSource ? <small className="status-pill ready">{provider.credentialSource}</small> : null}
-                    {provider.reasoningEffort ? <small className="status-pill">Reasoning {provider.reasoningEffort}</small> : null}
-                    {provider.oauth ? <small className="status-pill">OAuth</small> : null}
-                    {provider.requiresApiKey ? <small className="status-pill">API key</small> : null}
-                  </span>
                 </button>
               ))}
             </div>
-            {snapshot?.connectedProviders.length ? null : <div className="message-empty muted">No connected providers yet.</div>}
-            <IconButton icon={Plug} label="Connect a new provider" className="secondary" onClick={() => setScreen('settings')} />
+            {connectedProviders.length ? null : <div className="message-empty muted">No connected providers yet.</div>}
+            <IconButton icon={Settings} label="Provider settings" className="secondary" onClick={openProviderSettings}>Provider settings</IconButton>
           </div>
         ) : null}
 
-        {screen === 'settings' && activeProvider ? (
+        {screen === 'settings' ? (
           <div className="settings-screen">
-            <div className="provider-section">
-              <h3>Available Providers</h3>
-              <div className="provider-grid">
-                {(snapshot?.providers ?? []).map((provider) => (
-                  <button
-                    key={provider.id}
-                    className={provider.id === providerId ? 'provider-row active' : 'provider-row'}
-                    onClick={() => setProviderId(provider.id)}
-                  >
+            <div className="provider-list-header">
+              <div>
+                <h3>Providers</h3>
+                <p className="muted">Edit connected providers or add a new connection.</p>
+              </div>
+              <IconButton icon={Plus} label="Add provider" onClick={openCreateProviderForm}>Add provider</IconButton>
+            </div>
+            <div className="provider-list">
+              {connectedProviders.map((provider) => (
+                <article key={provider.id} className="provider-list-item">
+                  <div className="provider-list-main">
                     <strong>{provider.label}</strong>
-                    <span className="muted">{provider.setupHint || provider.defaultModel || 'Custom provider'}</span>
-                    <span className="provider-badges">
-                      {provider.connected ? <small className="status-pill ready">Connected</small> : null}
-                      {provider.oauth ? <small className="status-pill">OAuth</small> : null}
-                      {provider.requiresApiKey ? <small className="status-pill">API key</small> : null}
-                    </span>
-                  </button>
-                ))}
+                    <span className="muted">{provider.model || provider.defaultModel || 'No model selected'}</span>
+                  </div>
+                  <IconButton
+                    icon={Pencil}
+                    label={`Edit ${provider.label}`}
+                    className="secondary"
+                    onClick={() => openProviderForm(provider.id, 'edit')}
+                  />
+                </article>
+              ))}
+              {connectedProviders.length ? null : <div className="message-empty muted">No connected providers yet.</div>}
+            </div>
+          </div>
+        ) : null}
+
+        {screen === 'provider-create-select' ? (
+          <div className="settings-screen">
+            <div className="provider-list-header">
+              <div>
+                <h3>Select provider</h3>
+                <p className="muted">Choose the service you want to connect.</p>
               </div>
             </div>
+            <div className="provider-list provider-choice-list">
+              {providerCreateOptions.map((provider) => {
+                const description = getProviderUserDescription(provider);
+                return (
+                  <button
+                    key={provider.id}
+                    className="provider-choice-item"
+                    onClick={() => openProviderForm(provider.id, 'create')}
+                  >
+                    <span>
+                      <strong>{provider.label}</strong>
+                      {description ? <small className="muted">{description}</small> : null}
+                    </span>
+                    {provider.connected ? <span className="muted">Connected</span> : null}
+                  </button>
+                );
+              })}
+              {providerCreateOptions.length ? null : <div className="message-empty muted">No providers available.</div>}
+            </div>
+          </div>
+        ) : null}
 
+        {screen === 'provider-form' && activeProvider ? (
+          <div className="settings-screen">
             <div className="provider-form">
-              <div>
-                <h3>{activeProvider.label}</h3>
-                <p className="muted">{activeProvider.setupHint || 'Configure this provider for Axcut chat.'}</p>
+              <div className="provider-form-title">
+                <div>
+                  <h3>{activeProvider.label}</h3>
+                  {getProviderUserDescription(activeProvider) ? <p className="muted">{getProviderUserDescription(activeProvider)}</p> : null}
+                  {reconnectRequired ? <p className="error-copy">The saved credential no longer works. Reconnect this provider, or replace the stored key.</p> : null}
+                </div>
+                {activeProvider.connected ? <span className="status-pill ready">Connected</span> : null}
               </div>
+
               <label>
                 <span className="muted">Model</span>
-                <input value={model} onChange={(event) => setModel(event.target.value)} placeholder={activeProvider.defaultModel} />
+                {activeProvider.connected ? (
+                  <select value={model} onChange={(event) => setModel(event.target.value)} disabled={busy || !models.length}>
+                    <option value="" disabled>{busy ? 'Loading models...' : 'Select a model'}</option>
+                    {models.map((candidate) => (
+                      <option key={candidate} value={candidate}>{candidate}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <span className="message-empty muted">Connect this provider to load its available models.</span>
+                )}
               </label>
               {activeProvider.supportsReasoningEffort ? (
                 <label>
@@ -1372,78 +1778,60 @@ function ProviderSettingsDialog({
                 </label>
               ) : null}
               {challenge ? (
-                <div className="device-challenge">
-                  <strong>Finish browser login</strong>
-                  <a href={challenge.verificationUriComplete || challenge.verificationUri} target="_blank" rel="noreferrer">
-                    {challenge.verificationUriComplete || challenge.verificationUri}
-                  </a>
-                  <code>{challenge.userCode}</code>
+                <div className="device-challenge auth-panel">
+                  <div>
+                    <strong>Browser login pending</strong>
+                    <p className="muted">{completingAuth ? 'Waiting for authorization...' : 'Open the login page and enter this code.'}</p>
+                  </div>
+                  <div className="auth-code-row">
+                    <code>{challenge.userCode}</code>
+                    <IconButton icon={copiedAuthCode ? Check : Copy} label={copiedAuthCode ? 'Copied' : 'Copy code'} className="secondary" onClick={() => void copyAuthCode()} />
+                  </div>
+                  <div className="provider-actions">
+                    <a className="button-link secondary" href={challenge.verificationUriComplete || challenge.verificationUri} target="_blank" rel="noreferrer">
+                      <ExternalLink size={16} /> Open login page
+                    </a>
+                  </div>
                 </div>
               ) : null}
               {error ? <p className="error-copy">{error}</p> : null}
-              <div className="provider-actions">
-              <IconButton
-                icon={activeProvider.oauth ? LogIn : Plug}
-                label={activeProvider.oauth ? 'Start login' : 'Connect'}
-                onClick={() => runProviderAction(async () => {
-                  const result = await requestJson<{ challenge?: Omit<DeviceChallenge, 'provider'> }>(`/api/llm/providers/${activeProvider.id}/connect`, {
-                    method: 'POST',
-                    body: JSON.stringify({
-                      apiKey: apiKey || undefined,
-                      model,
-                      baseUrl: baseUrl || undefined,
-                      reasoningEffort: activeProvider.supportsReasoningEffort ? reasoningEffort : undefined,
-                    }),
-                    headers: authHeaders(sessionToken!),
-                  });
-                  if (result.challenge) {
-                    setChallenge({ provider: activeProvider.id, ...result.challenge });
-                  } else {
-                    setScreen('models');
-                  }
-                })}
-                disabled={busy || (!activeProvider.oauth && activeProvider.requiresApiKey && !apiKey && !activeProvider.connected)}
-              />
-              <IconButton
-                icon={Check}
-                label="Use provider"
-                className="secondary"
-                onClick={useModel}
-                disabled={busy || !model.trim()}
-              />
-              {challenge ? (
-                <IconButton
-                  icon={Check}
-                  label="Complete login"
-                  onClick={() => runProviderAction(async () => {
-                    await requestJson(`/api/llm/providers/${activeProvider.id}/device/complete`, {
-                      method: 'POST',
-                      body: JSON.stringify({
-                        ...challenge,
-                        model,
-                        reasoningEffort: activeProvider.supportsReasoningEffort ? reasoningEffort : undefined,
-                      }),
-                      headers: authHeaders(sessionToken!),
-                    });
-                    setChallenge(null);
-                    setScreen('models');
-                  })}
-                  disabled={busy}
-                />
+              {!challenge ? (
+                <div className="provider-actions provider-form-actions">
+                  {activeProvider.connected ? (
+                    <IconButton
+                      icon={Power}
+                      label="Disconnect"
+                      className="danger"
+                      onClick={() => runProviderAction(async () => {
+                        await requestJson(`/api/llm/providers/${activeProvider.id}`, {
+                          method: 'DELETE',
+                          headers: authHeaders(sessionToken!),
+                        });
+                      })}
+                      disabled={busy}
+                    >
+                      Disconnect
+                    </IconButton>
+                  ) : null}
+                  <IconButton
+                    icon={activeProvider.oauth && activeProvider.connected ? RefreshCw : activeProvider.oauth ? LogIn : Plug}
+                    label={activeProvider.oauth && activeProvider.connected ? 'Reconnect login' : activeProvider.oauth ? 'Start login' : 'Connect'}
+                    className={activeProvider.connected ? 'secondary' : undefined}
+                    onClick={startProviderConnection}
+                    disabled={busy || (!activeProvider.oauth && activeProvider.requiresApiKey && !apiKey && !activeProvider.connected)}
+                  >
+                    {activeProvider.oauth && activeProvider.connected ? 'Reconnect' : activeProvider.oauth ? 'Start login' : activeProvider.connected ? 'Update key' : 'Connect'}
+                  </IconButton>
+                  <IconButton
+                    icon={Check}
+                    label="Use provider"
+                    onClick={useModel}
+                    disabled={busy || !activeProvider.connected || !modelIsSelectable}
+                  >
+                    Use provider
+                  </IconButton>
+                </div>
               ) : null}
-              <IconButton
-                icon={Power}
-                label="Disconnect"
-                className="danger"
-                onClick={() => runProviderAction(async () => {
-                  await requestJson(`/api/llm/providers/${activeProvider.id}`, {
-                    method: 'DELETE',
-                    headers: authHeaders(sessionToken!),
-                  });
-                })}
-                disabled={busy || !activeProvider.connected}
-              />
-              </div>
             </div>
           </div>
         ) : null}

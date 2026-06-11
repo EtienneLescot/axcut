@@ -1,58 +1,73 @@
+import { getReasoningCapability, normalizeReasoningEffortForCapability } from '../llm/agent-provider-capabilities.js';
+import { LlmConfigStore } from '../llm/llm-config-store.js';
+import { beginCodexDeviceAuth, completeCodexDeviceAuth, ensureOpenAiAccountSession, fetchOpenAiAccountModels } from '../llm/provider-runtime/openai-account.js';
+import { fetchGitHubCopilotModels } from '../llm/provider-runtime/copilot-account.js';
 import {
-  YagrConfigService,
-  beginCodexDeviceAuth,
-  beginGitHubCopilotAuth,
-  completeCodexDeviceAuth,
-  completeGitHubCopilotAuth,
-  fetchAvailableModels,
+  AXCUT_SELECTABLE_MODEL_PROVIDERS,
   getDefaultBaseUrlForProvider,
   getDefaultModelForProvider,
   getProviderDisplayName,
   getProviderSetupHint,
-  getYagrPaths,
-  isProviderConfigured,
   isOAuthAccountProvider,
+  isProviderConfigured,
   normalizeProviderId,
-  prepareProviderRuntime,
   providerNeedsBaseUrlInput,
   providerRequiresApiKey,
-  YAGR_SELECTABLE_MODEL_PROVIDERS,
-  type YagrLocalConfig,
-  type YagrModelProvider,
-} from '@yagr/provider-runtime';
+  providerSupportsReasoningEffort,
+  PROVIDER_DEFINITIONS,
+  type AxcutLocalConfig,
+  type AxcutModelProvider,
+  type AxcutReasoningEffort,
+} from '../llm/provider-registry.js';
 
-const providerEnvKeys: Partial<Record<YagrModelProvider, string[]>> = {
-  openai: ['OPENAI_LLM_API_KEY', 'OPENAI_API_KEY'],
-  anthropic: ['ANTHROPIC_LLM_API_KEY', 'ANTHROPIC_API_KEY'],
-  google: ['GOOGLE_GENERATIVE_AI_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'GEMINI_LLM_API_KEY', 'GOOGLE_LLM_API_KEY'],
-  mistral: ['MISTRAL_API_KEY', 'MISTRAL_LLM_API_KEY'],
-  openrouter: ['OPENROUTER_API_KEY', 'OPENROUTER_LLM_API_KEY'],
-  minimax: ['MINIMAX_API_KEY'],
-  'minimax-token-plan': ['MINIMAX_TOKEN_PLAN_API_KEY'],
-  'openai-compatible': ['OPENAI_COMPATIBLE_API_KEY'],
-  'copilot-proxy': ['COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'],
+type DeviceChallenge = {
+  verificationUri: string;
+  verificationUriComplete?: string;
+  userCode: string;
+  deviceAuthId?: string;
+  deviceCode?: string;
+  intervalMs: number;
+  expiresAt: number;
 };
 
-function providerSupportsReasoningEffort(provider: YagrModelProvider | undefined): boolean {
-  return provider === 'openai-oauth';
+const MINIMAX_DISCOVERY_CANDIDATE_MODELS = [
+  'MiniMax-M2.7',
+  'MiniMax-M2.7-highspeed',
+  'MiniMax-M2.5',
+  'MiniMax-M2.5-highspeed',
+  'MiniMax-M2.1',
+  'MiniMax-M2.1-highspeed',
+  'MiniMax-M2',
+] as const;
+
+class ProviderAuthExpiredError extends Error {
+  readonly statusCode = 401;
+  readonly code = 'provider_auth_expired';
+  readonly reconnectRequired = true;
+
+  constructor(provider: AxcutModelProvider, detail?: string) {
+    super(`${getProviderDisplayName(provider)} authentication expired. Reconnect this provider to load models.${detail ? ` ${detail}` : ''}`);
+    this.name = 'ProviderAuthExpiredError';
+  }
 }
 
 export class LlmConfigService {
-  constructor(private readonly configService = new YagrConfigService()) {}
+  constructor(private readonly configService = new LlmConfigStore()) {}
 
   getSnapshot() {
     const localConfig = this.configService.getLocalConfig();
     const provider = localConfig.provider;
-    const paths = getYagrPaths();
+    const paths = this.configService.getPaths();
     const isReady = isProviderConfigured(localConfig, (candidate) => this.getStoredOrEnvironmentApiKey(candidate));
-    const providers = YAGR_SELECTABLE_MODEL_PROVIDERS.map((candidate) => this.buildProviderState(candidate, localConfig));
+    const providers = AXCUT_SELECTABLE_MODEL_PROVIDERS.map((candidate) => this.buildProviderState(candidate, localConfig));
 
     return {
       ready: isReady,
       source: {
         homeDir: paths.homeDir,
-        configPath: paths.yagrConfigPath,
-        credentialsPath: paths.yagrCredentialsPath,
+        configPath: paths.configPath,
+        credentialsPath: paths.credentialsPath,
+        accountAuthRoot: paths.accountAuthRoot,
       },
       stored: {
         provider: provider ?? null,
@@ -66,10 +81,10 @@ export class LlmConfigService {
         providerLabel: provider ? getProviderDisplayName(provider) : 'Not configured',
         model: localConfig.model ?? '',
         baseUrl: localConfig.baseUrl,
-        reasoningEffort: providerSupportsReasoningEffort(provider) ? localConfig.reasoningEffort : undefined,
-        supportsReasoningEffort: providerSupportsReasoningEffort(provider),
+        reasoningEffort: providerSupportsReasoningEffort(provider, localConfig.model) ? localConfig.reasoningEffort : undefined,
+        supportsReasoningEffort: providerSupportsReasoningEffort(provider, localConfig.model),
         apiKeyAvailable: provider ? Boolean(this.getStoredOrEnvironmentApiKey(provider)) : false,
-        apiKeySource: provider && this.configService.getApiKey(provider) ? 'yagr' : 'environment',
+        apiKeySource: provider && this.configService.getApiKey(provider) ? 'stored' : 'environment',
       },
       providers,
       connectedProviders: providers.filter((candidate) => candidate.connected),
@@ -86,7 +101,7 @@ export class LlmConfigService {
     if (provider === 'openai-oauth') {
       return { challenge: await beginCodexDeviceAuth(), snapshot: this.getSnapshot() };
     }
-    if (provider === 'copilot-proxy') {
+    if (provider === 'copilot-proxy' && !apiKey) {
       return { challenge: await beginGitHubCopilotAuth(), snapshot: this.getSnapshot() };
     }
 
@@ -94,7 +109,7 @@ export class LlmConfigService {
       this.configService.saveApiKey(provider, apiKey);
     }
 
-    const prepared = await prepareProviderRuntime(provider, {
+    const prepared = await this.prepareProviderRuntime(provider, {
       apiKey: apiKey || this.getStoredOrEnvironmentApiKey(provider),
       baseUrl,
     });
@@ -107,7 +122,7 @@ export class LlmConfigService {
       provider,
       model,
       baseUrl,
-      reasoningEffort: providerSupportsReasoningEffort(provider) ? this.optionalReasoningEffort(input.reasoningEffort) : undefined,
+      reasoningEffort: providerSupportsReasoningEffort(provider, model) ? this.optionalReasoningEffort(input.reasoningEffort) : undefined,
     });
 
     return { prepared, snapshot: this.getSnapshot() };
@@ -122,12 +137,16 @@ export class LlmConfigService {
         intervalMs: this.requireNumber(input.intervalMs, 'intervalMs'),
         expiresAt: this.requireNumber(input.expiresAt, 'expiresAt'),
       });
+      this.configService.saveApiKey(provider, '');
     } else if (provider === 'copilot-proxy') {
-      await completeGitHubCopilotAuth({
+      const token = await completeGitHubDeviceAuth({
+        verificationUri: this.optionalString(input.verificationUri) || 'https://github.com/login/device',
+        userCode: this.requireString(input.userCode, 'userCode'),
         deviceCode: this.requireString(input.deviceCode, 'deviceCode'),
         intervalMs: this.requireNumber(input.intervalMs, 'intervalMs'),
         expiresAt: this.requireNumber(input.expiresAt, 'expiresAt'),
       });
+      this.configService.saveApiKey(provider, token);
     } else {
       throw new Error(`${provider} does not use device authentication.`);
     }
@@ -137,25 +156,26 @@ export class LlmConfigService {
       : getDefaultModelForProvider(provider);
     const baseUrl = getDefaultBaseUrlForProvider(provider);
     const reasoningEffort = this.optionalReasoningEffort(input.reasoningEffort);
-    const prepared = await prepareProviderRuntime(provider, { baseUrl });
+    const prepared = await this.prepareProviderRuntime(provider, { apiKey: this.getStoredOrEnvironmentApiKey(provider), baseUrl });
     this.configService.saveLocalConfig({
       ...this.configService.getLocalConfig(),
       provider,
       model,
       baseUrl,
-      ...(providerSupportsReasoningEffort(provider) ? { reasoningEffort } : { reasoningEffort: undefined }),
+      ...(providerSupportsReasoningEffort(provider, model) ? { reasoningEffort } : { reasoningEffort: undefined }),
     });
     return { prepared, snapshot: this.getSnapshot() };
   }
 
   selectProvider(providerId: string, input: Record<string, unknown> = {}) {
     const provider = this.requireProvider(providerId);
+    const model = this.optionalString(input.model) || getDefaultModelForProvider(provider);
     this.configService.saveLocalConfig({
       ...this.configService.getLocalConfig(),
       provider,
-      model: this.optionalString(input.model) || getDefaultModelForProvider(provider),
+      model,
       baseUrl: this.optionalString(input.baseUrl) || getDefaultBaseUrlForProvider(provider),
-      reasoningEffort: providerSupportsReasoningEffort(provider) ? this.optionalReasoningEffort(input.reasoningEffort) : undefined,
+      reasoningEffort: providerSupportsReasoningEffort(provider, model) ? this.optionalReasoningEffort(input.reasoningEffort) : undefined,
     });
     return this.getSnapshot();
   }
@@ -165,12 +185,7 @@ export class LlmConfigService {
     this.configService.saveApiKey(provider, '');
     const localConfig = this.configService.getLocalConfig();
     if (localConfig.provider === provider) {
-      const { provider: _provider, model: _model, baseUrl: _baseUrl, reasoningEffort: _reasoningEffort, ...rest } = localConfig;
-      void _provider;
-      void _model;
-      void _baseUrl;
-      void _reasoningEffort;
-      this.configService.saveLocalConfig(rest);
+      this.configService.saveLocalConfig({});
     }
     return this.getSnapshot();
   }
@@ -179,28 +194,49 @@ export class LlmConfigService {
     const provider = this.requireProvider(providerId);
     const baseUrl = this.optionalString(input.baseUrl) || this.configService.getLocalConfig().baseUrl || getDefaultBaseUrlForProvider(provider);
     const apiKey = this.getStoredOrEnvironmentApiKey(provider);
-    const prepared = await prepareProviderRuntime(provider, { apiKey, baseUrl });
-    const models = prepared.runtime?.models?.length
-      ? prepared.runtime.models
-      : await fetchAvailableModels(provider, apiKey, baseUrl).catch(() => []);
+    const prepared = await this.prepareProviderRuntime(provider, { apiKey, baseUrl });
+    if (!prepared.ready) {
+      throw new Error(prepared.reason || `Provider ${getProviderDisplayName(provider)} is not ready.`);
+    }
+    const models = await this.fetchAvailableModels(provider, apiKey, baseUrl);
     return {
       provider,
-      models: models.length ? [...new Set(models)] : [getDefaultModelForProvider(provider)].filter(Boolean),
+      models: [...new Set(models)],
       prepared,
     };
   }
 
-  getConfigStore(): YagrConfigService {
-    return this.configService;
+  getRuntimeConfig() {
+    const localConfig = this.configService.getLocalConfig();
+    const provider = localConfig.provider;
+    if (!provider) {
+      throw new Error('No LLM provider is configured. Configure a provider from the Axcut web UI.');
+    }
+    const model = localConfig.model || getDefaultModelForProvider(provider);
+    const apiKey = this.getStoredOrEnvironmentApiKey(provider);
+    if (providerRequiresApiKey(provider) && !apiKey) {
+      throw new Error(`Missing API key for ${getProviderDisplayName(provider)}. Configure a provider from the Axcut web UI.`);
+    }
+    if (providerNeedsBaseUrlInput(provider) && !localConfig.baseUrl) {
+      throw new Error(`Missing base URL for ${getProviderDisplayName(provider)}. Configure a provider from the Axcut web UI.`);
+    }
+    return {
+      provider,
+      model,
+      apiKey,
+      baseUrl: localConfig.baseUrl || getDefaultBaseUrlForProvider(provider),
+      reasoningEffort: normalizeReasoningEffortForCapability(localConfig.reasoningEffort, getReasoningCapability(provider, model)),
+    };
   }
 
-  private buildProviderState(provider: YagrModelProvider, localConfig: YagrLocalConfig) {
+  private buildProviderState(provider: AxcutModelProvider, localConfig: AxcutLocalConfig) {
     const storedApiKey = this.configService.getApiKey(provider);
     const environmentApiKey = this.getEnvironmentApiKey(provider);
     const selected = localConfig.provider === provider;
     const connected = isOAuthAccountProvider(provider)
       ? selected || Boolean(storedApiKey || environmentApiKey)
       : Boolean(storedApiKey || environmentApiKey) || (!providerRequiresApiKey(provider) && selected);
+    const model = selected ? localConfig.model : undefined;
 
     return {
       id: provider,
@@ -213,20 +249,20 @@ export class LlmConfigService {
       setupHint: getProviderSetupHint(provider),
       connected,
       selected,
-      model: selected ? localConfig.model : undefined,
+      model,
       baseUrl: selected ? localConfig.baseUrl : getDefaultBaseUrlForProvider(provider),
-      supportsReasoningEffort: providerSupportsReasoningEffort(provider),
-      reasoningEffort: selected && providerSupportsReasoningEffort(provider) ? localConfig.reasoningEffort : undefined,
-      credentialSource: storedApiKey ? 'yagr' : environmentApiKey ? 'environment' : null,
+      supportsReasoningEffort: providerSupportsReasoningEffort(provider, model || getDefaultModelForProvider(provider)),
+      reasoningEffort: selected && providerSupportsReasoningEffort(provider, model) ? localConfig.reasoningEffort : undefined,
+      credentialSource: storedApiKey ? 'stored' : environmentApiKey ? 'environment' : null,
     };
   }
 
-  private getStoredOrEnvironmentApiKey(provider: YagrModelProvider): string | undefined {
+  private getStoredOrEnvironmentApiKey(provider: AxcutModelProvider): string | undefined {
     return this.configService.getApiKey(provider)?.trim() || this.getEnvironmentApiKey(provider);
   }
 
-  private getEnvironmentApiKey(provider: YagrModelProvider): string | undefined {
-    for (const key of providerEnvKeys[provider] ?? []) {
+  private getEnvironmentApiKey(provider: AxcutModelProvider): string | undefined {
+    for (const key of PROVIDER_DEFINITIONS[provider].envKeys) {
       const value = process.env[key]?.trim();
       if (value) {
         return value;
@@ -235,12 +271,126 @@ export class LlmConfigService {
     return undefined;
   }
 
-  private requireProvider(providerId: string): YagrModelProvider {
+  private requireProvider(providerId: string): AxcutModelProvider {
     const provider = normalizeProviderId(providerId);
     if (!provider) {
       throw new Error(`Unknown provider ${providerId}`);
     }
     return provider;
+  }
+
+  private async prepareProviderRuntime(provider: AxcutModelProvider, input: { apiKey?: string; baseUrl?: string }) {
+    if (providerRequiresApiKey(provider) && !input.apiKey) {
+      return { ready: false, reason: `Missing API key for ${getProviderDisplayName(provider)}.` };
+    }
+    if (providerNeedsBaseUrlInput(provider) && !input.baseUrl) {
+      return { ready: false, reason: `Missing base URL for ${getProviderDisplayName(provider)}.` };
+    }
+    return {
+      ready: true,
+      provider,
+      baseUrl: input.baseUrl,
+      models: await this.fetchAvailableModels(provider, input.apiKey, input.baseUrl).catch(() => []),
+    };
+  }
+
+  private async fetchAvailableModels(provider: AxcutModelProvider, apiKey?: string, baseUrl?: string): Promise<string[]> {
+    if (provider === 'copilot-proxy' && apiKey) {
+      return fetchGitHubCopilotModels(apiKey).catch((error) => {
+        throw this.toProviderModelDiscoveryError(provider, error);
+      });
+    }
+    if (provider === 'openai-oauth') {
+      const session = await ensureOpenAiAccountSession() || await ensureOpenAiAccountSession(apiKey);
+      if (!session?.accessToken) {
+        throw new ProviderAuthExpiredError(provider, 'No active account session was found.');
+      }
+      return fetchOpenAiAccountModels(session.accessToken).catch((error) => {
+        throw this.toProviderModelDiscoveryError(provider, error);
+      });
+    }
+    if (provider === 'anthropic') {
+      return fetchModelIds('https://api.anthropic.com/v1/models', undefined, { 'x-api-key': apiKey || '', 'anthropic-version': '2023-06-01' })
+        .catch((error) => {
+          throw this.toProviderModelDiscoveryError(provider, error);
+        });
+    }
+    if (provider === 'google') {
+      return fetchModelIds('https://generativelanguage.googleapis.com/v1beta/openai/models', undefined, { Authorization: `Bearer ${apiKey}` })
+        .then((models) => models.map((model) => model.replace(/^models\//, '')).filter((model) => /^gemini-/i.test(model)))
+        .catch((error) => {
+          throw this.toProviderModelDiscoveryError(provider, error);
+        });
+    }
+    if (provider === 'mistral') {
+      return fetchModelIds('https://api.mistral.ai/v1/models', apiKey).catch((error) => {
+        throw this.toProviderModelDiscoveryError(provider, error);
+      });
+    }
+    if (provider === 'minimax' || provider === 'minimax-token-plan') {
+      return this.probeMiniMaxModels(provider, apiKey, baseUrl);
+    }
+    const modelsBaseUrl = provider === 'openrouter'
+      ? 'https://openrouter.ai/api/v1'
+      : baseUrl || getDefaultBaseUrlForProvider(provider);
+    if (!modelsBaseUrl) {
+      return [];
+    }
+    return fetchModelIds(`${modelsBaseUrl.replace(/\/+$/, '')}/models`, apiKey).catch((error) => {
+      throw this.toProviderModelDiscoveryError(provider, error);
+    });
+  }
+
+  private toProviderModelDiscoveryError(provider: AxcutModelProvider, error: unknown): Error {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isAuthenticationFailure(message)) {
+      return new ProviderAuthExpiredError(provider);
+    }
+    return new Error(message || `Could not load models for ${getProviderDisplayName(provider)}.`);
+  }
+
+  private async probeMiniMaxModels(provider: AxcutModelProvider, apiKey?: string, baseUrl?: string): Promise<string[]> {
+    if (!apiKey) {
+      return [];
+    }
+    const url = this.getMiniMaxCompletionDiscoveryUrl(baseUrl);
+    const checks = await Promise.all(
+      MINIMAX_DISCOVERY_CANDIDATE_MODELS.map(async (model) => {
+        try {
+          const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model,
+              messages: [{ role: 'user', content: 'ping' }],
+              max_tokens: 1,
+            }),
+          });
+          if (response.status === 401 || response.status === 403) {
+            const body = await response.text().catch(() => '');
+            throw new ProviderAuthExpiredError(provider, body.trim());
+          }
+          return response.ok ? model : undefined;
+        } catch (error) {
+          if (error instanceof ProviderAuthExpiredError) {
+            throw error;
+          }
+          return undefined;
+        }
+      }),
+    );
+    return checks.filter((model): model is typeof MINIMAX_DISCOVERY_CANDIDATE_MODELS[number] => Boolean(model));
+  }
+
+  private getMiniMaxCompletionDiscoveryUrl(baseUrl?: string): string {
+    const resolvedBaseUrl = baseUrl || getDefaultBaseUrlForProvider('minimax') || 'https://api.minimax.io/anthropic';
+    if (resolvedBaseUrl.endsWith('/anthropic')) {
+      return resolvedBaseUrl.replace(/\/anthropic\/?$/, '/v1/chat/completions');
+    }
+    return `${resolvedBaseUrl.replace(/\/$/, '')}/v1/chat/completions`;
   }
 
   private requireString(value: unknown, label: string): string {
@@ -261,9 +411,77 @@ export class LlmConfigService {
     return typeof value === 'string' && value.trim() ? value.trim() : undefined;
   }
 
-  private optionalReasoningEffort(value: unknown): YagrLocalConfig['reasoningEffort'] | undefined {
+  private optionalReasoningEffort(value: unknown): AxcutReasoningEffort | undefined {
     return typeof value === 'string' && ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(value)
-      ? value as YagrLocalConfig['reasoningEffort']
+      ? value as AxcutReasoningEffort
       : undefined;
   }
+}
+
+async function beginGitHubCopilotAuth(): Promise<DeviceChallenge> {
+  const response = await fetch('https://github.com/login/device/code', {
+    method: 'POST',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: 'Iv1.b507a08c87ecfe98', scope: 'read:user' }),
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub device code failed: HTTP ${response.status}`);
+  }
+  const payload = await response.json() as Record<string, unknown>;
+  return {
+    verificationUri: String(payload.verification_uri || 'https://github.com/login/device'),
+    userCode: String(payload.user_code || ''),
+    deviceCode: String(payload.device_code || ''),
+    intervalMs: Math.max(1000, Number(payload.interval || 5) * 1000),
+    expiresAt: Date.now() + Number(payload.expires_in || 900) * 1000,
+  };
+}
+
+async function completeGitHubDeviceAuth(challenge: DeviceChallenge): Promise<string> {
+  while (Date.now() < challenge.expiresAt) {
+    const response = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: 'Iv1.b507a08c87ecfe98',
+        device_code: challenge.deviceCode || '',
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+      }),
+    });
+    const payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+    const accessToken = String(payload.access_token || '');
+    if (accessToken) {
+      return accessToken;
+    }
+    const error = String(payload.error || '');
+    if (error && error !== 'authorization_pending' && error !== 'slow_down') {
+      throw new Error(String(payload.error_description || error));
+    }
+    await new Promise((resolve) => setTimeout(resolve, challenge.intervalMs));
+  }
+  throw new Error('GitHub Copilot device login expired.');
+}
+
+async function fetchModelIds(url: string, apiKey?: string, headers: Record<string, string> = {}): Promise<string[]> {
+  const response = await fetch(url, {
+    headers: {
+      Accept: 'application/json',
+      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      ...headers,
+    },
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    throw new Error([`Model discovery failed: HTTP ${response.status}`, body.trim()].filter(Boolean).join(' - '));
+  }
+  const payload = await response.json() as Record<string, unknown>;
+  const data = Array.isArray(payload.data) ? payload.data : [];
+  return data
+    .map((entry) => entry && typeof entry === 'object' ? String((entry as Record<string, unknown>).id || '').trim() : '')
+    .filter(Boolean)
+    .sort((left, right) => left.localeCompare(right));
+}
+
+function isAuthenticationFailure(message: string): boolean {
+  return /\b(401|403|unauthorized|forbidden|expired|invalid[_ -]?token|invalid[_ -]?grant|token refresh failed)\b/i.test(message);
 }
