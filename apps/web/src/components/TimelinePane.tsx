@@ -50,6 +50,7 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
   const dragStateRef = useRef<CutDragState | null>(null);
   const activeDragCleanupRef = useRef<(() => void) | null>(null);
   const callbacksRef = useRef({ onSeek, onPreviewSource, onReplaceTimeline });
+  const suppressNextClipClickRef = useRef(false);
   const [trackWidthPx, setTrackWidthPx] = useState(0);
   const durationSec = totalVirtualDuration(clips);
   const activePosition = locateVirtualPosition(clips, currentTimeSec);
@@ -213,6 +214,25 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
     }
   };
 
+  const startClipBoundaryResize = (
+    previousItem: TimelineItem | undefined,
+    nextItem: TimelineItem | undefined,
+    event: ReactPointerEvent<HTMLElement> | ReactMouseEvent<HTMLElement>,
+  ) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const distanceFromLeft = event.clientX - rect.left;
+    const distanceFromRight = rect.right - event.clientX;
+    if (distanceFromLeft <= CUT_EDGE_HIT_ZONE_PX && previousItem?.type === 'cut') {
+      suppressNextClipClickRef.current = true;
+      startCutResize(previousItem.range, 'end', event);
+      return;
+    }
+    if (distanceFromRight <= CUT_EDGE_HIT_ZONE_PX && nextItem?.type === 'cut') {
+      suppressNextClipClickRef.current = true;
+      startCutResize(nextItem.range, 'start', event);
+    }
+  };
+
   const deleteCut = (cut: SourceRange) => {
     if (busy) {
       return;
@@ -260,7 +280,7 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
 
       <div ref={trackRef} className="timeline-track" aria-label="Source timeline with non-destructive cuts">
         {sourceDuration > 0 && clips.length > 0 ? (
-          timelineItems.map((item) => {
+          timelineItems.map((item, index) => {
             const itemStyle = timelineItemStyle(item, trackTotal, trackWidthPx);
             if (item.type === 'cut') {
               const dragging = dragState?.cut.id === item.range.id;
@@ -316,7 +336,15 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
                 className={active ? 'timeline-clip active' : 'timeline-clip'}
                 style={itemStyle}
                 title={`Kept source ${formatSeconds(item.startSec)}-${formatSeconds(item.endSec)}`}
-                onClick={() => onSeek(sourceToVirtualTime(keptIntervals, item.startSec))}
+                onPointerDown={(event) => startClipBoundaryResize(timelineItems[index - 1], timelineItems[index + 1], event)}
+                onMouseDown={(event) => startClipBoundaryResize(timelineItems[index - 1], timelineItems[index + 1], event)}
+                onClick={() => {
+                  if (suppressNextClipClickRef.current) {
+                    suppressNextClipClickRef.current = false;
+                    return;
+                  }
+                  onSeek(sourceToVirtualTime(keptIntervals, item.startSec));
+                }}
               >
                 <span>{formatSeconds(item.startSec)}</span>
                 <small>{formatSeconds(item.startSec)}-{formatSeconds(item.endSec)}</small>
