@@ -1,6 +1,6 @@
 import type { AxcutDocument } from '@axcut/schema';
-import type { DeepAgentSessionRecord } from '@yagr/session-service';
 
+import type { DeepAgentSessionRecord } from './agent-session-service.js';
 import { AxcutDeepAgentService, type AgentConversationMessage } from './axcut-deep-agent.js';
 import type { DocumentService } from './document-service.js';
 import type { EventBus } from './event-bus.js';

@@ -126,10 +126,26 @@ export async function createServer() {
 
   fastify.setErrorHandler((error, _request, reply) => {
     const message = error instanceof Error ? error.message : String(error);
+    const statusCode = typeof (error as { statusCode?: unknown }).statusCode === 'number'
+      ? (error as { statusCode: number }).statusCode
+      : undefined;
+    const code = typeof (error as { code?: unknown }).code === 'string'
+      ? (error as { code: string }).code
+      : undefined;
+    const reconnectRequired = Boolean((error as { reconnectRequired?: unknown }).reconnectRequired);
     if (error instanceof ZodError) {
       reply.code(400).send({
         error: 'Validation error',
         issues: error.issues,
+      });
+      return;
+    }
+
+    if (statusCode && statusCode >= 400 && statusCode < 500) {
+      reply.code(statusCode).send({
+        error: message,
+        ...(code ? { code } : {}),
+        ...(reconnectRequired ? { reconnectRequired } : {}),
       });
       return;
     }

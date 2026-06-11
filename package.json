@@ -13,14 +13,11 @@
     "dev:web": "npm run dev --workspace @axcut/web",
     "assets:generate": "node scripts/generate-assets.mjs",
     "clean:processes": "node scripts/clean-processes.mjs",
-    "llm:setup": "node scripts/run-yagr-llm-setup.mjs",
     "build": "npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present"
   },
-  "dependencies": {
-    "@yagr/provider-runtime": "^0.1.2"
-  },
+  "dependencies": {},
   "devDependencies": {
     "concurrently": "^9.2.1",
     "sharp": "^0.34.5",

@@ -60,7 +60,7 @@ export function LlmSetupPanel({ snapshot, busy, onSave }: LlmSetupPanelProps) {
       <div className="panel-header">
         <div>
           <h2>LLM Setup</h2>
-          <p className="muted">Provider-agnostic local model configuration backed by the extracted Yagr runtime.</p>
+          <p className="muted">Provider-agnostic local model configuration backed by Axcut's native runtime.</p>
         </div>
         <span className={snapshot?.ready ? 'setup-badge ready' : 'setup-badge'}>
           {snapshot?.ready ? 'Ready' : 'Required'}
