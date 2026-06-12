@@ -109,9 +109,6 @@ type PendingTimelineEdit = {
   projectId: string;
   intervals: Array<{ startSec: number; endSec: number }>;
   reason: string;
-  document?: AxcutDocument;
-  message?: Message | null;
-  completedAt?: number;
 };
 
 type ReplaceTimelineInput = PendingTimelineEdit & {
@@ -485,25 +482,10 @@ function applyPendingTimelineEdit(snapshot: ProjectSnapshot, pendingEdit: Pendin
   if (!pendingEdit || snapshot.document.project.id !== pendingEdit.projectId) {
     return snapshot;
   }
-  const message = pendingEdit.message;
-  const shouldAppendMessage = Boolean(
-    message
-    && snapshot.activeSessionId === message.sessionId
-    && !snapshot.messages.some((item) => item.id === message.id),
-  );
   return {
     ...snapshot,
-    document: pendingEdit.document ?? buildOptimisticTimelineDocument(snapshot.document, pendingEdit.intervals, pendingEdit.reason),
-    messages: shouldAppendMessage && message ? [...snapshot.messages, message] : snapshot.messages,
+    document: buildOptimisticTimelineDocument(snapshot.document, pendingEdit.intervals, pendingEdit.reason),
   };
-}
-
-function serverSnapshotIncludesTimelineEdit(snapshot: ProjectSnapshot, pendingEdit: PendingTimelineEdit): boolean {
-  if (!pendingEdit.completedAt || !pendingEdit.document) {
-    return false;
-  }
-  const hasMessage = !pendingEdit.message || snapshot.messages.some((message) => message.id === pendingEdit.message?.id);
-  return hasMessage && snapshot.document.preview.revision >= pendingEdit.document.preview.revision;
 }
 
 function getSttStatus(document: AxcutDocument | undefined, jobs: JobSummary[] | undefined) {
@@ -816,13 +798,7 @@ export function App() {
       const pendingEdit = pendingTimelineEditRef.current;
       return requestJson<ProjectSnapshot>(`/api/projects/${projectId}${sessionQueryPart}`, {
         headers: authHeaders(sessionToken!),
-      }).then((snapshot) => {
-        if (pendingEdit && serverSnapshotIncludesTimelineEdit(snapshot, pendingEdit)) {
-          pendingTimelineEditRef.current = null;
-          return snapshot;
-        }
-        return applyPendingTimelineEdit(snapshot, pendingEdit);
-      });
+      }).then((snapshot) => applyPendingTimelineEdit(snapshot, pendingEdit));
     },
   });
 
@@ -1067,7 +1043,7 @@ export function App() {
         queryClient.setQueryData(queryKey, snapshot);
       }
     },
-    onSuccess: async (result, input, context) => {
+    onSuccess: async (result, _input, context) => {
       if (context.requestId !== replaceTimelineRequestRef.current?.id) {
         return;
       }
@@ -1080,35 +1056,29 @@ export function App() {
         }
         return;
       }
-      const completedEdit: PendingTimelineEdit = {
-        requestId: input.requestId,
-        projectId: input.projectId,
-        intervals: input.intervals,
-        reason: input.reason,
-        document: result.document,
-        message: result.message,
-        completedAt: Date.now(),
-      };
       queryClient.setQueriesData<ProjectSnapshot>({ queryKey: ['project', context.projectId] }, (current) => {
         if (!current) {
           return current;
         }
-        return applyPendingTimelineEdit(current, completedEdit);
+        const message = result.message;
+        const shouldAppendMessage = Boolean(
+          message
+          && current.activeSessionId === message.sessionId
+          && !current.messages.some((item) => item.id === message.id),
+        );
+        return {
+          ...current,
+          document: result.document,
+          messages: shouldAppendMessage && message ? [...current.messages, message] : current.messages,
+        };
       });
-      pendingTimelineEditRef.current = completedEdit;
+      pendingTimelineEditRef.current = null;
       replaceTimelineRequestRef.current = null;
       setAutoScrollMessages(true);
+      await queryClient.invalidateQueries({ queryKey: ['project', context.projectId] });
       await queryClient.invalidateQueries({ queryKey: ['projects'] });
-      window.setTimeout(() => {
-        void queryClient.invalidateQueries({ queryKey: ['project', context.projectId] });
-      }, 1200);
     },
   });
-  const replaceTimelineMutateRef = useRef(replaceTimeline.mutate);
-
-  useEffect(() => {
-    replaceTimelineMutateRef.current = replaceTimeline.mutate;
-  }, [replaceTimeline.mutate]);
 
   const queueReplaceTimeline = useCallback((intervals: Array<{ startSec: number; endSec: number }>, reason: string) => {
     if (!projectId || !activeSessionId) {
@@ -1124,7 +1094,7 @@ export function App() {
       intervals,
       reason,
     };
-    replaceTimelineMutateRef.current({
+    replaceTimeline.mutate({
       requestId,
       projectId,
       sessionId: activeSessionId,
@@ -1132,7 +1102,7 @@ export function App() {
       reason,
       controller,
     });
-  }, [activeSessionId, projectId]);
+  }, [activeSessionId, projectId, replaceTimeline]);
 
   const compactContext = useMutation({
     mutationFn: async () => {

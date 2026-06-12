@@ -1192,7 +1192,7 @@ body.resizing-timeline * {
   position: absolute;
   top: 0;
   bottom: 0;
-  width: 1.1rem;
+  width: 0.62rem;
   cursor: ew-resize;
   touch-action: none;
   z-index: 2;
