@@ -444,7 +444,7 @@ export async function createServer() {
       label: 'Before timeline edit',
       summary: `Before manual timeline edit: ${summary}`,
     }) : null;
-    if (request.raw.aborted || request.raw.destroyed) {
+    if (request.raw.aborted) {
       return { aborted: true };
     }
     const result = documents.applyOperation(projectId, payload.operation, payload.operation.reason || 'Manual timeline update', 'user');

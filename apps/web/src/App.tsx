@@ -105,7 +105,6 @@ type ProjectSnapshot = {
 };
 
 type PendingTimelineEdit = {
-  requestId: number;
   projectId: string;
   intervals: Array<{ startSec: number; endSec: number }>;
   reason: string;
@@ -113,12 +112,9 @@ type PendingTimelineEdit = {
 
 type ReplaceTimelineInput = PendingTimelineEdit & {
   sessionId: string;
-  controller: AbortController;
 };
 
-type ReplaceTimelineResult =
-  | { aborted?: false; document: AxcutDocument; revisionId: string; message: Message | null }
-  | { aborted: true };
+type ReplaceTimelineResult = { document: AxcutDocument; revisionId: string; message: Message | null };
 
 type JobSummary = {
   id: string;
@@ -691,7 +687,6 @@ export function App() {
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const providerButtonRef = useRef<HTMLButtonElement | null>(null);
   const reasoningButtonRef = useRef<HTMLButtonElement | null>(null);
-  const replaceTimelineRequestRef = useRef<{ id: number; controller: AbortController } | null>(null);
   const pendingTimelineEditRef = useRef<PendingTimelineEdit | null>(null);
 
   const layoutStyle = useMemo(() => ({
@@ -1011,12 +1006,10 @@ export function App() {
           },
         }),
         headers: authHeaders(sessionToken),
-        signal: input.controller.signal,
       });
     },
     onMutate: async (input) => {
       const pendingEdit: PendingTimelineEdit = {
-        requestId: input.requestId,
         projectId: input.projectId,
         intervals: input.intervals,
         reason: input.reason,
@@ -1027,35 +1020,20 @@ export function App() {
       queryClient.setQueriesData<ProjectSnapshot>({ queryKey: ['project', input.projectId] }, (current) => (
         current ? applyPendingTimelineEdit(current, pendingEdit) : current
       ));
-      return { requestId: input.requestId, projectId: input.projectId, previousSnapshots };
+      return { projectId: input.projectId, previousSnapshots };
     },
     onError: async (error, _input, context) => {
-      if (error instanceof DOMException && error.name === 'AbortError') {
-        return;
-      }
-      if (!context || context.requestId !== replaceTimelineRequestRef.current?.id) {
+      if (!context) {
         return;
       }
       await queryClient.cancelQueries({ queryKey: ['project', context.projectId] });
       pendingTimelineEditRef.current = null;
-      replaceTimelineRequestRef.current = null;
       for (const [queryKey, snapshot] of context.previousSnapshots) {
         queryClient.setQueryData(queryKey, snapshot);
       }
     },
     onSuccess: async (result, _input, context) => {
-      if (context.requestId !== replaceTimelineRequestRef.current?.id) {
-        return;
-      }
       await queryClient.cancelQueries({ queryKey: ['project', context.projectId] });
-      if ('aborted' in result && result.aborted) {
-        pendingTimelineEditRef.current = null;
-        replaceTimelineRequestRef.current = null;
-        for (const [queryKey, snapshot] of context.previousSnapshots) {
-          queryClient.setQueryData(queryKey, snapshot);
-        }
-        return;
-      }
       queryClient.setQueriesData<ProjectSnapshot>({ queryKey: ['project', context.projectId] }, (current) => {
         if (!current) {
           return current;
@@ -1073,7 +1051,6 @@ export function App() {
         };
       });
       pendingTimelineEditRef.current = null;
-      replaceTimelineRequestRef.current = null;
       setAutoScrollMessages(true);
       await queryClient.invalidateQueries({ queryKey: ['project', context.projectId] });
       await queryClient.invalidateQueries({ queryKey: ['projects'] });
@@ -1081,26 +1058,19 @@ export function App() {
   });
 
   const queueReplaceTimeline = useCallback((intervals: Array<{ startSec: number; endSec: number }>, reason: string) => {
-    if (!projectId || !activeSessionId) {
+    if (!projectId || !activeSessionId || replaceTimeline.isPending) {
       return;
     }
-    replaceTimelineRequestRef.current?.controller.abort();
-    const requestId = (replaceTimelineRequestRef.current?.id ?? 0) + 1;
-    const controller = new AbortController();
-    replaceTimelineRequestRef.current = { id: requestId, controller };
     pendingTimelineEditRef.current = {
-      requestId,
       projectId,
       intervals,
       reason,
     };
     replaceTimeline.mutate({
-      requestId,
       projectId,
       sessionId: activeSessionId,
       intervals,
       reason,
-      controller,
     });
   }, [activeSessionId, projectId, replaceTimeline]);
 
@@ -1549,7 +1519,7 @@ export function App() {
         clips={document?.timeline.clips ?? []}
         currentTimeSec={virtualTimeSec}
         sourceDurationSec={primaryAsset?.durationSec ?? 0}
-        busy={!activeSessionId || sendChat.isPending}
+        busy={!activeSessionId || sendChat.isPending || replaceTimeline.isPending}
         onSeek={(timeSec) => setSeekTarget({ timeSec, requestId: Date.now() })}
         onPreviewSource={(sourceTimeSec) => setSourcePreviewTarget({ sourceTimeSec, requestId: Date.now() })}
         onReplaceTimeline={queueReplaceTimeline}
