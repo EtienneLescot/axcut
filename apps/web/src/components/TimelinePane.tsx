@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from 'react';
-import { Maximize2, Minus, Plus, Trash2 } from 'lucide-react';
+import { Plus, Trash2 } from 'lucide-react';
 import type { AxcutClip } from '@axcut/schema';
 
 import { formatSeconds, locateVirtualPosition, totalVirtualDuration } from '../lib/virtual-preview.js';
@@ -43,9 +43,16 @@ type PanState = {
   startScrollLeft: number;
 };
 
+type NavigatorDragState = {
+  mode: 'move' | 'start' | 'end';
+  startClientX: number;
+  overviewWidthPx: number;
+  startVisibleStartSec: number;
+  startVisibleEndSec: number;
+};
+
 const MIN_CUT_DURATION_SEC = 0.1;
 const MIN_SOURCE_DURATION_SEC = 0.001;
-const MIN_PX_PER_SEC = 0.35;
 const MAX_PX_PER_SEC = 280;
 const MIN_SEGMENT_WIDTH_PX = 1;
 const RULER_HEIGHT_PX = 28;
@@ -60,13 +67,17 @@ export function TimelinePane({
   onReplaceTimeline,
 }: TimelinePaneProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const overviewRef = useRef<HTMLDivElement | null>(null);
   const resizeRef = useRef<ResizeState | null>(null);
   const panRef = useRef<PanState | null>(null);
+  const navigatorDragRef = useRef<NavigatorDragState | null>(null);
   const resizeSequenceRef = useRef(0);
   const [viewportWidthPx, setViewportWidthPx] = useState(0);
+  const [scrollLeftPx, setScrollLeftPx] = useState(0);
   const [zoom, setZoom] = useState(1);
   const [resizeState, setResizeState] = useState<ResizeState | null>(null);
   const [panning, setPanning] = useState(false);
+  const [navigatorDragging, setNavigatorDragging] = useState(false);
 
   const virtualDurationSec = totalVirtualDuration(clips);
   const activePosition = locateVirtualPosition(clips, currentTimeSec);
@@ -75,10 +86,17 @@ export function TimelinePane({
     [clips, sourceDurationSec],
   );
   const fitPxPerSec = useMemo(() => (
-    Math.max(MIN_PX_PER_SEC, viewportWidthPx / Math.max(sourceDuration, MIN_SOURCE_DURATION_SEC))
+    Math.max(0.001, viewportWidthPx / Math.max(sourceDuration, MIN_SOURCE_DURATION_SEC))
   ), [sourceDuration, viewportWidthPx]);
-  const pxPerSec = clamp(fitPxPerSec * zoom, MIN_PX_PER_SEC, MAX_PX_PER_SEC);
+  const pxPerSec = clamp(fitPxPerSec * zoom, fitPxPerSec, MAX_PX_PER_SEC);
   const contentWidthPx = Math.max(viewportWidthPx, Math.ceil(sourceDuration * pxPerSec));
+  const visibleStartSec = clamp(scrollLeftPx / Math.max(pxPerSec, 0.001), 0, sourceDuration);
+  const visibleDurationSec = clamp(viewportWidthPx / Math.max(pxPerSec, 0.001), 0, sourceDuration);
+  const visibleEndSec = clamp(visibleStartSec + visibleDurationSec, 0, sourceDuration);
+  const navigatorWindowStyle = useMemo(() => ({
+    left: `${(visibleStartSec / Math.max(sourceDuration, MIN_SOURCE_DURATION_SEC)) * 100}%`,
+    width: `${Math.max(0, ((visibleEndSec - visibleStartSec) / Math.max(sourceDuration, MIN_SOURCE_DURATION_SEC)) * 100)}%`,
+  }) as CSSProperties, [sourceDuration, visibleEndSec, visibleStartSec]);
 
   const keptIntervals = useMemo(() => normalizeRanges(
     sourceDuration,
@@ -129,7 +147,7 @@ export function TimelinePane({
 
   const zoomAt = useCallback((nextZoom: number, anchorClientX?: number) => {
     const scrollElement = scrollRef.current;
-    const boundedZoom = clamp(nextZoom, 1, MAX_PX_PER_SEC / Math.max(fitPxPerSec, MIN_PX_PER_SEC));
+    const boundedZoom = clamp(nextZoom, 1, MAX_PX_PER_SEC / Math.max(fitPxPerSec, 0.001));
     if (!scrollElement) {
       setZoom(boundedZoom);
       return;
@@ -137,18 +155,40 @@ export function TimelinePane({
     const rect = scrollElement.getBoundingClientRect();
     const anchorX = anchorClientX === undefined ? rect.left + rect.width / 2 : anchorClientX;
     const sourceAtAnchor = (scrollElement.scrollLeft + anchorX - rect.left) / pxPerSec;
-    const nextPxPerSec = clamp(fitPxPerSec * boundedZoom, MIN_PX_PER_SEC, MAX_PX_PER_SEC);
+    const nextPxPerSec = clamp(fitPxPerSec * boundedZoom, fitPxPerSec, MAX_PX_PER_SEC);
     setZoom(boundedZoom);
     requestAnimationFrame(() => {
-      scrollElement.scrollLeft = Math.max(0, sourceAtAnchor * nextPxPerSec - (anchorX - rect.left));
+      const nextScrollLeft = Math.max(0, sourceAtAnchor * nextPxPerSec - (anchorX - rect.left));
+      scrollElement.scrollLeft = nextScrollLeft;
+      setScrollLeftPx(scrollElement.scrollLeft);
     });
   }, [fitPxPerSec, pxPerSec]);
+
+  const setVisibleWindow = useCallback((startSec: number, endSec: number) => {
+    const scrollElement = scrollRef.current;
+    if (!scrollElement || viewportWidthPx <= 0) {
+      return;
+    }
+    const minVisibleDurationSec = Math.max(MIN_CUT_DURATION_SEC, viewportWidthPx / MAX_PX_PER_SEC);
+    const visibleDuration = clamp(endSec - startSec, minVisibleDurationSec, sourceDuration);
+    const visibleStart = clamp(startSec, 0, Math.max(0, sourceDuration - visibleDuration));
+    const nextPxPerSec = viewportWidthPx / Math.max(visibleDuration, MIN_SOURCE_DURATION_SEC);
+    const nextZoom = clamp(nextPxPerSec / Math.max(fitPxPerSec, 0.001), 1, MAX_PX_PER_SEC / Math.max(fitPxPerSec, 0.001));
+    setZoom(nextZoom);
+    requestAnimationFrame(() => {
+      const currentPxPerSec = clamp(fitPxPerSec * nextZoom, fitPxPerSec, MAX_PX_PER_SEC);
+      const nextScrollLeft = visibleStart * currentPxPerSec;
+      scrollElement.scrollLeft = nextScrollLeft;
+      setScrollLeftPx(scrollElement.scrollLeft);
+    });
+  }, [fitPxPerSec, sourceDuration, viewportWidthPx]);
 
   const fitTimeline = useCallback(() => {
     setZoom(1);
     requestAnimationFrame(() => {
       if (scrollRef.current) {
         scrollRef.current.scrollLeft = 0;
+        setScrollLeftPx(0);
       }
     });
   }, []);
@@ -204,7 +244,7 @@ export function TimelinePane({
       if (!current) {
         return;
       }
-      const deltaSec = (moveEvent.clientX - current.startClientX) / Math.max(current.pxPerSec, MIN_PX_PER_SEC);
+      const deltaSec = (moveEvent.clientX - current.startClientX) / Math.max(current.pxPerSec, 0.001);
       const currentIndex = current.baseCuts.findIndex((item) => item.id === current.cutId);
       const previousCut = currentIndex > 0 ? current.baseCuts[currentIndex - 1] : null;
       const nextCut = currentIndex >= 0 && currentIndex < current.baseCuts.length - 1 ? current.baseCuts[currentIndex + 1] : null;
@@ -299,6 +339,65 @@ export function TimelinePane({
     zoomAt(zoom * (direction > 0 ? 1.18 : 1 / 1.18), event.clientX);
   }, [zoom, zoomAt]);
 
+  const handleTimelineScroll = useCallback(() => {
+    setScrollLeftPx(scrollRef.current?.scrollLeft ?? 0);
+  }, []);
+
+  const startNavigatorDrag = useCallback((mode: NavigatorDragState['mode'], event: ReactPointerEvent<HTMLElement>) => {
+    if (busy || clips.length === 0) {
+      return;
+    }
+    const overview = overviewRef.current;
+    if (!overview) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const nextState: NavigatorDragState = {
+      mode,
+      startClientX: event.clientX,
+      overviewWidthPx: Math.max(1, overview.clientWidth),
+      startVisibleStartSec: visibleStartSec,
+      startVisibleEndSec: visibleEndSec,
+    };
+    navigatorDragRef.current = nextState;
+    setNavigatorDragging(true);
+    globalThis.document.body.classList.add('timeline-navigating');
+
+    const move = (moveEvent: PointerEvent) => {
+      const current = navigatorDragRef.current;
+      if (!current) {
+        return;
+      }
+      const deltaSec = ((moveEvent.clientX - current.startClientX) / current.overviewWidthPx) * sourceDuration;
+      const currentDuration = current.startVisibleEndSec - current.startVisibleStartSec;
+      if (current.mode === 'move') {
+        const nextStartSec = clamp(current.startVisibleStartSec + deltaSec, 0, Math.max(0, sourceDuration - currentDuration));
+        setVisibleWindow(nextStartSec, nextStartSec + currentDuration);
+        return;
+      }
+      if (current.mode === 'start') {
+        const nextStartSec = clamp(current.startVisibleStartSec + deltaSec, 0, current.startVisibleEndSec - MIN_CUT_DURATION_SEC);
+        setVisibleWindow(nextStartSec, current.startVisibleEndSec);
+        return;
+      }
+      const nextEndSec = clamp(current.startVisibleEndSec + deltaSec, current.startVisibleStartSec + MIN_CUT_DURATION_SEC, sourceDuration);
+      setVisibleWindow(current.startVisibleStartSec, nextEndSec);
+    };
+    const end = () => {
+      navigatorDragRef.current = null;
+      setNavigatorDragging(false);
+      globalThis.document.body.classList.remove('timeline-navigating');
+      globalThis.window.removeEventListener('pointermove', move);
+      globalThis.window.removeEventListener('pointerup', end);
+      globalThis.window.removeEventListener('pointercancel', end);
+    };
+
+    globalThis.window.addEventListener('pointermove', move);
+    globalThis.window.addEventListener('pointerup', end, { once: true });
+    globalThis.window.addEventListener('pointercancel', end, { once: true });
+  }, [busy, clips.length, setVisibleWindow, sourceDuration, visibleEndSec, visibleStartSec]);
+
   return (
     <section className="timeline-pane panel">
       <div className="timeline-header">
@@ -313,32 +412,36 @@ export function TimelinePane({
             <Plus size={14} strokeWidth={1.8} aria-hidden="true" />
             <span>Add cut</span>
           </button>
-          <div className="timeline-zoom-controls" aria-label="Timeline zoom controls">
-            <button className="timeline-icon-button secondary" type="button" onClick={() => zoomAt(zoom / 1.35)} disabled={zoom <= 1.01} title="Zoom out">
-              <Minus size={14} strokeWidth={1.9} aria-hidden="true" />
-              <span className="sr-only">Zoom out</span>
-            </button>
-            <input
-              aria-label="Timeline zoom"
-              className="timeline-zoom-slider"
-              type="range"
-              min="1"
-              max="32"
-              step="0.1"
-              value={Math.min(32, zoom)}
-              onChange={(event) => zoomAt(Number(event.target.value))}
-            />
-            <button className="timeline-icon-button secondary" type="button" onClick={() => zoomAt(zoom * 1.35)} title="Zoom in">
-              <Plus size={14} strokeWidth={1.9} aria-hidden="true" />
-              <span className="sr-only">Zoom in</span>
-            </button>
-            <button className="timeline-icon-button secondary" type="button" onClick={fitTimeline} disabled={zoom <= 1.01} title="Fit timeline">
-              <Maximize2 size={14} strokeWidth={1.8} aria-hidden="true" />
-              <span className="sr-only">Fit timeline</span>
-            </button>
-          </div>
           <strong>{formatSeconds(currentTimeSec)}</strong>
           <span className="muted">{activePosition ? `Clip ${activePosition.clipIndex + 1}/${clips.length}` : 'No active clip'}</span>
+        </div>
+      </div>
+
+      <div className="timeline-navigator-row">
+        <button className="timeline-fit-button secondary" type="button" onClick={fitTimeline} disabled={zoom <= 1.01} title="Fit full timeline">
+          Fit
+        </button>
+        <div
+          ref={overviewRef}
+          className={navigatorDragging ? 'timeline-navigator navigating' : 'timeline-navigator'}
+          aria-label="Timeline zoom and pan navigator"
+        >
+          <div className="timeline-navigator-content">
+            {committedCutRanges.map((cut) => (
+              <span
+                key={cut.id}
+                className="timeline-navigator-cut"
+                style={{
+                  left: `${(cut.startSec / Math.max(sourceDuration, MIN_SOURCE_DURATION_SEC)) * 100}%`,
+                  width: `${((cut.endSec - cut.startSec) / Math.max(sourceDuration, MIN_SOURCE_DURATION_SEC)) * 100}%`,
+                }}
+              />
+            ))}
+          </div>
+          <div className="timeline-navigator-window" style={navigatorWindowStyle} onPointerDown={(event) => startNavigatorDrag('move', event)}>
+            <span className="timeline-navigator-handle start" onPointerDown={(event) => startNavigatorDrag('start', event)} />
+            <span className="timeline-navigator-handle end" onPointerDown={(event) => startNavigatorDrag('end', event)} />
+          </div>
         </div>
       </div>
 
@@ -347,6 +450,7 @@ export function TimelinePane({
         className={panning ? 'timeline-viewport panning' : 'timeline-viewport'}
         onPointerDown={startPan}
         onWheel={handleWheel}
+        onScroll={handleTimelineScroll}
         aria-label="Source timeline. Drag empty space to pan, use controls or Ctrl wheel to zoom."
       >
         {clips.length > 0 ? (
@@ -510,7 +614,7 @@ function timelineItemStyle(item: TimelineItem, pxPerSec: number): CSSProperties 
 }
 
 function buildRulerTicks(durationSec: number, pxPerSec: number): Array<{ timeSec: number; major: boolean }> {
-  const majorStepSec = chooseTickStep(90 / Math.max(pxPerSec, MIN_PX_PER_SEC));
+  const majorStepSec = chooseTickStep(90 / Math.max(pxPerSec, 0.001));
   const minorStepSec = majorStepSec / 5;
   const ticks: Array<{ timeSec: number; major: boolean }> = [];
   for (let timeSec = 0; timeSec <= durationSec + minorStepSec / 2; timeSec += minorStepSec) {

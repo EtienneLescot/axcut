@@ -1110,7 +1110,7 @@ body.resizing-timeline * {
 .timeline-viewport {
   flex: 1 1 auto;
   min-height: 84px;
-  margin-top: 0.34rem;
+  margin-top: 0.28rem;
   border: 1px solid rgba(148, 163, 184, 0.12);
   background: rgba(5, 8, 15, 0.78);
   overflow-x: auto;
@@ -1351,6 +1351,12 @@ body.timeline-panning * {
   user-select: none;
 }
 
+body.timeline-navigating,
+body.timeline-navigating * {
+  cursor: grabbing !important;
+  user-select: none;
+}
+
 .timeline-empty {
   display: grid;
   place-items: center;
@@ -1383,28 +1389,101 @@ body.timeline-panning * {
   font-size: 0.76rem;
 }
 
-.timeline-zoom-controls {
-  display: inline-flex;
+.timeline-navigator-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
-  gap: 0.24rem;
-  padding: 0.16rem;
-  border: 1px solid rgba(148, 163, 184, 0.14);
-  border-radius: 8px;
-  background: rgba(15, 23, 42, 0.38);
+  gap: 0.5rem;
+  min-height: 1.65rem;
 }
 
-.timeline-icon-button {
-  width: 1.7rem;
-  height: 1.7rem;
-  min-width: 0;
-  min-height: 0;
-  padding: 0;
+.timeline-fit-button {
+  height: 1.55rem;
+  min-height: 1.55rem;
+  padding: 0 0.48rem;
   border-radius: 6px;
+  font-size: 0.72rem;
 }
 
-.timeline-zoom-slider {
-  width: 5.5rem;
-  accent-color: #60a5fa;
+.timeline-navigator {
+  position: relative;
+  height: 1.15rem;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.54);
+  overflow: hidden;
+}
+
+.timeline-navigator-content {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, rgba(37, 99, 235, 0.42), rgba(13, 148, 136, 0.42));
+}
+
+.timeline-navigator-cut {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 1px;
+  background:
+    repeating-linear-gradient(135deg, rgba(251, 113, 133, 0.4) 0 5px, rgba(251, 113, 133, 0.2) 5px 10px),
+    rgba(51, 65, 85, 0.72);
+}
+
+.timeline-navigator-window {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  min-width: 1.8rem;
+  border: 2px solid rgba(219, 234, 254, 0.92);
+  border-radius: 999px;
+  background: rgba(96, 165, 250, 0.16);
+  box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.8), inset 0 0 0 1px rgba(15, 23, 42, 0.4);
+  cursor: grab;
+}
+
+.timeline-navigator.navigating .timeline-navigator-window,
+.timeline-navigator-window:active {
+  cursor: grabbing;
+}
+
+.timeline-navigator-handle {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 0.75rem;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.timeline-navigator-handle::after {
+  content: "";
+  position: absolute;
+  top: 27%;
+  bottom: 27%;
+  width: 2px;
+  border-radius: 999px;
+  background: rgba(219, 234, 254, 0.9);
+}
+
+.timeline-navigator-handle.start {
+  left: -2px;
+}
+
+.timeline-navigator-handle.start::after {
+  left: 0.28rem;
+}
+
+.timeline-navigator-handle.end {
+  right: -2px;
+}
+
+.timeline-navigator-handle.end::after {
+  right: 0.28rem;
+}
+
+.timeline-navigator-handle:hover::after {
+  background: #ffffff;
 }
 
 .modal-backdrop {
