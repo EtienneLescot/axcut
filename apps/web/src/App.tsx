@@ -36,9 +36,9 @@ import {
 } from 'lucide-react';
 import type { LucideIcon, LucideProps } from 'lucide-react';
 
+import { CurrentTranscriptView } from './components/CurrentTranscriptView.js';
 import { TimelinePane } from './components/TimelinePane.js';
 import { VirtualPreview } from './components/VirtualPreview.js';
-import { deriveEditableTranscriptUpdate } from './lib/editable-transcript.js';
 import { emptyLiveRunState, reduceLiveRunState, type LiveOperation, type LiveRunState, type ProjectStreamEvent } from './lib/live-run.js';
 
 type ProjectSummary = {
@@ -424,34 +424,6 @@ function parseJobResult(job?: JobSummary | null): Record<string, unknown> | null
   }
 }
 
-function formatTimestamp(seconds: number): string {
-  const safe = Math.max(0, seconds);
-  const minutes = Math.floor(safe / 60);
-  const wholeSeconds = Math.floor(safe % 60);
-  const tenths = Math.floor((safe % 1) * 10);
-  return `${minutes}:${String(wholeSeconds).padStart(2, '0')}.${tenths}`;
-}
-
-function buildEditedTranscript(document: AxcutDocument): string {
-  const transcript = document.transcript;
-  if (!transcript) {
-    return 'No transcript is available yet.';
-  }
-  if (document.timeline.clips.length === 0) {
-    return 'No edited timeline is available yet.';
-  }
-
-  const lines: string[] = [];
-  for (const [index, clip] of document.timeline.clips.entries()) {
-    const words = transcript.words.filter((word) => word.endSec > clip.sourceStartSec && word.startSec < clip.sourceEndSec);
-    const text = words.map((word) => word.text).join(' ').replace(/\s+/g, ' ').trim();
-    lines.push(`# Clip ${index + 1}: source ${formatTimestamp(clip.sourceStartSec)}-${formatTimestamp(clip.sourceEndSec)} -> timeline ${formatTimestamp(clip.timelineStartSec)}-${formatTimestamp(clip.timelineEndSec)}`);
-    lines.push(text || '[No spoken words in this clip]');
-    lines.push('');
-  }
-  return lines.join('\n').trimEnd();
-}
-
 function buildOptimisticTimelineDocument(
   document: AxcutDocument,
   intervals: Array<{ startSec: number; endSec: number }>,
@@ -735,8 +707,6 @@ export function App() {
   const [loadVideoOpen, setLoadVideoOpen] = useState(false);
   const [transcriptModal, setTranscriptModal] = useState<'source' | null>(null);
   const [transcriptLanguage, setTranscriptLanguage] = useState<TranscriptLanguageSelection>('auto');
-  const [transcriptDraft, setTranscriptDraft] = useState('');
-  const [transcriptDraftFocused, setTranscriptDraftFocused] = useState(false);
   const [virtualTimeSec, setVirtualTimeSec] = useState(0);
   const [seekTarget, setSeekTarget] = useState<{ timeSec: number; requestId: number } | null>(null);
   const [sourcePreviewTarget, setSourcePreviewTarget] = useState<{ sourceTimeSec: number; requestId: number } | null>(null);
@@ -752,7 +722,6 @@ export function App() {
   const providerButtonRef = useRef<HTMLButtonElement | null>(null);
   const reasoningButtonRef = useRef<HTMLButtonElement | null>(null);
   const pendingTimelineEditRef = useRef<PendingTimelineEdit | null>(null);
-  const pendingTranscriptDraftRef = useRef<{ draft: string; resetOnNoop: boolean } | null>(null);
 
   const layoutStyle = useMemo(() => ({
     '--chat-panel-width': `${chatPanelWidth}px`,
@@ -1351,7 +1320,6 @@ export function App() {
     queryKey: ['source-transcript', projectId, sourceTranscriptName],
     queryFn: () => requestText(`/api/projects/${projectId}/artifacts/${encodeURIComponent(sourceTranscriptName!)}?token=${encodeURIComponent(sessionToken!)}`),
   });
-  const editedTranscript = useMemo(() => document ? buildEditedTranscript(document) : 'No project is loaded.', [document]);
   const sttStatus = getSttStatus(document, snapshot?.jobs);
   const sourceTranscriptError = transcriptModal === 'source'
     ? sourceTranscriptQuery.error instanceof Error
@@ -1360,58 +1328,6 @@ export function App() {
         ? regenerateTranscript.error.message
         : null
     : null;
-
-  useEffect(() => {
-    if (!transcriptDraftFocused) {
-      setTranscriptDraft(editedTranscript);
-    }
-  }, [editedTranscript, transcriptDraftFocused]);
-
-  const commitTranscriptDraftValue = useCallback((draft: string, options?: { resetOnNoop?: boolean }) => {
-    if (!document || draft === editedTranscript) {
-      return;
-    }
-    if (replaceTimeline.isPending) {
-      pendingTranscriptDraftRef.current = { draft, resetOnNoop: Boolean(options?.resetOnNoop) };
-      return;
-    }
-    const update = deriveEditableTranscriptUpdate(document, draft);
-    if (!update) {
-      if (options?.resetOnNoop) {
-        setTranscriptDraft(editedTranscript);
-      }
-      return;
-    }
-    pendingTranscriptDraftRef.current = null;
-    queueReplaceTimeline(
-      update.intervals,
-      `Edited current transcription and removed ${update.deletedWordIds.length} word${update.deletedWordIds.length === 1 ? '' : 's'}.`,
-    );
-  }, [document, editedTranscript, queueReplaceTimeline, replaceTimeline.isPending]);
-
-  useEffect(() => {
-    if (!transcriptDraftFocused || replaceTimeline.isPending || transcriptDraft === editedTranscript) {
-      return undefined;
-    }
-    const timeoutId = window.setTimeout(() => {
-      commitTranscriptDraftValue(transcriptDraft);
-    }, 250);
-    return () => window.clearTimeout(timeoutId);
-  }, [commitTranscriptDraftValue, editedTranscript, replaceTimeline.isPending, transcriptDraft, transcriptDraftFocused]);
-
-  useEffect(() => {
-    if (replaceTimeline.isPending || !pendingTranscriptDraftRef.current) {
-      return;
-    }
-    const pending = pendingTranscriptDraftRef.current;
-    pendingTranscriptDraftRef.current = null;
-    commitTranscriptDraftValue(pending.draft, { resetOnNoop: pending.resetOnNoop });
-  }, [commitTranscriptDraftValue, replaceTimeline.isPending]);
-
-  const commitTranscriptDraft = useCallback(() => {
-    setTranscriptDraftFocused(false);
-    commitTranscriptDraftValue(transcriptDraft, { resetOnNoop: true });
-  }, [commitTranscriptDraftValue, transcriptDraft]);
 
   return (
     <div className={appShellClassName} style={layoutStyle}>
@@ -1706,28 +1622,14 @@ export function App() {
         <div className="transcript-panel-header">
           <div>
             <h2>Current Transcription</h2>
-            <p className="muted">Timeline text from the active cut.</p>
+            <p className="muted">Projection of the current DSL result.</p>
           </div>
         </div>
-        <textarea
-          className="transcript-viewer transcription-panel-content"
-          value={document?.transcript ? transcriptDraft : 'No transcript is available yet.'}
-          disabled={!document?.transcript}
-          spellCheck={false}
-          onFocus={() => setTranscriptDraftFocused(true)}
-          onChange={(event) => {
-            const nextDraft = event.target.value;
-            setTranscriptDraft(nextDraft);
-            if (replaceTimeline.isPending) {
-              pendingTranscriptDraftRef.current = { draft: nextDraft, resetOnNoop: false };
-            }
-          }}
-          onBlur={commitTranscriptDraft}
-          onKeyDown={(event) => {
-            if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-              event.currentTarget.blur();
-            }
-          }}
+        <CurrentTranscriptView
+          document={document ?? null}
+          busy={!activeSessionId || sendChat.isPending || replaceTimeline.isPending}
+          sourceDurationSec={primaryAsset?.durationSec ?? 0}
+          onReplaceTimeline={queueReplaceTimeline}
         />
       </aside>
 
