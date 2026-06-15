@@ -78,3 +78,23 @@ test('AgentSessionService restores checkpoint metadata and payload state', async
   await service.deleteCheckpoint('session_1', checkpoint.id);
   assert.deepEqual(service.listCheckpointsSync('session_1'), []);
 });
+
+test('AgentSessionService preserves restored runtime checkpoint until explicitly cleared', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'axcut-session-runtime-'));
+  const service = new AgentSessionService(root);
+  service.ensure('session_1', { title: 'Runtime session', scope: { kind: 'axcut-project', key: 'proj_1' } });
+
+  const checkpoint = await service.saveCheckpoint('session_1', {
+    label: 'Runtime checkpoint',
+    reason: 'manual',
+    runtimeCheckpointId: 'runtime_checkpoint_1',
+  });
+  const restored = await service.restoreCheckpoint('session_1', checkpoint.id);
+  assert.equal(restored.langGraphRestored, true);
+
+  assert.equal(service.buildSessionConfig('session_1').configurable?.checkpoint_id, 'runtime_checkpoint_1');
+  assert.equal(service.buildSessionConfig('session_1').configurable?.checkpoint_id, 'runtime_checkpoint_1');
+
+  service.clearRestoredRuntimeCheckpoint('session_1');
+  assert.equal(service.buildSessionConfig('session_1').configurable?.checkpoint_id, undefined);
+});

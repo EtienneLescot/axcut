@@ -34,7 +34,11 @@ export class WorktreeService {
         maxBuffer: 1024 * 1024,
       });
       return this.parseWorktreePorcelain(stdout);
-    } catch {
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '';
+      if (!message.includes('not a git repository')) {
+        console.warn('Failed to list worktrees:', error);
+      }
       return [];
     }
   }

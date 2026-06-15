@@ -9,6 +9,7 @@ import { ZodError } from 'zod';
 
 import { streamFile } from './lib/media-stream.js';
 import { databasePath, dataRoot, projectArtifactsRoot, repoRoot, runtimeRoot } from './lib/paths.js';
+import type { SessionCheckpointMetadata } from './services/agent-session-service.js';
 import { AxcutAgentRuntime } from './services/axcut-agent-runtime.js';
 import { ChatService } from './services/chat-service.js';
 import { DatabaseService } from './services/database.js';
@@ -86,6 +87,19 @@ function resolveActiveWorktree(worktrees: WorktreeInfo[], sessionId: string): Wo
   return activePath ? worktrees.find((worktree) => path.resolve(worktree.path) === path.resolve(activePath)) : undefined;
 }
 
+function summarizeCheckpoint(checkpoint: SessionCheckpointMetadata): Omit<SessionCheckpointMetadata, 'payloadState' | 'runtimeCheckpointId'> {
+  return {
+    id: checkpoint.id,
+    sessionId: checkpoint.sessionId,
+    createdAt: checkpoint.createdAt,
+    messageCount: checkpoint.messageCount,
+    summary: checkpoint.summary,
+    reason: checkpoint.reason,
+    label: checkpoint.label,
+    restoredAt: checkpoint.restoredAt,
+  };
+}
+
 export async function createServer() {
   const fastify = Fastify({ logger: true });
   await fastify.register(cors, {
@@ -146,7 +160,7 @@ export async function createServer() {
       ...documents.getSnapshot(projectId, activeSession.id),
       activeSessionId: activeSession.id,
       sessions: buildSessionSummary(projectId, activeSession.id),
-      checkpoints: agentRuntime.listCheckpoints(projectId, activeSession.id),
+      checkpoints: agentRuntime.listCheckpoints(projectId, activeSession.id).map(summarizeCheckpoint),
       contextUsage: agentRuntime.getContextUsage(projectId, activeSession.id),
       activeWorktree: resolveActiveWorktree(availableWorktrees, activeSession.id),
       availableWorktrees,
@@ -457,9 +471,6 @@ export async function createServer() {
       checkpointId: checkpoint?.id ?? null,
     }) : null;
     events.emit(projectId, 'project.revision.created', { revisionId: result.revisionId });
-    if (message) {
-      events.emit(projectId, 'agent.message.user', { sessionId: session!.id, messageId: message.id, content: message.content });
-    }
     return { ...result, message };
   });
 

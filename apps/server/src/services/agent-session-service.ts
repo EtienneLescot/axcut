@@ -165,17 +165,22 @@ export class AgentSessionService {
   buildSessionConfig(sessionId: string): RunnableConfig {
     const record = this.get(sessionId);
     const checkpointId = record?.restoredRuntimeCheckpointId;
-    if (record && checkpointId) {
-      const { restoredRuntimeCheckpointId: _unused, ...next } = record;
-      void _unused;
-      this.writeRecord({ ...next, updatedAt: new Date().toISOString() });
-    }
     return {
       configurable: {
         thread_id: sessionId,
         ...(checkpointId ? { checkpoint_id: checkpointId } : {}),
       },
     };
+  }
+
+  clearRestoredRuntimeCheckpoint(sessionId: string): void {
+    const record = this.get(sessionId);
+    if (!record?.restoredRuntimeCheckpointId) {
+      return;
+    }
+    const { restoredRuntimeCheckpointId: _unused, ...next } = record;
+    void _unused;
+    this.writeRecord({ ...next, updatedAt: new Date().toISOString() });
   }
 
   async saveCheckpoint(sessionId: string, options: SaveCheckpointOptions = {}): Promise<SessionCheckpointMetadata> {
@@ -216,7 +221,7 @@ export class AgentSessionService {
     }
     const warnings: string[] = [];
     const restoredAt = new Date().toISOString();
-    if (!checkpoint?.runtimeCheckpointId) {
+    if (!checkpoint.runtimeCheckpointId) {
       warnings.push('This checkpoint does not include a runtime checkpoint.');
     } else {
       const record = this.ensure(sessionId);

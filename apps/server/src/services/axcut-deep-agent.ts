@@ -548,6 +548,7 @@ export class AxcutDeepAgentService {
       messages: hasCheckpoint ? [new HumanMessage(invocationPrompt)] : buildAgentInputMessages(prompt, history, invocationPrompt),
     };
     const config = this.sessions.buildSessionConfig(sessionId);
+    this.sessions.clearRestoredRuntimeCheckpoint(sessionId);
     let result: unknown = null;
     let streamedResponse = '';
     let thinkingOperationId = '';
@@ -678,12 +679,12 @@ export class AxcutDeepAgentService {
     }
 
     const latest = this.sessions.listCheckpointsSync(sessionId)[0];
-    if (!latest) {
+    if (!latest?.runtimeCheckpointId) {
       return false;
     }
 
-    await this.sessions.restoreCheckpoint(sessionId, latest.id);
-    return true;
+    const restored = await this.sessions.restoreCheckpoint(sessionId, latest.id);
+    return restored.langGraphRestored;
   }
 
   private projectScope(projectId: string) {
