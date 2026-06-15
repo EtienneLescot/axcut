@@ -17,6 +17,9 @@ import {
   History,
   LogIn,
   MessageSquarePlus,
+  PanelBottom,
+  PanelLeft,
+  PanelRight,
   Pencil,
   Plus,
   Plug,
@@ -31,10 +34,11 @@ import {
   Wrench,
   X,
 } from 'lucide-react';
-import type { LucideIcon } from 'lucide-react';
+import type { LucideIcon, LucideProps } from 'lucide-react';
 
 import { TimelinePane } from './components/TimelinePane.js';
 import { VirtualPreview } from './components/VirtualPreview.js';
+import { deriveEditableTranscriptUpdate } from './lib/editable-transcript.js';
 import { emptyLiveRunState, reduceLiveRunState, type LiveOperation, type LiveRunState, type ProjectStreamEvent } from './lib/live-run.js';
 
 type ProjectSummary = {
@@ -185,8 +189,13 @@ const providerUserDescriptions: Record<string, string> = {
 
 const CHAT_WIDTH_STORAGE_KEY = 'axcut.workbench.chatWidthPx';
 const TIMELINE_HEIGHT_STORAGE_KEY = 'axcut.workbench.timelineHeightPx';
+const TRANSCRIPT_WIDTH_STORAGE_KEY = 'axcut.workbench.transcriptWidthPx';
+const CHAT_OPEN_STORAGE_KEY = 'axcut.workbench.chatOpen';
+const TIMELINE_OPEN_STORAGE_KEY = 'axcut.workbench.timelineOpen';
+const TRANSCRIPT_OPEN_STORAGE_KEY = 'axcut.workbench.transcriptOpen';
 const DEFAULT_CHAT_WIDTH = 610;
 const DEFAULT_TIMELINE_HEIGHT = 170;
+const DEFAULT_TRANSCRIPT_WIDTH = 360;
 
 function readStoredNumber(key: string, fallback: number): number {
   if (typeof window === 'undefined') {
@@ -194,6 +203,26 @@ function readStoredNumber(key: string, fallback: number): number {
   }
   const value = Number(window.localStorage.getItem(key));
   return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function readStoredBoolean(key: string, fallback: boolean): boolean {
+  if (typeof window === 'undefined') {
+    return fallback;
+  }
+  const value = window.localStorage.getItem(key);
+  if (value === 'true') {
+    return true;
+  }
+  if (value === 'false') {
+    return false;
+  }
+  return fallback;
+}
+
+function writeStoredBoolean(key: string, value: boolean): void {
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(key, String(value));
+  }
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -247,8 +276,10 @@ const transcriptLanguageOptions = [
 
 type TranscriptLanguageSelection = typeof transcriptLanguageOptions[number]['value'];
 
+type AppIcon = LucideIcon | ((props: LucideProps) => ReactNode);
+
 type IconButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
-  icon: LucideIcon;
+  icon: AppIcon;
   label: string;
   children?: ReactNode;
 };
@@ -264,6 +295,33 @@ function IconButton({ icon: Icon, label, className, children, ...props }: IconBu
       <Icon size={16} strokeWidth={1.8} aria-hidden="true" />
       {children ? <span className="button-text">{children}</span> : <span className="sr-only">{label}</span>}
     </button>
+  );
+}
+
+function ClosedPanelLeftIcon({ size = 16, strokeWidth = 1.8, ...props }: LucideProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M9 7v10" />
+    </svg>
+  );
+}
+
+function ClosedPanelRightIcon({ size = 16, strokeWidth = 1.8, ...props }: LucideProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M15 7v10" />
+    </svg>
+  );
+}
+
+function ClosedPanelBottomIcon({ size = 16, strokeWidth = 1.8, ...props }: LucideProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M7 15h10" />
+    </svg>
   );
 }
 
@@ -675,15 +733,21 @@ export function App() {
   const [reasoningAnchor, setReasoningAnchor] = useState<PopoverAnchor | null>(null);
   const [rewindConfirmation, setRewindConfirmation] = useState<{ messageId: string; anchor: PopoverAnchor } | null>(null);
   const [loadVideoOpen, setLoadVideoOpen] = useState(false);
-  const [transcriptModal, setTranscriptModal] = useState<'source' | 'edited' | null>(null);
+  const [transcriptModal, setTranscriptModal] = useState<'source' | null>(null);
   const [transcriptLanguage, setTranscriptLanguage] = useState<TranscriptLanguageSelection>('auto');
+  const [transcriptDraft, setTranscriptDraft] = useState('');
+  const [transcriptDraftFocused, setTranscriptDraftFocused] = useState(false);
   const [virtualTimeSec, setVirtualTimeSec] = useState(0);
   const [seekTarget, setSeekTarget] = useState<{ timeSec: number; requestId: number } | null>(null);
   const [sourcePreviewTarget, setSourcePreviewTarget] = useState<{ sourceTimeSec: number; requestId: number } | null>(null);
   const [liveRun, setLiveRun] = useState<LiveRunState>(emptyLiveRunState);
   const [autoScrollMessages, setAutoScrollMessages] = useState(true);
+  const [chatPanelOpen, setChatPanelOpen] = useState(() => readStoredBoolean(CHAT_OPEN_STORAGE_KEY, true));
+  const [timelinePanelOpen, setTimelinePanelOpen] = useState(() => readStoredBoolean(TIMELINE_OPEN_STORAGE_KEY, true));
+  const [transcriptPanelOpen, setTranscriptPanelOpen] = useState(() => readStoredBoolean(TRANSCRIPT_OPEN_STORAGE_KEY, true));
   const [chatPanelWidth, setChatPanelWidth] = useState(() => readStoredNumber(CHAT_WIDTH_STORAGE_KEY, DEFAULT_CHAT_WIDTH));
   const [timelinePanelHeight, setTimelinePanelHeight] = useState(() => readStoredNumber(TIMELINE_HEIGHT_STORAGE_KEY, DEFAULT_TIMELINE_HEIGHT));
+  const [transcriptPanelWidth, setTranscriptPanelWidth] = useState(() => readStoredNumber(TRANSCRIPT_WIDTH_STORAGE_KEY, DEFAULT_TRANSCRIPT_WIDTH));
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const providerButtonRef = useRef<HTMLButtonElement | null>(null);
   const reasoningButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -692,10 +756,17 @@ export function App() {
   const layoutStyle = useMemo(() => ({
     '--chat-panel-width': `${chatPanelWidth}px`,
     '--timeline-panel-height': `${timelinePanelHeight}px`,
-  }) as CSSProperties, [chatPanelWidth, timelinePanelHeight]);
+    '--transcript-panel-width': `${transcriptPanelWidth}px`,
+  }) as CSSProperties, [chatPanelWidth, timelinePanelHeight, transcriptPanelWidth]);
+  const appShellClassName = [
+    'app-shell',
+    chatPanelOpen ? '' : 'chat-collapsed',
+    timelinePanelOpen ? '' : 'timeline-collapsed',
+    transcriptPanelOpen ? '' : 'transcript-collapsed',
+  ].filter(Boolean).join(' ');
 
   const startChatResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (window.innerWidth <= 980) {
+    if (!chatPanelOpen || window.innerWidth <= 980) {
       return;
     }
     event.preventDefault();
@@ -706,7 +777,8 @@ export function App() {
     const rect = shell.getBoundingClientRect();
     let nextWidth = chatPanelWidth;
     const update = (clientX: number) => {
-      const maxWidth = Math.max(320, rect.width - 430);
+      const transcriptReserve = transcriptPanelOpen ? transcriptPanelWidth + 8 : 0;
+      const maxWidth = Math.max(320, rect.width - transcriptReserve - 430);
       nextWidth = Math.round(clamp(clientX - rect.left, 320, maxWidth));
       setChatPanelWidth(nextWidth);
     };
@@ -721,10 +793,10 @@ export function App() {
     update(event.clientX);
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp, { once: true });
-  }, [chatPanelWidth]);
+  }, [chatPanelOpen, chatPanelWidth, transcriptPanelOpen, transcriptPanelWidth]);
 
   const startTimelineResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (window.innerWidth <= 980) {
+    if (!timelinePanelOpen || window.innerWidth <= 980) {
       return;
     }
     event.preventDefault();
@@ -750,7 +822,37 @@ export function App() {
     update(event.clientY);
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp, { once: true });
-  }, [timelinePanelHeight]);
+  }, [timelinePanelHeight, timelinePanelOpen]);
+
+  const startTranscriptResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!transcriptPanelOpen || window.innerWidth <= 980) {
+      return;
+    }
+    event.preventDefault();
+    const shell = event.currentTarget.closest<HTMLElement>('.app-shell');
+    if (!shell) {
+      return;
+    }
+    const rect = shell.getBoundingClientRect();
+    let nextWidth = transcriptPanelWidth;
+    const update = (clientX: number) => {
+      const chatReserve = chatPanelOpen ? chatPanelWidth + 8 : 0;
+      const maxWidth = Math.max(280, rect.width - chatReserve - 430);
+      nextWidth = Math.round(clamp(rect.right - clientX, 280, maxWidth));
+      setTranscriptPanelWidth(nextWidth);
+    };
+    const onMove = (moveEvent: PointerEvent) => update(moveEvent.clientX);
+    const onUp = () => {
+      window.localStorage.setItem(TRANSCRIPT_WIDTH_STORAGE_KEY, String(nextWidth));
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      globalThis.document.body.classList.remove('resizing-transcript');
+    };
+    globalThis.document.body.classList.add('resizing-transcript');
+    update(event.clientX);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp, { once: true });
+  }, [chatPanelOpen, chatPanelWidth, transcriptPanelOpen, transcriptPanelWidth]);
 
   const sessionQuery = useQuery({
     queryKey: ['session'],
@@ -1258,8 +1360,63 @@ export function App() {
         : null
     : null;
 
+  useEffect(() => {
+    if (!transcriptDraftFocused) {
+      setTranscriptDraft(editedTranscript);
+    }
+  }, [editedTranscript, transcriptDraftFocused]);
+
+  const commitTranscriptDraft = useCallback(() => {
+    setTranscriptDraftFocused(false);
+    if (!document || transcriptDraft === editedTranscript || replaceTimeline.isPending) {
+      return;
+    }
+    const update = deriveEditableTranscriptUpdate(document, transcriptDraft);
+    if (!update) {
+      setTranscriptDraft(editedTranscript);
+      return;
+    }
+    queueReplaceTimeline(
+      update.intervals,
+      `Edited current transcription and removed ${update.deletedWordIds.length} word${update.deletedWordIds.length === 1 ? '' : 's'}.`,
+    );
+  }, [document, editedTranscript, queueReplaceTimeline, replaceTimeline.isPending, transcriptDraft]);
+
   return (
-    <div className="app-shell" style={layoutStyle}>
+    <div className={appShellClassName} style={layoutStyle}>
+      <IconButton
+        icon={chatPanelOpen ? PanelLeft : ClosedPanelLeftIcon}
+        label={chatPanelOpen ? 'Hide chat panel' : 'Show chat panel'}
+        className="panel-toggle chat-panel-toggle"
+        aria-pressed={chatPanelOpen}
+        onClick={() => setChatPanelOpen((open) => {
+          const nextOpen = !open;
+          writeStoredBoolean(CHAT_OPEN_STORAGE_KEY, nextOpen);
+          return nextOpen;
+        })}
+      />
+      <IconButton
+        icon={transcriptPanelOpen ? PanelRight : ClosedPanelRightIcon}
+        label={transcriptPanelOpen ? 'Hide transcription panel' : 'Show transcription panel'}
+        className="panel-toggle transcript-panel-toggle"
+        aria-pressed={transcriptPanelOpen}
+        onClick={() => setTranscriptPanelOpen((open) => {
+          const nextOpen = !open;
+          writeStoredBoolean(TRANSCRIPT_OPEN_STORAGE_KEY, nextOpen);
+          return nextOpen;
+        })}
+      />
+      <IconButton
+        icon={timelinePanelOpen ? PanelBottom : ClosedPanelBottomIcon}
+        label={timelinePanelOpen ? 'Hide timeline panel' : 'Show timeline panel'}
+        className="panel-toggle timeline-panel-toggle"
+        aria-pressed={timelinePanelOpen}
+        onClick={() => setTimelinePanelOpen((open) => {
+          const nextOpen = !open;
+          writeStoredBoolean(TIMELINE_OPEN_STORAGE_KEY, nextOpen);
+          return nextOpen;
+        })}
+      />
       <aside className="left-rail panel">
         <header className="chat-header">
           <div className="chat-title-block">
@@ -1488,7 +1645,6 @@ export function App() {
               <IconButton icon={FolderOpen} label="Load video" className="secondary" onClick={() => setLoadVideoOpen(true)} />
             </div>
             <IconButton icon={FileText} label="Source transcript" className="secondary" onClick={() => setTranscriptModal('source')} disabled={!sourceTranscriptName} />
-            <IconButton icon={Eye} label="Timeline transcript" className="secondary" onClick={() => setTranscriptModal('edited')} disabled={!document?.transcript} />
             <IconButton icon={Download} label={exportBusy ? 'Exporting' : 'Export'} onClick={() => exportVideo.mutate()} disabled={!document?.timeline.clips.length || !sessionToken || exportBusy} />
           </div>
         </div>
@@ -1506,6 +1662,37 @@ export function App() {
           <div className="video placeholder">No video configured.</div>
         )}
       </main>
+
+      <div
+        className="transcript-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize transcription panel"
+        onPointerDown={startTranscriptResize}
+      />
+
+      <aside className="transcript-rail panel">
+        <div className="transcript-panel-header">
+          <div>
+            <h2>Current Transcription</h2>
+            <p className="muted">Timeline text from the active cut.</p>
+          </div>
+        </div>
+        <textarea
+          className="transcript-viewer transcription-panel-content"
+          value={document?.transcript ? transcriptDraft : 'No transcript is available yet.'}
+          disabled={!document?.transcript || replaceTimeline.isPending}
+          spellCheck={false}
+          onFocus={() => setTranscriptDraftFocused(true)}
+          onChange={(event) => setTranscriptDraft(event.target.value)}
+          onBlur={commitTranscriptDraft}
+          onKeyDown={(event) => {
+            if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+              event.currentTarget.blur();
+            }
+          }}
+        />
+      </aside>
 
       <div
         className="timeline-resizer"
@@ -1576,22 +1763,18 @@ export function App() {
 
       {transcriptModal ? (
         <TranscriptDialog
-          title={transcriptModal === 'source' ? 'Source Transcript' : 'Timeline Transcript'}
-          subtitle={transcriptModal === 'source'
-            ? sourceTranscriptName ?? 'No transcript artifact available yet.'
-            : 'Reconstructed from the current timeline clips using source word timestamps.'}
-          content={transcriptModal === 'source'
-            ? sourceTranscriptQuery.data ?? ''
-            : editedTranscript}
-          loading={transcriptModal === 'source' && sourceTranscriptQuery.isLoading}
+          title="Source Transcript"
+          subtitle={sourceTranscriptName ?? 'No transcript artifact available yet.'}
+          content={sourceTranscriptQuery.data ?? ''}
+          loading={sourceTranscriptQuery.isLoading}
           error={sourceTranscriptError}
-          detectedLanguage={transcriptModal === 'source' ? document?.transcript?.language : undefined}
+          detectedLanguage={document?.transcript?.language}
           language={transcriptLanguage}
           languageOptions={transcriptLanguageOptions}
-          regenerateLabel={transcriptModal === 'source' ? 'Regenerate transcript' : undefined}
+          regenerateLabel="Regenerate transcript"
           regenerating={regenerateTranscript.isPending}
           onLanguageChange={setTranscriptLanguage}
-          onRegenerate={transcriptModal === 'source' ? () => regenerateTranscript.mutate() : undefined}
+          onRegenerate={() => regenerateTranscript.mutate()}
           onClose={() => setTranscriptModal(null)}
         />
       ) : null}

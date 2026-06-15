@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { AxcutClip } from '@axcut/schema';
 import { Pause, Play, RotateCcw } from 'lucide-react';
 
-import { clampVirtualTime, formatSeconds, locateSourcePosition, locateVirtualPosition, totalVirtualDuration } from '../lib/virtual-preview.js';
+import { clampVirtualTime, formatSeconds, locateVirtualPosition, resolvePlaybackPosition, totalVirtualDuration } from '../lib/virtual-preview.js';
 
 type VirtualPreviewProps = {
   videoSources: Array<{ src: string; label: string }>;
@@ -12,6 +12,8 @@ type VirtualPreviewProps = {
   sourcePreviewTarget?: { sourceTimeSec: number; requestId: number } | null;
   onTimeChange?: (timeSec: number) => void;
 };
+
+const CLIP_END_LOOKAHEAD_SEC = 0.04;
 
 export function VirtualPreview({ videoSources, clips, revision, seekTarget, sourcePreviewTarget, onTimeChange }: VirtualPreviewProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -52,7 +54,7 @@ export function VirtualPreview({ videoSources, clips, revision, seekTarget, sour
 
   const handlePlayPause = useCallback(() => {
     const video = videoRef.current;
-    if (!video || clips.length === 0) {
+    if (!video || clips.length === 0 || virtualDurationSec <= 0) {
       return;
     }
     if (!video.paused) {
@@ -60,7 +62,8 @@ export function VirtualPreview({ videoSources, clips, revision, seekTarget, sour
       setIsPlaying(false);
       return;
     }
-    const position = locateVirtualPosition(clips, virtualTimeSec) ?? locateVirtualPosition(clips, 0);
+    const playbackStartSec = virtualTimeSec >= virtualDurationSec - 0.01 ? 0 : virtualTimeSec;
+    const position = locateVirtualPosition(clips, playbackStartSec) ?? locateVirtualPosition(clips, 0);
     if (!position) {
       return;
     }
@@ -74,9 +77,9 @@ export function VirtualPreview({ videoSources, clips, revision, seekTarget, sour
     }).catch(() => {
       setIsPlaying(false);
     });
-  }, [clips, updateVirtualTime, virtualTimeSec]);
+  }, [clips, updateVirtualTime, virtualDurationSec, virtualTimeSec]);
 
-  const handleTimeUpdate = useCallback(() => {
+  const syncPlaybackPosition = useCallback(() => {
     const video = videoRef.current;
     if (!video || clips.length === 0) {
       return;
@@ -85,21 +88,34 @@ export function VirtualPreview({ videoSources, clips, revision, seekTarget, sour
       isProgrammaticSeekRef.current = false;
     }
 
-    const position = locateSourcePosition(clips, video.currentTime);
-    if (!position) {
-      const nextClip = clips.find((clip) => clip.sourceStartSec > video.currentTime);
-      if (nextClip) {
-        seekToVirtualTime(nextClip.timelineStartSec, true);
+    const playbackPosition = resolvePlaybackPosition(clips, video.currentTime);
+    if (playbackPosition.kind === 'empty') {
+      return;
+    }
+    if (playbackPosition.kind === 'next') {
+      seekToVirtualTime(playbackPosition.position.virtualTimeSec, true);
+      return;
+    }
+    if (playbackPosition.kind === 'ended') {
+      video.pause();
+      if (Math.abs(video.currentTime - playbackPosition.position.sourceTimeSec) > 0.01) {
+        video.currentTime = playbackPosition.position.sourceTimeSec;
       }
+      updateVirtualTime(virtualDurationSec);
+      setIsPlaying(false);
       return;
     }
 
+    const position = playbackPosition.position;
     const currentClip = position.clip;
-    const reachedClipEnd = video.currentTime >= currentClip.sourceEndSec - 0.04;
+    const reachedClipEnd = video.currentTime >= currentClip.sourceEndSec - CLIP_END_LOOKAHEAD_SEC;
     if (reachedClipEnd) {
       const nextClip = clips[position.clipIndex + 1];
       if (!nextClip) {
         video.pause();
+        if (Math.abs(video.currentTime - currentClip.sourceEndSec) > 0.01) {
+          video.currentTime = currentClip.sourceEndSec;
+        }
         updateVirtualTime(virtualDurationSec);
         setIsPlaying(false);
         return;
@@ -110,6 +126,21 @@ export function VirtualPreview({ videoSources, clips, revision, seekTarget, sour
 
     updateVirtualTime(clampVirtualTime(clips, position.virtualTimeSec));
   }, [clips, seekToVirtualTime, updateVirtualTime, virtualDurationSec]);
+
+  useEffect(() => {
+    if (!isPlaying) {
+      return;
+    }
+    let frameId = 0;
+    const tick = () => {
+      syncPlaybackPosition();
+      if (!videoRef.current?.paused) {
+        frameId = requestAnimationFrame(tick);
+      }
+    };
+    frameId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frameId);
+  }, [isPlaying, syncPlaybackPosition]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -184,7 +215,7 @@ export function VirtualPreview({ videoSources, clips, revision, seekTarget, sour
               onPause={() => setIsPlaying(false)}
               onPlay={() => setIsPlaying(true)}
               onEnded={() => setIsPlaying(false)}
-              onTimeUpdate={handleTimeUpdate}
+              onTimeUpdate={syncPlaybackPosition}
             />
             {loadState !== 'ready' ? (
               <div className="video-overlay muted">
