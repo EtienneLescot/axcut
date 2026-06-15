@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import type { AxcutClip, AxcutWord } from '@axcut/schema';
 
-import { locateSourcePosition, locateVirtualPosition, selectWordRange, totalVirtualDuration } from './virtual-preview.js';
+import { locateSourcePosition, locateVirtualPosition, resolvePlaybackPosition, selectWordRange, totalVirtualDuration } from './virtual-preview.js';
 
 const clips: AxcutClip[] = [
   {
@@ -52,6 +52,21 @@ test('locateSourcePosition maps source time back to virtual time', () => {
   assert.ok(position);
   assert.equal(position.clip.id, 'clip_1');
   assert.equal(position.virtualTimeSec, 2.25);
+});
+
+test('resolvePlaybackPosition jumps across source cuts', () => {
+  const position = resolvePlaybackPosition(clips, 14.02);
+  assert.equal(position.kind, 'next');
+  assert.equal(position.position.clip.id, 'clip_2');
+  assert.equal(position.position.virtualTimeSec, 4);
+  assert.equal(position.position.sourceTimeSec, 20);
+});
+
+test('resolvePlaybackPosition ends after the final kept clip', () => {
+  const position = resolvePlaybackPosition(clips, 23.2);
+  assert.equal(position.kind, 'ended');
+  assert.equal(position.position.virtualTimeSec, 7);
+  assert.equal(position.position.sourceTimeSec, 23);
 });
 
 test('selectWordRange returns the ordered range regardless of click order', () => {

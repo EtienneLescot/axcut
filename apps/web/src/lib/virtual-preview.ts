@@ -7,6 +7,12 @@ export type VirtualPosition = {
   sourceTimeSec: number;
 };
 
+export type PlaybackPosition =
+  | { kind: 'inside'; position: VirtualPosition }
+  | { kind: 'next'; position: VirtualPosition }
+  | { kind: 'ended'; position: VirtualPosition }
+  | { kind: 'empty' };
+
 export type SelectedWordRange = {
   startWordId: string;
   endWordId: string;
@@ -64,6 +70,22 @@ export function locateSourcePosition(clips: AxcutClip[], sourceTimeSec: number, 
     virtualTimeSec: clip.timelineStartSec + sourceOffset,
     sourceTimeSec,
   };
+}
+
+export function resolvePlaybackPosition(clips: AxcutClip[], sourceTimeSec: number, epsilon = 0.05): PlaybackPosition {
+  const position = locateSourcePosition(clips, sourceTimeSec, epsilon);
+  if (position) {
+    return { kind: 'inside', position };
+  }
+
+  const nextClip = clips.find((clip) => clip.sourceStartSec > sourceTimeSec);
+  if (nextClip) {
+    const nextPosition = locateVirtualPosition(clips, nextClip.timelineStartSec);
+    return nextPosition ? { kind: 'next', position: nextPosition } : { kind: 'empty' };
+  }
+
+  const endPosition = locateVirtualPosition(clips, totalVirtualDuration(clips));
+  return endPosition ? { kind: 'ended', position: endPosition } : { kind: 'empty' };
 }
 
 export function keptWordIdSet(clips: AxcutClip[]): Set<string> {

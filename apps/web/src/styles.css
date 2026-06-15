@@ -61,7 +61,6 @@ textarea {
   font: inherit;
 }
 
-button,
 select,
 input,
 textarea {
@@ -74,12 +73,13 @@ button {
   align-items: center;
   justify-content: center;
   gap: 0.45rem;
-  border-radius: 10px;
+  border: 0;
+  border-radius: 8px;
   background: #315ce8;
   color: #f8fbff;
   padding: 0.54rem 0.72rem;
   cursor: pointer;
-  transition: background 150ms ease, border-color 150ms ease, color 150ms ease, transform 150ms ease;
+  transition: background 150ms ease, color 150ms ease, transform 150ms ease;
 }
 
 button,
@@ -98,8 +98,8 @@ button.secondary {
   align-items: center;
   justify-content: center;
   gap: 0.45rem;
-  border: 1px solid rgba(148, 163, 184, 0.16);
-  border-radius: 10px;
+  border: 0;
+  border-radius: 8px;
   background: #315ce8;
   color: #f8fbff;
   padding: 0.54rem 0.72rem;
@@ -117,7 +117,6 @@ button.danger {
 
 button:not(:disabled):hover,
 .button-link:hover {
-  border-color: rgba(191, 219, 254, 0.38);
   transform: translateY(-1px);
 }
 
@@ -130,7 +129,7 @@ input,
 select,
 textarea {
   width: 100%;
-  border-radius: 10px;
+  border-radius: 8px;
   background: rgba(9, 14, 25, 0.82);
   color: inherit;
   padding: 0.66rem 0.78rem;
@@ -146,7 +145,7 @@ a {
 
 code {
   display: inline-flex;
-  border-radius: 10px;
+  border-radius: 8px;
   background: #111827;
   border: 1px solid #334155;
   padding: 0.45rem 0.65rem;
@@ -155,17 +154,39 @@ code {
 .app-shell {
   --chat-panel-width: 610px;
   --timeline-panel-height: 170px;
+  --transcript-panel-width: 360px;
+  --chat-column-width: minmax(320px, clamp(320px, var(--chat-panel-width), calc(100vw - 470px)));
+  --chat-resizer-width: 1px;
+  --transcript-column-width: minmax(280px, clamp(280px, var(--transcript-panel-width), calc(100vw - 620px)));
+  --transcript-resizer-width: 1px;
+  --timeline-row-height: minmax(120px, clamp(120px, var(--timeline-panel-height), calc(100vh - 360px)));
+  --timeline-resizer-height: 1px;
+  position: relative;
   height: 100vh;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(320px, clamp(320px, var(--chat-panel-width), calc(100vw - 470px))) 8px minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr) 8px minmax(120px, clamp(120px, var(--timeline-panel-height), calc(100vh - 360px)));
+  grid-template-columns: var(--chat-column-width) var(--chat-resizer-width) minmax(0, 1fr) var(--transcript-resizer-width) var(--transcript-column-width);
+  grid-template-rows: minmax(0, 1fr) var(--timeline-resizer-height) var(--timeline-row-height);
   grid-template-areas:
-    "left chat-resizer preview"
-    "timeline-resizer timeline-resizer timeline-resizer"
-    "timeline timeline timeline";
+    "left chat-resizer preview transcript-resizer transcript"
+    "timeline-resizer timeline-resizer timeline-resizer timeline-resizer timeline-resizer"
+    "timeline timeline timeline timeline timeline";
   gap: 0;
-  padding: 0.85rem;
+}
+
+.app-shell.chat-collapsed {
+  --chat-column-width: 0;
+  --chat-resizer-width: 0;
+}
+
+.app-shell.transcript-collapsed {
+  --transcript-column-width: 0;
+  --transcript-resizer-width: 0;
+}
+
+.app-shell.timeline-collapsed {
+  --timeline-row-height: 0;
+  --timeline-resizer-height: 0;
 }
 
 .panel {
@@ -188,14 +209,13 @@ code {
   gap: 0.72rem;
 }
 
-.left-rail::after {
-  content: "";
-  position: absolute;
-  top: 1.4rem;
-  right: 0;
-  width: 1px;
-  height: calc(100% - 2.8rem);
-  background: linear-gradient(transparent, rgba(148, 163, 184, 0.18) 12%, rgba(148, 163, 184, 0.18) 88%, transparent);
+.chat-collapsed .left-rail,
+.chat-collapsed .chat-resizer,
+.transcript-collapsed .transcript-rail,
+.transcript-collapsed .transcript-resizer,
+.timeline-collapsed .timeline-pane,
+.timeline-collapsed .timeline-resizer {
+  display: none;
 }
 
 .left-rail > :not(.messages) {
@@ -212,14 +232,39 @@ code {
   gap: 0.72rem;
 }
 
-.preview-pane::after {
-  content: "";
-  position: absolute;
-  left: 1.4rem;
-  right: 1.4rem;
-  bottom: 0;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(148, 163, 184, 0.18) 12%, rgba(148, 163, 184, 0.18) 88%, transparent);
+.transcript-rail {
+  position: relative;
+  grid-area: transcript;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 0.72rem;
+}
+
+.transcript-panel-header {
+  min-width: 0;
+  min-height: 2.25rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+  padding-right: 2.85rem;
+}
+
+.transcript-panel-header h2,
+.transcript-panel-header p {
+  margin: 0;
+}
+
+.transcript-panel-header h2 {
+  font-size: 1.02rem;
+}
+
+.transcript-panel-header p {
+  margin-top: 0.1rem;
+  font-size: 0.82rem;
 }
 
 .timeline-pane {
@@ -232,7 +277,7 @@ code {
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  padding: 0.48rem 0.72rem 0.55rem;
+  padding: 0.48rem 3.2rem 0.55rem 0.72rem;
 }
 
 .timeline-header {
@@ -264,7 +309,17 @@ code {
 .chat-resizer {
   grid-area: chat-resizer;
   position: relative;
-  min-width: 8px;
+  min-width: 1px;
+  background: rgba(148, 163, 184, 0.14);
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.transcript-resizer {
+  grid-area: transcript-resizer;
+  position: relative;
+  min-width: 1px;
+  background: rgba(148, 163, 184, 0.14);
   cursor: col-resize;
   touch-action: none;
 }
@@ -272,46 +327,16 @@ code {
 .timeline-resizer {
   grid-area: timeline-resizer;
   position: relative;
-  min-height: 8px;
+  min-height: 1px;
+  background: rgba(148, 163, 184, 0.14);
   cursor: row-resize;
   touch-action: none;
 }
 
-.chat-resizer::before,
-.timeline-resizer::before {
-  content: "";
-  position: absolute;
-  transition: background 140ms ease, opacity 140ms ease;
-  opacity: 0;
-}
-
-.chat-resizer::before {
-  top: 1.4rem;
-  bottom: 1.4rem;
-  left: 50%;
-  width: 1px;
-  transform: translateX(-50%);
-  background: rgba(147, 197, 253, 0.58);
-}
-
-.timeline-resizer::before {
-  left: 1.4rem;
-  right: 1.4rem;
-  top: 50%;
-  height: 1px;
-  transform: translateY(-50%);
-  background: rgba(147, 197, 253, 0.58);
-}
-
-.chat-resizer:hover::before,
-.timeline-resizer:hover::before,
-body.resizing-chat .chat-resizer::before,
-body.resizing-timeline .timeline-resizer::before {
-  opacity: 1;
-}
-
 body.resizing-chat,
-body.resizing-chat * {
+body.resizing-chat *,
+body.resizing-transcript,
+body.resizing-transcript * {
   cursor: col-resize !important;
   user-select: none;
 }
@@ -425,6 +450,7 @@ body.resizing-timeline * {
 .chat-header {
   min-width: 0;
   flex-wrap: nowrap;
+  padding-left: 2.75rem;
 }
 
 .chat-header .header-actions {
@@ -494,6 +520,8 @@ body.resizing-timeline * {
 
 .preview-header {
   align-items: center;
+  padding-left: 2.75rem;
+  padding-right: 2.75rem;
 }
 
 .preview-header > div:first-child {
@@ -576,7 +604,7 @@ body.resizing-timeline * {
   width: auto;
   max-width: 100%;
   padding: 0.44rem 0.68rem;
-  border-radius: 999px;
+  border-radius: 8px;
   font-size: 0.82rem;
   white-space: nowrap;
 }
@@ -595,8 +623,8 @@ body.resizing-timeline * {
   max-width: 11rem;
   min-height: 2.25rem;
   padding: 0.42rem 0.62rem;
-  border-radius: 999px;
-  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 8px;
+  border: 0;
   background: rgba(15, 23, 42, 0.66);
   color: #cbd5e1;
   font-size: 0.78rem;
@@ -616,7 +644,7 @@ body.resizing-timeline * {
 .status-pill {
   display: inline-flex;
   align-items: center;
-  border-radius: 999px;
+  border-radius: 8px;
   padding: 0.32rem 0.58rem;
   background: #35233b;
   color: #e9d5ff;
@@ -648,6 +676,16 @@ body.resizing-timeline * {
 .message-group {
   display: grid;
   gap: 0.28rem;
+}
+
+.message-group.user {
+  width: min(80%, 44rem);
+  justify-self: end;
+  align-self: flex-end;
+}
+
+.message-group.user .message {
+  width: 100%;
 }
 
 .message-actions {
@@ -714,8 +752,13 @@ body.resizing-timeline * {
 }
 
 .message.assistant {
-  background: rgba(13, 148, 136, 0.11);
-  border-color: rgba(45, 212, 191, 0.2);
+  background: transparent;
+  border-color: transparent;
+  padding-inline: 0;
+}
+
+.message .message-meta .muted {
+  display: none;
 }
 
 .message.system {
@@ -894,9 +937,8 @@ body.resizing-timeline * {
   width: auto;
   min-height: 2.25rem;
   padding: 0.44rem 0.68rem;
-  border-radius: 999px;
+  border-radius: 8px;
   background: rgba(9, 14, 25, 0.42);
-  border-color: transparent;
   color: #dbeafe;
   font-size: 0.82rem;
   white-space: nowrap;
@@ -923,7 +965,7 @@ body.resizing-timeline * {
   align-items: center;
   gap: 0.48rem;
   padding: 0.38rem 0.52rem;
-  border-radius: 999px;
+  border-radius: 8px;
   background: rgba(9, 14, 25, 0.58);
   border: 1px solid rgba(148, 163, 184, 0.12);
 }
@@ -990,9 +1032,9 @@ body.resizing-timeline * {
   display: inline-flex;
   align-items: center;
   gap: 0.38rem;
-  border-radius: 999px;
+  border-radius: 7px;
   background: rgba(15, 46, 37, 0.78);
-  border: 1px solid #166534;
+  border: 0;
   color: #d1fae5;
   padding: 0.28rem 0.48rem;
   text-decoration: none;
@@ -1309,7 +1351,7 @@ body.resizing-timeline * {
   min-height: 0;
   padding: 0;
   border: 0;
-  border-radius: 999px;
+  border-radius: 5px;
   background: rgba(15, 23, 42, 0.82);
   color: #fecdd3;
   opacity: 0;
@@ -1428,7 +1470,7 @@ body.timeline-navigating * {
   position: relative;
   height: 1.15rem;
   border: 1px solid rgba(148, 163, 184, 0.14);
-  border-radius: 999px;
+  border-radius: 6px;
   background: rgba(15, 23, 42, 0.54);
   overflow: hidden;
 }
@@ -1455,7 +1497,7 @@ body.timeline-navigating * {
   bottom: 0;
   min-width: 1.8rem;
   border: 2px solid rgba(219, 234, 254, 0.92);
-  border-radius: 999px;
+  border-radius: 6px;
   background: rgba(96, 165, 250, 0.16);
   box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.8), inset 0 0 0 1px rgba(15, 23, 42, 0.4);
   cursor: grab;
@@ -1634,7 +1676,44 @@ body.timeline-navigating * {
   display: inline-grid;
   place-items: center;
   padding: 0;
-  border-radius: 999px;
+  border-radius: 8px;
+}
+
+.icon-action.panel-toggle {
+  position: absolute;
+  z-index: 8;
+  width: 1.95rem;
+  height: 1.95rem;
+  min-height: 1.95rem;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #cbd5e1;
+  box-shadow: none;
+}
+
+.icon-action.panel-toggle[aria-pressed="true"] {
+  background: rgba(255, 255, 255, 0.08);
+  color: #eef2ff;
+}
+
+.icon-action.panel-toggle:not(:disabled):hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.chat-panel-toggle {
+  top: 1.18rem;
+  left: 1.18rem;
+}
+
+.transcript-panel-toggle {
+  top: 1.18rem;
+  right: 1.18rem;
+}
+
+.timeline-panel-toggle {
+  right: 1.18rem;
+  bottom: 1.18rem;
 }
 
 .icon-action.has-text {
@@ -1645,7 +1724,7 @@ body.timeline-navigating * {
   align-items: center;
   justify-content: center;
   padding: 0 0.78rem;
-  border-radius: 10px;
+  border-radius: 8px;
 }
 
 .button-text {
@@ -1938,20 +2017,57 @@ body.timeline-navigating * {
   white-space: pre-wrap;
 }
 
+.transcription-panel-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  border-radius: 0;
+  resize: none;
+  outline: none;
+}
+
+button,
+button[class],
+.button-link,
+.export-download {
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+}
+
+button[aria-pressed="true"],
+button[class][aria-pressed="true"] {
+  color: #f8fafc;
+}
+
+button:not(:disabled):hover,
+button[class]:not(:disabled):hover,
+.button-link:hover,
+.export-download:hover,
+button:focus-visible,
+button[class]:focus-visible,
+.button-link:focus-visible,
+.export-download:focus-visible {
+  background: rgba(255, 255, 255, 0.07) !important;
+  transform: none;
+}
+
 @media (max-width: 980px) {
   .app-shell {
     height: auto;
     min-height: 100vh;
     overflow: visible;
     grid-template-columns: 1fr;
-    grid-template-rows: auto auto auto;
+    grid-template-rows: auto auto auto auto;
     grid-template-areas:
       "left"
       "preview"
+      "transcript"
       "timeline";
   }
 
   .chat-resizer,
+  .transcript-resizer,
   .timeline-resizer {
     display: none;
   }
@@ -1960,13 +2076,20 @@ body.timeline-navigating * {
     overflow: auto;
   }
 
-  .left-rail {
+  .left-rail,
+  .transcript-rail {
     max-height: min(900px, calc(100vh - 2rem));
   }
 
-  .left-rail::after,
-  .preview-pane::after {
-    display: none;
+  .chat-header,
+  .preview-header,
+  .transcript-panel-header {
+    padding-left: 2.75rem;
+    padding-right: 2.75rem;
+  }
+
+  .timeline-pane {
+    padding-right: 3.2rem;
   }
 
   .preview-controls,
