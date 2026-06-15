@@ -77,6 +77,7 @@ export function TimelinePane({
   const [zoom, setZoom] = useState(1);
   const [resizeState, setResizeState] = useState<ResizeState | null>(null);
   const [panning, setPanning] = useState(false);
+  const [scrubbing, setScrubbing] = useState(false);
   const [navigatorDragging, setNavigatorDragging] = useState(false);
 
   const virtualDurationSec = totalVirtualDuration(clips);
@@ -144,6 +145,16 @@ export function TimelinePane({
     onPreviewSource(boundedSourceSec);
     onSeek(sourceToVirtualTime(intervals, boundedSourceSec));
   }, [onPreviewSource, onSeek, sourceDuration, visibleKeptIntervals]);
+
+  const seekClientX = useCallback((clientX: number) => {
+    const scrollElement = scrollRef.current;
+    if (!scrollElement) {
+      return;
+    }
+    const rect = scrollElement.getBoundingClientRect();
+    const sourceSec = (scrollElement.scrollLeft + clientX - rect.left) / Math.max(pxPerSec, 0.001);
+    seekSource(sourceSec);
+  }, [pxPerSec, seekSource]);
 
   const zoomAt = useCallback((nextZoom: number, anchorClientX?: number) => {
     const scrollElement = scrollRef.current;
@@ -292,9 +303,38 @@ export function TimelinePane({
     globalThis.window.addEventListener('pointercancel', end, { once: true });
   }, [busy, committedCutRanges, replaceTimelineFromCuts, pxPerSec, seekSource, sourceDuration]);
 
+  const startScrub = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest('.timeline-cut-handle, .timeline-cut-delete')) {
+      return;
+    }
+    if (event.button !== 0 || clips.length === 0) {
+      return;
+    }
+    event.preventDefault();
+    seekClientX(event.clientX);
+    setScrubbing(true);
+    globalThis.document.body.classList.add('timeline-scrubbing');
+
+    const move = (moveEvent: PointerEvent) => {
+      seekClientX(moveEvent.clientX);
+    };
+    const end = () => {
+      setScrubbing(false);
+      globalThis.document.body.classList.remove('timeline-scrubbing');
+      globalThis.window.removeEventListener('pointermove', move);
+      globalThis.window.removeEventListener('pointerup', end);
+      globalThis.window.removeEventListener('pointercancel', end);
+    };
+
+    globalThis.window.addEventListener('pointermove', move);
+    globalThis.window.addEventListener('pointerup', end, { once: true });
+    globalThis.window.addEventListener('pointercancel', end, { once: true });
+  }, [clips.length, seekClientX]);
+
   const startPan = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     const target = event.target instanceof Element ? event.target : null;
-    if (busy || target?.closest('button, .timeline-segment, .timeline-cut-handle')) {
+    if (busy || target?.closest('button, .timeline-cut-handle, .timeline-cut-delete')) {
       return;
     }
     const scrollElement = scrollRef.current;
@@ -329,6 +369,14 @@ export function TimelinePane({
     globalThis.window.addEventListener('pointerup', end, { once: true });
     globalThis.window.addEventListener('pointercancel', end, { once: true });
   }, [busy]);
+
+  const handleTimelinePointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.altKey || event.button === 1) {
+      startPan(event);
+      return;
+    }
+    startScrub(event);
+  }, [startPan, startScrub]);
 
   const handleWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
     if (!(event.ctrlKey || event.metaKey)) {
@@ -447,11 +495,15 @@ export function TimelinePane({
 
       <div
         ref={scrollRef}
-        className={panning ? 'timeline-viewport panning' : 'timeline-viewport'}
-        onPointerDown={startPan}
+        className={[
+          'timeline-viewport',
+          panning ? 'panning' : '',
+          scrubbing ? 'scrubbing' : '',
+        ].filter(Boolean).join(' ')}
+        onPointerDown={handleTimelinePointerDown}
         onWheel={handleWheel}
         onScroll={handleTimelineScroll}
-        aria-label="Source timeline. Drag empty space to pan, use controls or Ctrl wheel to zoom."
+        aria-label="Source timeline. Click or drag to scrub, use the navigator or Alt drag to pan, and Ctrl wheel to zoom."
       >
         {clips.length > 0 ? (
           <div className="timeline-canvas" style={{ width: `${contentWidthPx}px` }}>
@@ -516,19 +568,17 @@ export function TimelinePane({
                 }
                 const active = playheadSourceSec !== null && playheadSourceSec >= item.startSec && playheadSourceSec <= item.endSec;
                 return (
-                  <button
+                  <div
                     key={item.id}
-                    type="button"
                     className={active ? 'timeline-segment timeline-kept active' : 'timeline-segment timeline-kept'}
                     style={style}
-                    onClick={() => seekSource(item.startSec)}
                     title={`Kept source ${formatSeconds(item.startSec)}-${formatSeconds(item.endSec)}`}
                   >
                     <div className="timeline-segment-label">
                       <span>{formatSeconds(item.startSec)}</span>
                       <small>{formatSeconds(item.startSec)}-{formatSeconds(item.endSec)}</small>
                     </div>
-                  </button>
+                  </div>
                 );
               })}
               {playheadSourceSec !== null ? (

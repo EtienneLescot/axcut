@@ -1115,12 +1115,16 @@ body.resizing-timeline * {
   background: rgba(5, 8, 15, 0.78);
   overflow-x: auto;
   overflow-y: hidden;
-  cursor: grab;
+  cursor: pointer;
   scrollbar-color: rgba(96, 165, 250, 0.45) rgba(15, 23, 42, 0.7);
 }
 
 .timeline-viewport.panning {
   cursor: grabbing;
+}
+
+.timeline-viewport.scrubbing {
+  cursor: ew-resize;
 }
 
 .timeline-canvas {
@@ -1357,6 +1361,12 @@ body.timeline-resizing-cut * {
 body.timeline-panning,
 body.timeline-panning * {
   cursor: grabbing !important;
+  user-select: none;
+}
+
+body.timeline-scrubbing,
+body.timeline-scrubbing * {
+  cursor: ew-resize !important;
   user-select: none;
 }
 
