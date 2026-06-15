@@ -11,11 +11,6 @@
     "resolveJsonModule": true,
     "declaration": true,
     "composite": true,
-    "paths": {
-      "@axcut/schema": [
-        "packages/axcut-schema/dist/index.d.ts"
-      ]
-    },
     "types": [
       "node"
     ]
