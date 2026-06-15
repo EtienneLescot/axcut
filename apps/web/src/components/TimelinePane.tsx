@@ -1,15 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, PointerEvent as ReactPointerEvent } from 'react';
-import { Plus, Trash2 } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { CSSProperties, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from 'react';
+import { Maximize2, Minus, Plus, Trash2 } from 'lucide-react';
 import type { AxcutClip } from '@axcut/schema';
 
 import { formatSeconds, locateVirtualPosition, totalVirtualDuration } from '../lib/virtual-preview.js';
-
-type SourceRange = {
-  id: string;
-  startSec: number;
-  endSec: number;
-};
 
 type TimelinePaneProps = {
   clips: AxcutClip[];
@@ -21,164 +15,289 @@ type TimelinePaneProps = {
   onReplaceTimeline: (intervals: Array<{ startSec: number; endSec: number }>, reason: string) => void;
 };
 
-type CutDragState = {
+type SourceRange = {
+  id: string;
+  startSec: number;
+  endSec: number;
+};
+
+type TimelineItem = SourceRange & {
+  kind: 'kept' | 'cut';
+};
+
+type ResizeState = {
   id: number;
-  cut: SourceRange;
+  cutId: string;
   edge: 'start' | 'end';
   startClientX: number;
-  originalStartSec: number;
-  originalEndSec: number;
+  startSec: number;
+  endSec: number;
   currentStartSec: number;
   currentEndSec: number;
-  secondsPerPixel: number;
+  baseCuts: SourceRange[];
+  pxPerSec: number;
+};
+
+type PanState = {
+  startClientX: number;
+  startScrollLeft: number;
 };
 
 const MIN_CUT_DURATION_SEC = 0.1;
-const SEGMENT_MIN_WIDTH_PX = 42;
+const MIN_SOURCE_DURATION_SEC = 0.001;
+const MIN_PX_PER_SEC = 0.35;
+const MAX_PX_PER_SEC = 280;
+const MIN_SEGMENT_WIDTH_PX = 1;
+const RULER_HEIGHT_PX = 28;
 
-type TimelineItem =
-  | { type: 'clip'; startSec: number; endSec: number; range: SourceRange }
-  | { type: 'cut'; startSec: number; endSec: number; range: SourceRange };
+export function TimelinePane({
+  clips,
+  currentTimeSec,
+  sourceDurationSec,
+  busy = false,
+  onSeek,
+  onPreviewSource,
+  onReplaceTimeline,
+}: TimelinePaneProps) {
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const resizeRef = useRef<ResizeState | null>(null);
+  const panRef = useRef<PanState | null>(null);
+  const resizeSequenceRef = useRef(0);
+  const [viewportWidthPx, setViewportWidthPx] = useState(0);
+  const [zoom, setZoom] = useState(1);
+  const [resizeState, setResizeState] = useState<ResizeState | null>(null);
+  const [panning, setPanning] = useState(false);
 
-export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = false, onSeek, onPreviewSource, onReplaceTimeline }: TimelinePaneProps) {
-  const trackRef = useRef<HTMLDivElement | null>(null);
-  const dragSequenceRef = useRef(0);
-  const committedDragRef = useRef<number | null>(null);
-  const [trackWidthPx, setTrackWidthPx] = useState(0);
-  const durationSec = totalVirtualDuration(clips);
+  const virtualDurationSec = totalVirtualDuration(clips);
   const activePosition = locateVirtualPosition(clips, currentTimeSec);
-  const sourceDuration = useMemo(() => Math.max(sourceDurationSec, ...clips.map((clip) => clip.sourceEndSec), 0), [clips, sourceDurationSec]);
-  const keptIntervals = useMemo(() => normalizeSourceRanges(sourceDuration, clips.map((clip) => ({ startSec: clip.sourceStartSec, endSec: clip.sourceEndSec }))), [clips, sourceDuration]);
-  const cutRanges = useMemo(() => deriveCutRanges(keptIntervals, sourceDuration), [keptIntervals, sourceDuration]);
-  const [dragState, setDragState] = useState<CutDragState | null>(null);
-  const trackTotal = Math.max(sourceDuration, durationSec, 0.001);
+  const sourceDuration = useMemo(
+    () => Math.max(sourceDurationSec, ...clips.map((clip) => clip.sourceEndSec), MIN_SOURCE_DURATION_SEC),
+    [clips, sourceDurationSec],
+  );
+  const fitPxPerSec = useMemo(() => (
+    Math.max(MIN_PX_PER_SEC, viewportWidthPx / Math.max(sourceDuration, MIN_SOURCE_DURATION_SEC))
+  ), [sourceDuration, viewportWidthPx]);
+  const pxPerSec = clamp(fitPxPerSec * zoom, MIN_PX_PER_SEC, MAX_PX_PER_SEC);
+  const contentWidthPx = Math.max(viewportWidthPx, Math.ceil(sourceDuration * pxPerSec));
+
+  const keptIntervals = useMemo(() => normalizeRanges(
+    sourceDuration,
+    clips.map((clip) => ({ startSec: clip.sourceStartSec, endSec: clip.sourceEndSec })),
+    'clip',
+  ), [clips, sourceDuration]);
+  const committedCutRanges = useMemo(() => deriveCutRanges(keptIntervals, sourceDuration), [keptIntervals, sourceDuration]);
   const visibleCutRanges = useMemo(() => {
-    if (!dragState) {
-      return cutRanges;
+    if (!resizeState) {
+      return committedCutRanges;
     }
-    return normalizeSourceRanges(sourceDuration, cutRanges.map((cut) => cut.id === dragState.cut.id
-      ? { ...cut, startSec: dragState.currentStartSec, endSec: dragState.currentEndSec }
-      : cut));
-  }, [cutRanges, dragState, sourceDuration]);
-  const visibleKeptIntervals = useMemo(() => normalizeSourceRanges(sourceDuration, invertCutRanges(visibleCutRanges, sourceDuration)), [sourceDuration, visibleCutRanges]);
+    return normalizeRanges(sourceDuration, committedCutRanges.map((cut) => (
+      cut.id === resizeState.cutId
+        ? { id: cut.id, startSec: resizeState.currentStartSec, endSec: resizeState.currentEndSec }
+        : cut
+    )), 'cut');
+  }, [committedCutRanges, resizeState, sourceDuration]);
+  const visibleKeptIntervals = useMemo(() => invertCutRanges(visibleCutRanges, sourceDuration), [sourceDuration, visibleCutRanges]);
   const timelineItems = useMemo(() => buildTimelineItems(visibleKeptIntervals, visibleCutRanges), [visibleKeptIntervals, visibleCutRanges]);
+  const rulerTicks = useMemo(() => buildRulerTicks(sourceDuration, pxPerSec), [pxPerSec, sourceDuration]);
+  const playheadSourceSec = activePosition?.sourceTimeSec ?? null;
 
   useEffect(() => {
-    const track = trackRef.current;
-    if (!track) {
+    const scrollElement = scrollRef.current;
+    if (!scrollElement) {
       return;
     }
-    const updateTrackWidth = () => setTrackWidthPx(track.clientWidth);
-    updateTrackWidth();
-    const observer = new ResizeObserver(updateTrackWidth);
-    observer.observe(track);
+    const updateWidth = () => setViewportWidthPx(scrollElement.clientWidth);
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(scrollElement);
     return () => observer.disconnect();
   }, []);
 
   useEffect(() => {
-    if (!dragState) {
-      return;
-    }
-    const handlePointerMove = (event: PointerEvent) => {
-      const deltaSec = (event.clientX - dragState.startClientX) * dragState.secondsPerPixel;
-      setDragState((current) => {
-        if (!current) {
-          return current;
-        }
-        let nextState: CutDragState;
-        if (current.edge === 'start') {
-          const currentStartSec = clamp(current.originalStartSec + deltaSec, 0, current.currentEndSec - MIN_CUT_DURATION_SEC);
-          nextState = { ...current, currentStartSec };
-        } else {
-          const currentEndSec = clamp(current.originalEndSec + deltaSec, current.currentStartSec + MIN_CUT_DURATION_SEC, sourceDuration);
-          nextState = { ...current, currentEndSec };
-        }
-        const nextCuts = normalizeSourceRanges(sourceDuration, [
-          ...cutRanges.filter((cut) => cut.id !== nextState.cut.id),
-          { id: nextState.cut.id, startSec: nextState.currentStartSec, endSec: nextState.currentEndSec },
-        ]);
-        const nextIntervals = invertCutRanges(nextCuts, sourceDuration);
-        const boundarySourceSec = nextState.edge === 'start' ? nextState.currentStartSec : nextState.currentEndSec;
-        onPreviewSource(boundarySourceSec);
-        onSeek(sourceToVirtualTime(nextIntervals, boundarySourceSec));
-        return nextState;
-      });
-    };
-    const handlePointerUp = () => {
-      setDragState((current) => {
-        if (current && committedDragRef.current !== current.id) {
-          committedDragRef.current = current.id;
-          commitCutChange(
-            cutRanges,
-            sourceDuration,
-            current.cut,
-            { startSec: current.currentStartSec, endSec: current.currentEndSec },
-            onReplaceTimeline,
-          );
-        }
-        return null;
-      });
-    };
-    globalThis.document.body.classList.add('resizing-cut');
-    globalThis.window.addEventListener('pointermove', handlePointerMove);
-    globalThis.window.addEventListener('pointerup', handlePointerUp, { once: true });
-    return () => {
-      globalThis.document.body.classList.remove('resizing-cut');
-      globalThis.window.removeEventListener('pointermove', handlePointerMove);
-      globalThis.window.removeEventListener('pointerup', handlePointerUp);
-    };
-  }, [cutRanges, dragState, onPreviewSource, onReplaceTimeline, onSeek, sourceDuration]);
+    resizeRef.current = resizeState;
+  }, [resizeState]);
 
-  const startCutResize = (cut: SourceRange, edge: 'start' | 'end', event: ReactPointerEvent<HTMLElement>) => {
-    if (busy) {
+  const replaceTimelineFromCuts = useCallback((cuts: SourceRange[], reason: string) => {
+    onReplaceTimeline(invertCutRanges(normalizeRanges(sourceDuration, cuts, 'cut'), sourceDuration), reason);
+  }, [onReplaceTimeline, sourceDuration]);
+
+  const seekSource = useCallback((sourceSec: number, intervals = visibleKeptIntervals) => {
+    const boundedSourceSec = clamp(sourceSec, 0, sourceDuration);
+    onPreviewSource(boundedSourceSec);
+    onSeek(sourceToVirtualTime(intervals, boundedSourceSec));
+  }, [onPreviewSource, onSeek, sourceDuration, visibleKeptIntervals]);
+
+  const zoomAt = useCallback((nextZoom: number, anchorClientX?: number) => {
+    const scrollElement = scrollRef.current;
+    const boundedZoom = clamp(nextZoom, 1, MAX_PX_PER_SEC / Math.max(fitPxPerSec, MIN_PX_PER_SEC));
+    if (!scrollElement) {
+      setZoom(boundedZoom);
       return;
     }
-    const track = trackRef.current;
-    if (!track) {
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    onPreviewSource(edge === 'start' ? cut.startSec : cut.endSec);
-    const dragId = dragSequenceRef.current + 1;
-    dragSequenceRef.current = dragId;
-    committedDragRef.current = null;
-    setDragState({
-      id: dragId,
-      cut,
-      edge,
-      startClientX: event.clientX,
-      originalStartSec: cut.startSec,
-      originalEndSec: cut.endSec,
-      currentStartSec: cut.startSec,
-      currentEndSec: cut.endSec,
-      secondsPerPixel: trackTotal / Math.max(1, track.clientWidth),
+    const rect = scrollElement.getBoundingClientRect();
+    const anchorX = anchorClientX === undefined ? rect.left + rect.width / 2 : anchorClientX;
+    const sourceAtAnchor = (scrollElement.scrollLeft + anchorX - rect.left) / pxPerSec;
+    const nextPxPerSec = clamp(fitPxPerSec * boundedZoom, MIN_PX_PER_SEC, MAX_PX_PER_SEC);
+    setZoom(boundedZoom);
+    requestAnimationFrame(() => {
+      scrollElement.scrollLeft = Math.max(0, sourceAtAnchor * nextPxPerSec - (anchorX - rect.left));
     });
-  };
+  }, [fitPxPerSec, pxPerSec]);
 
-  const deleteCut = (cut: SourceRange) => {
-    if (busy) {
-      return;
-    }
-    const nextCuts = cutRanges.filter((item) => item.id !== cut.id);
-    const nextIntervals = invertCutRanges(normalizeSourceRanges(sourceDuration, nextCuts), sourceDuration);
-    onReplaceTimeline(nextIntervals, `Deleted cut ${formatSeconds(cut.startSec)}-${formatSeconds(cut.endSec)} by restoring that source range.`);
-  };
+  const fitTimeline = useCallback(() => {
+    setZoom(1);
+    requestAnimationFrame(() => {
+      if (scrollRef.current) {
+        scrollRef.current.scrollLeft = 0;
+      }
+    });
+  }, []);
 
-  const addCut = () => {
-    if (busy || sourceDuration <= 0) {
+  const addCut = useCallback(() => {
+    if (busy || sourceDuration <= MIN_SOURCE_DURATION_SEC) {
       return;
     }
     const centerSec = activePosition?.sourceTimeSec ?? clips[0]?.sourceStartSec ?? 0;
     const startSec = clamp(centerSec - 0.5, 0, Math.max(0, sourceDuration - MIN_CUT_DURATION_SEC));
     const endSec = clamp(centerSec + 0.5, startSec + MIN_CUT_DURATION_SEC, sourceDuration);
-    const nextCuts = normalizeSourceRanges(sourceDuration, [
-      ...cutRanges,
-      { id: `cut_${cutRanges.length + 1}`, startSec, endSec },
-    ]);
-    const nextIntervals = invertCutRanges(nextCuts, sourceDuration);
-    onReplaceTimeline(nextIntervals, `Added cut ${formatSeconds(startSec)}-${formatSeconds(endSec)} around the current playhead.`);
-  };
+    replaceTimelineFromCuts(
+      [...committedCutRanges, { id: `cut_${committedCutRanges.length + 1}`, startSec, endSec }],
+      `Added cut ${formatSeconds(startSec)}-${formatSeconds(endSec)} around the current playhead.`,
+    );
+  }, [activePosition?.sourceTimeSec, busy, clips, committedCutRanges, replaceTimelineFromCuts, sourceDuration]);
+
+  const deleteCut = useCallback((cut: SourceRange) => {
+    if (busy) {
+      return;
+    }
+    replaceTimelineFromCuts(
+      committedCutRanges.filter((item) => item.id !== cut.id),
+      `Deleted cut ${formatSeconds(cut.startSec)}-${formatSeconds(cut.endSec)} by restoring that source range.`,
+    );
+  }, [busy, committedCutRanges, replaceTimelineFromCuts]);
+
+  const startResize = useCallback((cut: SourceRange, edge: ResizeState['edge'], event: ReactPointerEvent<HTMLElement>) => {
+    if (busy) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const nextState: ResizeState = {
+      id: resizeSequenceRef.current + 1,
+      cutId: cut.id,
+      edge,
+      startClientX: event.clientX,
+      startSec: cut.startSec,
+      endSec: cut.endSec,
+      currentStartSec: cut.startSec,
+      currentEndSec: cut.endSec,
+      baseCuts: committedCutRanges,
+      pxPerSec,
+    };
+    resizeSequenceRef.current = nextState.id;
+    resizeRef.current = nextState;
+    setResizeState(nextState);
+    seekSource(edge === 'start' ? cut.startSec : cut.endSec);
+
+    const move = (moveEvent: PointerEvent) => {
+      const current = resizeRef.current;
+      if (!current) {
+        return;
+      }
+      const deltaSec = (moveEvent.clientX - current.startClientX) / Math.max(current.pxPerSec, MIN_PX_PER_SEC);
+      const currentIndex = current.baseCuts.findIndex((item) => item.id === current.cutId);
+      const previousCut = currentIndex > 0 ? current.baseCuts[currentIndex - 1] : null;
+      const nextCut = currentIndex >= 0 && currentIndex < current.baseCuts.length - 1 ? current.baseCuts[currentIndex + 1] : null;
+      const nextStartSec = current.edge === 'start'
+        ? clamp(current.startSec + deltaSec, previousCut?.endSec ?? 0, current.currentEndSec - MIN_CUT_DURATION_SEC)
+        : current.currentStartSec;
+      const nextEndSec = current.edge === 'end'
+        ? clamp(current.endSec + deltaSec, current.currentStartSec + MIN_CUT_DURATION_SEC, nextCut?.startSec ?? sourceDuration)
+        : current.currentEndSec;
+      const nextState = { ...current, currentStartSec: nextStartSec, currentEndSec: nextEndSec };
+      resizeRef.current = nextState;
+      setResizeState(nextState);
+      const nextCuts = current.baseCuts.map((item) => (
+        item.id === current.cutId ? { ...item, startSec: nextStartSec, endSec: nextEndSec } : item
+      ));
+      const boundarySec = current.edge === 'start' ? nextStartSec : nextEndSec;
+      seekSource(boundarySec, invertCutRanges(nextCuts, sourceDuration));
+    };
+
+    const end = () => {
+      const current = resizeRef.current;
+      resizeRef.current = null;
+      setResizeState(null);
+      globalThis.document.body.classList.remove('timeline-resizing-cut');
+      globalThis.window.removeEventListener('pointermove', move);
+      globalThis.window.removeEventListener('pointerup', end);
+      globalThis.window.removeEventListener('pointercancel', end);
+      if (!current) {
+        return;
+      }
+      if (Math.abs(current.currentStartSec - current.startSec) < 0.01 && Math.abs(current.currentEndSec - current.endSec) < 0.01) {
+        return;
+      }
+      replaceTimelineFromCuts(
+        current.baseCuts.map((item) => (
+          item.id === current.cutId ? { ...item, startSec: current.currentStartSec, endSec: current.currentEndSec } : item
+        )),
+        `Changed cut ${formatSeconds(current.startSec)}-${formatSeconds(current.endSec)} to ${formatSeconds(current.currentStartSec)}-${formatSeconds(current.currentEndSec)}.`,
+      );
+    };
+
+    globalThis.document.body.classList.add('timeline-resizing-cut');
+    globalThis.window.addEventListener('pointermove', move);
+    globalThis.window.addEventListener('pointerup', end, { once: true });
+    globalThis.window.addEventListener('pointercancel', end, { once: true });
+  }, [busy, committedCutRanges, replaceTimelineFromCuts, pxPerSec, seekSource, sourceDuration]);
+
+  const startPan = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (busy || target?.closest('button, .timeline-segment, .timeline-cut-handle')) {
+      return;
+    }
+    const scrollElement = scrollRef.current;
+    if (!scrollElement || scrollElement.scrollWidth <= scrollElement.clientWidth) {
+      return;
+    }
+    event.preventDefault();
+    panRef.current = {
+      startClientX: event.clientX,
+      startScrollLeft: scrollElement.scrollLeft,
+    };
+    setPanning(true);
+    globalThis.document.body.classList.add('timeline-panning');
+
+    const move = (moveEvent: PointerEvent) => {
+      const pan = panRef.current;
+      if (!pan || !scrollRef.current) {
+        return;
+      }
+      scrollRef.current.scrollLeft = pan.startScrollLeft - (moveEvent.clientX - pan.startClientX);
+    };
+    const end = () => {
+      panRef.current = null;
+      setPanning(false);
+      globalThis.document.body.classList.remove('timeline-panning');
+      globalThis.window.removeEventListener('pointermove', move);
+      globalThis.window.removeEventListener('pointerup', end);
+      globalThis.window.removeEventListener('pointercancel', end);
+    };
+
+    globalThis.window.addEventListener('pointermove', move);
+    globalThis.window.addEventListener('pointerup', end, { once: true });
+    globalThis.window.addEventListener('pointercancel', end, { once: true });
+  }, [busy]);
+
+  const handleWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
+    if (!(event.ctrlKey || event.metaKey)) {
+      return;
+    }
+    event.preventDefault();
+    const direction = event.deltaY > 0 ? -1 : 1;
+    zoomAt(zoom * (direction > 0 ? 1.18 : 1 / 1.18), event.clientX);
+  }, [zoom, zoomAt]);
 
   return (
     <section className="timeline-pane panel">
@@ -186,118 +305,147 @@ export function TimelinePane({ clips, currentTimeSec, sourceDurationSec, busy = 
         <div>
           <h2>Timeline</h2>
           <p className="muted">
-            {clips.length} clip{clips.length === 1 ? '' : 's'} · {cutRanges.length} cut{cutRanges.length === 1 ? '' : 's'} · {formatSeconds(durationSec)} total
+            {clips.length} clip{clips.length === 1 ? '' : 's'} · {committedCutRanges.length} cut{committedCutRanges.length === 1 ? '' : 's'} · {formatSeconds(virtualDurationSec)} total
           </p>
         </div>
         <div className="timeline-readout">
-          <button className="timeline-add-cut secondary" type="button" onClick={addCut} disabled={busy || sourceDuration <= 0} title="Add cut at playhead">
+          <button className="timeline-tool secondary" type="button" onClick={addCut} disabled={busy || clips.length === 0} title="Add cut at playhead">
             <Plus size={14} strokeWidth={1.8} aria-hidden="true" />
             <span>Add cut</span>
           </button>
+          <div className="timeline-zoom-controls" aria-label="Timeline zoom controls">
+            <button className="timeline-icon-button secondary" type="button" onClick={() => zoomAt(zoom / 1.35)} disabled={zoom <= 1.01} title="Zoom out">
+              <Minus size={14} strokeWidth={1.9} aria-hidden="true" />
+              <span className="sr-only">Zoom out</span>
+            </button>
+            <input
+              aria-label="Timeline zoom"
+              className="timeline-zoom-slider"
+              type="range"
+              min="1"
+              max="32"
+              step="0.1"
+              value={Math.min(32, zoom)}
+              onChange={(event) => zoomAt(Number(event.target.value))}
+            />
+            <button className="timeline-icon-button secondary" type="button" onClick={() => zoomAt(zoom * 1.35)} title="Zoom in">
+              <Plus size={14} strokeWidth={1.9} aria-hidden="true" />
+              <span className="sr-only">Zoom in</span>
+            </button>
+            <button className="timeline-icon-button secondary" type="button" onClick={fitTimeline} disabled={zoom <= 1.01} title="Fit timeline">
+              <Maximize2 size={14} strokeWidth={1.8} aria-hidden="true" />
+              <span className="sr-only">Fit timeline</span>
+            </button>
+          </div>
           <strong>{formatSeconds(currentTimeSec)}</strong>
-          <span className="muted">
-            {activePosition ? `Clip ${activePosition.clipIndex + 1}/${clips.length}` : 'No active clip'}
-          </span>
+          <span className="muted">{activePosition ? `Clip ${activePosition.clipIndex + 1}/${clips.length}` : 'No active clip'}</span>
         </div>
       </div>
 
-      <div ref={trackRef} className="timeline-track" aria-label="Source timeline with non-destructive cuts">
-        {sourceDuration > 0 && clips.length > 0 ? (
-          timelineItems.map((item) => {
-            const itemStyle = timelineItemStyle(item, trackTotal, trackWidthPx);
-            if (item.type === 'cut') {
-              const dragging = dragState?.cut.id === item.range.id;
-              return (
+      <div
+        ref={scrollRef}
+        className={panning ? 'timeline-viewport panning' : 'timeline-viewport'}
+        onPointerDown={startPan}
+        onWheel={handleWheel}
+        aria-label="Source timeline. Drag empty space to pan, use controls or Ctrl wheel to zoom."
+      >
+        {clips.length > 0 ? (
+          <div className="timeline-canvas" style={{ width: `${contentWidthPx}px` }}>
+            <div className="timeline-ruler" style={{ height: `${RULER_HEIGHT_PX}px` }}>
+              {rulerTicks.map((tick) => (
                 <div
-                  key={`cut-${item.range.id}`}
-                  className={dragging ? 'timeline-cut dragging' : 'timeline-cut'}
-                  style={itemStyle}
-                  title={`Cut source ${formatSeconds(item.startSec)}-${formatSeconds(item.endSec)}`}
-                  data-cut-trigger="true"
+                  key={`${tick.timeSec}-${tick.major ? 'major' : 'minor'}`}
+                  className={tick.major ? 'timeline-tick major' : 'timeline-tick'}
+                  style={{ left: `${tick.timeSec * pxPerSec}px` }}
                 >
-                  <span
-                    className="cut-resize-handle start"
-                    role="separator"
-                    aria-orientation="vertical"
-                    aria-label="Adjust cut start"
-                    onPointerDown={(event) => startCutResize(item.range, 'start', event)}
-                  />
-                  <span className="cut-label">cut</span>
-                  <small>{formatSeconds(item.startSec)}-{formatSeconds(item.endSec)}</small>
-                  <button
-                    type="button"
-                    className="cut-delete"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      deleteCut(item.range);
-                    }}
-                    disabled={busy}
-                    title="Delete cut"
-                    aria-label={`Delete cut ${formatSeconds(item.startSec)}-${formatSeconds(item.endSec)}`}
-                  >
-                    <Trash2 size={12} strokeWidth={1.9} aria-hidden="true" />
-                  </button>
-                  <span
-                    className="cut-resize-handle end"
-                    role="separator"
-                    aria-orientation="vertical"
-                    aria-label="Adjust cut end"
-                    onPointerDown={(event) => startCutResize(item.range, 'end', event)}
-                  />
+                  {tick.major ? <span>{formatSeconds(tick.timeSec)}</span> : null}
                 </div>
-              );
-            }
-            const active = Boolean(activePosition && activePosition.sourceTimeSec >= item.startSec && activePosition.sourceTimeSec <= item.endSec);
-            return (
-              <button
-                key={`clip-${item.range.id}`}
-                type="button"
-                className={active ? 'timeline-clip active' : 'timeline-clip'}
-                style={itemStyle}
-                title={`Kept source ${formatSeconds(item.startSec)}-${formatSeconds(item.endSec)}`}
-                onClick={() => onSeek(sourceToVirtualTime(keptIntervals, item.startSec))}
-              >
-                <span>{formatSeconds(item.startSec)}</span>
-                <small>{formatSeconds(item.startSec)}-{formatSeconds(item.endSec)}</small>
-              </button>
-            );
-          })
-        ) : <div className="timeline-empty muted">No virtual clips yet.</div>}
+              ))}
+            </div>
+            <div className="timeline-track-lane">
+              {timelineItems.map((item) => {
+                const style = timelineItemStyle(item, pxPerSec);
+                if (item.kind === 'cut') {
+                  const active = resizeState?.cutId === item.id;
+                  return (
+                    <div
+                      key={item.id}
+                      className={active ? 'timeline-segment timeline-cut active' : 'timeline-segment timeline-cut'}
+                      style={style}
+                      title={`Cut source ${formatSeconds(item.startSec)}-${formatSeconds(item.endSec)}`}
+                    >
+                      <button
+                        className="timeline-cut-handle start"
+                        type="button"
+                        onPointerDown={(event) => startResize(item, 'start', event)}
+                        disabled={busy}
+                        aria-label={`Adjust cut start at ${formatSeconds(item.startSec)}`}
+                        title="Adjust cut start"
+                      />
+                      <div className="timeline-segment-label">
+                        <span>Cut</span>
+                        <small>{formatSeconds(item.startSec)}-{formatSeconds(item.endSec)}</small>
+                      </div>
+                      <button
+                        className="timeline-cut-delete"
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          deleteCut(item);
+                        }}
+                        disabled={busy}
+                        title="Delete cut"
+                        aria-label={`Delete cut ${formatSeconds(item.startSec)}-${formatSeconds(item.endSec)}`}
+                      >
+                        <Trash2 size={12} strokeWidth={1.9} aria-hidden="true" />
+                      </button>
+                      <button
+                        className="timeline-cut-handle end"
+                        type="button"
+                        onPointerDown={(event) => startResize(item, 'end', event)}
+                        disabled={busy}
+                        aria-label={`Adjust cut end at ${formatSeconds(item.endSec)}`}
+                        title="Adjust cut end"
+                      />
+                    </div>
+                  );
+                }
+                const active = playheadSourceSec !== null && playheadSourceSec >= item.startSec && playheadSourceSec <= item.endSec;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    className={active ? 'timeline-segment timeline-kept active' : 'timeline-segment timeline-kept'}
+                    style={style}
+                    onClick={() => seekSource(item.startSec)}
+                    title={`Kept source ${formatSeconds(item.startSec)}-${formatSeconds(item.endSec)}`}
+                  >
+                    <div className="timeline-segment-label">
+                      <span>{formatSeconds(item.startSec)}</span>
+                      <small>{formatSeconds(item.startSec)}-{formatSeconds(item.endSec)}</small>
+                    </div>
+                  </button>
+                );
+              })}
+              {playheadSourceSec !== null ? (
+                <div className="timeline-playhead" style={{ left: `${playheadSourceSec * pxPerSec}px` }} aria-hidden="true" />
+              ) : null}
+            </div>
+          </div>
+        ) : (
+          <div className="timeline-empty muted">No virtual clips yet.</div>
+        )}
       </div>
     </section>
   );
 }
 
-function commitCutChange(
-  cutRanges: SourceRange[],
-  sourceDuration: number,
-  originalCut: SourceRange,
-  nextCut: { startSec: number; endSec: number },
-  onReplaceTimeline: TimelinePaneProps['onReplaceTimeline'],
-) {
-  if (
-    Math.abs(originalCut.startSec - nextCut.startSec) < 0.01
-    && Math.abs(originalCut.endSec - nextCut.endSec) < 0.01
-  ) {
-    return;
-  }
-  const nextCuts = normalizeSourceRanges(sourceDuration, [
-    ...cutRanges.filter((cut) => cut.id !== originalCut.id),
-    { id: originalCut.id, startSec: nextCut.startSec, endSec: nextCut.endSec },
-  ]);
-  const nextIntervals = invertCutRanges(nextCuts, sourceDuration);
-  onReplaceTimeline(
-    nextIntervals,
-    `Changed cut ${formatSeconds(originalCut.startSec)}-${formatSeconds(originalCut.endSec)} to ${formatSeconds(nextCut.startSec)}-${formatSeconds(nextCut.endSec)}.`,
-  );
-}
-
-function normalizeSourceRanges(durationSec: number, ranges: Array<{ id?: string; startSec: number; endSec: number }>): SourceRange[] {
+function normalizeRanges(durationSec: number, ranges: Array<{ id?: string; startSec: number; endSec: number }>, idPrefix: string): SourceRange[] {
   const normalized = ranges
     .map((range, index) => ({
-      id: range.id ?? `range_${index + 1}`,
-      startSec: Math.max(0, Math.min(durationSec, range.startSec)),
-      endSec: Math.max(0, Math.min(durationSec, range.endSec)),
+      id: range.id ?? `${idPrefix}_${index + 1}`,
+      startSec: clamp(range.startSec, 0, durationSec),
+      endSec: clamp(range.endSec, 0, durationSec),
     }))
     .filter((range) => range.endSec > range.startSec)
     .sort((a, b) => a.startSec - b.startSec);
@@ -305,7 +453,7 @@ function normalizeSourceRanges(durationSec: number, ranges: Array<{ id?: string;
   for (const range of normalized) {
     const previous = merged.at(-1);
     if (!previous || range.startSec > previous.endSec) {
-      merged.push({ ...range, id: `cut_${merged.length + 1}` });
+      merged.push({ ...range, id: `${idPrefix}_${merged.length + 1}` });
       continue;
     }
     previous.endSec = Math.max(previous.endSec, range.endSec);
@@ -314,7 +462,7 @@ function normalizeSourceRanges(durationSec: number, ranges: Array<{ id?: string;
 }
 
 function deriveCutRanges(keptIntervals: SourceRange[], durationSec: number): SourceRange[] {
-  if (durationSec <= 0 || keptIntervals.length === 0) {
+  if (durationSec <= MIN_SOURCE_DURATION_SEC || keptIntervals.length === 0) {
     return [];
   }
   const cuts: SourceRange[] = [];
@@ -331,36 +479,51 @@ function deriveCutRanges(keptIntervals: SourceRange[], durationSec: number): Sou
   return cuts;
 }
 
-function invertCutRanges(cuts: SourceRange[], durationSec: number): Array<{ startSec: number; endSec: number }> {
-  const intervals: Array<{ startSec: number; endSec: number }> = [];
+function invertCutRanges(cuts: SourceRange[], durationSec: number): SourceRange[] {
+  const intervals: SourceRange[] = [];
   let cursor = 0;
-  for (const cut of cuts) {
+  for (const cut of normalizeRanges(durationSec, cuts, 'cut')) {
     if (cut.startSec > cursor) {
-      intervals.push({ startSec: cursor, endSec: cut.startSec });
+      intervals.push({ id: `clip_${intervals.length + 1}`, startSec: cursor, endSec: cut.startSec });
     }
     cursor = Math.max(cursor, cut.endSec);
   }
   if (cursor < durationSec) {
-    intervals.push({ startSec: cursor, endSec: durationSec });
+    intervals.push({ id: `clip_${intervals.length + 1}`, startSec: cursor, endSec: durationSec });
   }
   return intervals;
 }
 
 function buildTimelineItems(keptIntervals: SourceRange[], cutRanges: SourceRange[]): TimelineItem[] {
   return [
-    ...keptIntervals.map((range) => ({ type: 'clip' as const, startSec: range.startSec, endSec: range.endSec, range })),
-    ...cutRanges.map((range) => ({ type: 'cut' as const, startSec: range.startSec, endSec: range.endSec, range })),
-  ].sort((a, b) => a.startSec - b.startSec);
+    ...keptIntervals.map((range) => ({ ...range, kind: 'kept' as const })),
+    ...cutRanges.map((range) => ({ ...range, kind: 'cut' as const })),
+  ].sort((a, b) => a.startSec - b.startSec || (a.kind === 'kept' ? -1 : 1));
 }
 
-function timelineItemStyle(item: TimelineItem, trackTotal: number, trackWidthPx: number): CSSProperties {
-  const durationSec = Math.max(0, item.endSec - item.startSec);
-  const proportionalWidthPx = (durationSec / Math.max(trackTotal, 0.001)) * Math.max(trackWidthPx, 1);
+function timelineItemStyle(item: TimelineItem, pxPerSec: number): CSSProperties {
   return {
-    flexGrow: 0,
-    flexShrink: 0,
-    flexBasis: `${Math.max(SEGMENT_MIN_WIDTH_PX, proportionalWidthPx)}px`,
+    left: `${item.startSec * pxPerSec}px`,
+    width: `${Math.max(MIN_SEGMENT_WIDTH_PX, (item.endSec - item.startSec) * pxPerSec)}px`,
+    minWidth: `${MIN_SEGMENT_WIDTH_PX}px`,
   };
+}
+
+function buildRulerTicks(durationSec: number, pxPerSec: number): Array<{ timeSec: number; major: boolean }> {
+  const majorStepSec = chooseTickStep(90 / Math.max(pxPerSec, MIN_PX_PER_SEC));
+  const minorStepSec = majorStepSec / 5;
+  const ticks: Array<{ timeSec: number; major: boolean }> = [];
+  for (let timeSec = 0; timeSec <= durationSec + minorStepSec / 2; timeSec += minorStepSec) {
+    const rounded = Number(timeSec.toFixed(4));
+    const major = Math.abs(rounded / majorStepSec - Math.round(rounded / majorStepSec)) < 0.001;
+    ticks.push({ timeSec: Math.min(durationSec, rounded), major });
+  }
+  return ticks;
+}
+
+function chooseTickStep(minStepSec: number): number {
+  const steps = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+  return steps.find((step) => step >= minStepSec) ?? steps.at(-1)!;
 }
 
 function sourceToVirtualTime(intervals: Array<{ startSec: number; endSec: number }>, sourceSec: number): number {
