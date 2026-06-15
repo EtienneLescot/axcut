@@ -11,7 +11,16 @@ import { buildFillerSuggestions, buildPauseSuggestions, searchTranscript } from 
 import { normalizeIntervals, timelineIntervals } from '../lib/timeline.js';
 import { agentSessionsRoot } from '../lib/paths.js';
 import { createAxcutChatModel } from '../llm/create-chat-model.js';
-import { AgentSessionService, deriveSessionTitle, PersistentFileCheckpointSaver, type DeepAgentSessionRecord } from './agent-session-service.js';
+import {
+  AgentSessionService,
+  deriveSessionTitle,
+  PersistentFileCheckpointSaver,
+  type DeepAgentSessionRecord,
+  type RestoreCheckpointResult,
+  type SaveCheckpointOptions,
+  type SessionCheckpointMetadata,
+  type SessionCheckpointPayload,
+} from './agent-session-service.js';
 import type { DocumentService } from './document-service.js';
 import type { EventBus } from './event-bus.js';
 import type { LlmConfigService } from './llm-config-service.js';
@@ -403,6 +412,36 @@ export class AxcutDeepAgentService {
     await this.sessions.delete(sessionId);
   }
 
+  listCheckpoints(projectId: string, sessionId: string): SessionCheckpointMetadata[] {
+    this.getSession(projectId, sessionId);
+    return this.sessions.listCheckpointsSync(sessionId);
+  }
+
+  async saveCheckpoint(
+    projectId: string,
+    sessionId: string,
+    payload: SessionCheckpointPayload,
+    options: Omit<SaveCheckpointOptions, 'payload'> = {},
+  ): Promise<SessionCheckpointMetadata> {
+    this.getSession(projectId, sessionId);
+    return this.sessions.saveCheckpoint(sessionId, { ...options, payload });
+  }
+
+  async restoreCheckpoint(projectId: string, sessionId: string, checkpointId: string): Promise<RestoreCheckpointResult> {
+    this.getSession(projectId, sessionId);
+    return this.sessions.restoreCheckpoint(sessionId, checkpointId);
+  }
+
+  async deleteCheckpoint(projectId: string, sessionId: string, checkpointId: string): Promise<void> {
+    this.getSession(projectId, sessionId);
+    await this.sessions.deleteCheckpoint(sessionId, checkpointId);
+  }
+
+  async resetRuntimeThread(projectId: string, sessionId: string): Promise<void> {
+    this.getSession(projectId, sessionId);
+    await this.sessions.resetRuntimeThread(sessionId);
+  }
+
   async create(projectId: string) {
     const getProject = () => this.documents.readDocument(projectId);
 
@@ -509,6 +548,7 @@ export class AxcutDeepAgentService {
       messages: hasCheckpoint ? [new HumanMessage(invocationPrompt)] : buildAgentInputMessages(prompt, history, invocationPrompt),
     };
     const config = this.sessions.buildSessionConfig(sessionId);
+    this.sessions.clearRestoredRuntimeCheckpoint(sessionId);
     let result: unknown = null;
     let streamedResponse = '';
     let thinkingOperationId = '';
@@ -619,7 +659,6 @@ export class AxcutDeepAgentService {
       result = await agent.invoke(input, config);
     }
 
-    await this.sessions.saveCheckpoint(sessionId);
     const currentSession = this.sessions.get(sessionId);
     this.sessions.touch(sessionId, {
       title: currentSession?.title === 'New conversation'
@@ -640,12 +679,12 @@ export class AxcutDeepAgentService {
     }
 
     const latest = this.sessions.listCheckpointsSync(sessionId)[0];
-    if (!latest) {
+    if (!latest?.runtimeCheckpointId) {
       return false;
     }
 
-    await this.sessions.restoreCheckpoint(sessionId, latest.id);
-    return true;
+    const restored = await this.sessions.restoreCheckpoint(sessionId, latest.id);
+    return restored.langGraphRestored;
   }
 
   private projectScope(projectId: string) {

@@ -65,6 +65,9 @@ export function reduceLiveRunState(state: LiveRunState, event: ProjectStreamEven
   }
 
   if (event.type === 'agent.operation') {
+    if (!state.active && !state.userMessage && !state.assistantDraft) {
+      return state;
+    }
     const operation = normalizeOperation(event.payload.operation);
     if (!operation) {
       return state;
@@ -101,13 +104,7 @@ export function reduceLiveRunState(state: LiveRunState, event: ProjectStreamEven
   }
 
   if (event.type === 'agent.message.assistant') {
-    return {
-      ...state,
-      active: false,
-      assistantDraft: '',
-      thinking: '',
-      operations: state.operations.filter((operation) => operation.category !== 'thinking'),
-    };
+    return emptyLiveRunState;
   }
 
   return state;

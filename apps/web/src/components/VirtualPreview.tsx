@@ -9,10 +9,11 @@ type VirtualPreviewProps = {
   clips: AxcutClip[];
   revision: number;
   seekTarget?: { timeSec: number; requestId: number } | null;
+  sourcePreviewTarget?: { sourceTimeSec: number; requestId: number } | null;
   onTimeChange?: (timeSec: number) => void;
 };
 
-export function VirtualPreview({ videoSources, clips, revision, seekTarget, onTimeChange }: VirtualPreviewProps) {
+export function VirtualPreview({ videoSources, clips, revision, seekTarget, sourcePreviewTarget, onTimeChange }: VirtualPreviewProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const isProgrammaticSeekRef = useRef(false);
   const [virtualTimeSec, setVirtualTimeSec] = useState(0);
@@ -21,7 +22,6 @@ export function VirtualPreview({ videoSources, clips, revision, seekTarget, onTi
   const [sourceIndex, setSourceIndex] = useState(0);
 
   const virtualDurationSec = useMemo(() => totalVirtualDuration(clips), [clips]);
-  const activePosition = useMemo(() => locateVirtualPosition(clips, virtualTimeSec), [clips, virtualTimeSec]);
   const activeSource = videoSources[sourceIndex] ?? null;
 
   const updateVirtualTime = useCallback((nextTimeSec: number) => {
@@ -136,12 +136,24 @@ export function VirtualPreview({ videoSources, clips, revision, seekTarget, onTi
     seekToVirtualTime(seekTarget.timeSec);
   }, [seekTarget, seekToVirtualTime]);
 
+  useEffect(() => {
+    if (!sourcePreviewTarget) {
+      return;
+    }
+    const video = videoRef.current;
+    if (!video) {
+      return;
+    }
+    video.pause();
+    setIsPlaying(false);
+    isProgrammaticSeekRef.current = true;
+    if (Math.abs(video.currentTime - sourcePreviewTarget.sourceTimeSec) > 0.01) {
+      video.currentTime = sourcePreviewTarget.sourceTimeSec;
+    }
+  }, [sourcePreviewTarget]);
+
   return (
     <>
-      <p className="muted preview-summary">
-        Seek-based virtual preview · {clips.length} clip{clips.length === 1 ? '' : 's'} · {formatSeconds(virtualDurationSec)}
-        {activeSource ? ` · ${activeSource.label}` : ''}
-      </p>
       {activeSource ? (
         <>
           <div className="video-frame">
@@ -209,14 +221,9 @@ export function VirtualPreview({ videoSources, clips, revision, seekTarget, onTi
             />
           </div>
 
-          <div className="preview-meta muted">
-            {loadState === 'error'
-              ? 'Preview request failed. Verify the source or proxy file exists and is streamable.'
-              : activePosition
-              ? `Previewing clip ${activePosition.clipIndex + 1}/${clips.length} at source ${formatSeconds(activePosition.sourceTimeSec)}`
-               : 'No virtual timeline available yet.'}
-          </div>
-
+          {loadState === 'error' ? (
+            <div className="preview-meta muted">Preview request failed. Verify the source or proxy file exists and is streamable.</div>
+          ) : null}
         </>
       ) : <div className="video placeholder">Attach a video to start previewing.</div>}
     </>
