@@ -752,6 +752,7 @@ export function App() {
   const providerButtonRef = useRef<HTMLButtonElement | null>(null);
   const reasoningButtonRef = useRef<HTMLButtonElement | null>(null);
   const pendingTimelineEditRef = useRef<PendingTimelineEdit | null>(null);
+  const pendingTranscriptDraftRef = useRef<{ draft: string; resetOnNoop: boolean } | null>(null);
 
   const layoutStyle = useMemo(() => ({
     '--chat-panel-width': `${chatPanelWidth}px`,
@@ -1366,21 +1367,51 @@ export function App() {
     }
   }, [editedTranscript, transcriptDraftFocused]);
 
-  const commitTranscriptDraft = useCallback(() => {
-    setTranscriptDraftFocused(false);
-    if (!document || transcriptDraft === editedTranscript || replaceTimeline.isPending) {
+  const commitTranscriptDraftValue = useCallback((draft: string, options?: { resetOnNoop?: boolean }) => {
+    if (!document || draft === editedTranscript) {
       return;
     }
-    const update = deriveEditableTranscriptUpdate(document, transcriptDraft);
+    if (replaceTimeline.isPending) {
+      pendingTranscriptDraftRef.current = { draft, resetOnNoop: Boolean(options?.resetOnNoop) };
+      return;
+    }
+    const update = deriveEditableTranscriptUpdate(document, draft);
     if (!update) {
-      setTranscriptDraft(editedTranscript);
+      if (options?.resetOnNoop) {
+        setTranscriptDraft(editedTranscript);
+      }
       return;
     }
+    pendingTranscriptDraftRef.current = null;
     queueReplaceTimeline(
       update.intervals,
       `Edited current transcription and removed ${update.deletedWordIds.length} word${update.deletedWordIds.length === 1 ? '' : 's'}.`,
     );
-  }, [document, editedTranscript, queueReplaceTimeline, replaceTimeline.isPending, transcriptDraft]);
+  }, [document, editedTranscript, queueReplaceTimeline, replaceTimeline.isPending]);
+
+  useEffect(() => {
+    if (!transcriptDraftFocused || replaceTimeline.isPending || transcriptDraft === editedTranscript) {
+      return undefined;
+    }
+    const timeoutId = window.setTimeout(() => {
+      commitTranscriptDraftValue(transcriptDraft);
+    }, 250);
+    return () => window.clearTimeout(timeoutId);
+  }, [commitTranscriptDraftValue, editedTranscript, replaceTimeline.isPending, transcriptDraft, transcriptDraftFocused]);
+
+  useEffect(() => {
+    if (replaceTimeline.isPending || !pendingTranscriptDraftRef.current) {
+      return;
+    }
+    const pending = pendingTranscriptDraftRef.current;
+    pendingTranscriptDraftRef.current = null;
+    commitTranscriptDraftValue(pending.draft, { resetOnNoop: pending.resetOnNoop });
+  }, [commitTranscriptDraftValue, replaceTimeline.isPending]);
+
+  const commitTranscriptDraft = useCallback(() => {
+    setTranscriptDraftFocused(false);
+    commitTranscriptDraftValue(transcriptDraft, { resetOnNoop: true });
+  }, [commitTranscriptDraftValue, transcriptDraft]);
 
   return (
     <div className={appShellClassName} style={layoutStyle}>
@@ -1681,10 +1712,16 @@ export function App() {
         <textarea
           className="transcript-viewer transcription-panel-content"
           value={document?.transcript ? transcriptDraft : 'No transcript is available yet.'}
-          disabled={!document?.transcript || replaceTimeline.isPending}
+          disabled={!document?.transcript}
           spellCheck={false}
           onFocus={() => setTranscriptDraftFocused(true)}
-          onChange={(event) => setTranscriptDraft(event.target.value)}
+          onChange={(event) => {
+            const nextDraft = event.target.value;
+            setTranscriptDraft(nextDraft);
+            if (replaceTimeline.isPending) {
+              pendingTranscriptDraftRef.current = { draft: nextDraft, resetOnNoop: false };
+            }
+          }}
           onBlur={commitTranscriptDraft}
           onKeyDown={(event) => {
             if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
