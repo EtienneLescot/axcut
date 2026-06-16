@@ -11,7 +11,6 @@ import {
   Download,
   ExternalLink,
   Eye,
-  FileText,
   FolderOpen,
   GitBranch,
   History,
@@ -40,6 +39,7 @@ import { CurrentTranscriptView } from './components/CurrentTranscriptView.js';
 import { TimelinePane } from './components/TimelinePane.js';
 import { VirtualPreview } from './components/VirtualPreview.js';
 import { emptyLiveRunState, reduceLiveRunState, type LiveOperation, type LiveRunState, type ProjectStreamEvent } from './lib/live-run.js';
+import { locateVirtualPosition } from './lib/virtual-preview.js';
 
 type ProjectSummary = {
   id: string;
@@ -227,6 +227,20 @@ function writeStoredBoolean(key: string, value: boolean): void {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function sourceToVirtualTime(clips: AxcutClip[], sourceTimeSec: number): number {
+  let cursor = 0;
+  for (const clip of clips) {
+    if (sourceTimeSec <= clip.sourceStartSec) {
+      return cursor;
+    }
+    if (sourceTimeSec <= clip.sourceEndSec) {
+      return cursor + Math.max(0, sourceTimeSec - clip.sourceStartSec);
+    }
+    cursor += clip.sourceEndSec - clip.sourceStartSec;
+  }
+  return cursor;
 }
 
 function getProviderUserDescription(provider: Pick<LlmProviderState, 'id' | 'defaultModel'>) {
@@ -1313,7 +1327,6 @@ export function App() {
       ].filter(Boolean).join(' / ')
     : 'LLM not configured';
   const agentResponsePending = sendChat.isPending && liveRun.active && !liveRun.assistantDraft;
-  const projectCount = projectsQuery.data?.projects.length ?? 0;
   const sourceTranscriptName = artifactName(document?.transcript?.sourceDslPath ?? document?.transcript?.sourceJsonPath);
   const sourceTranscriptQuery = useQuery({
     enabled: Boolean(transcriptModal === 'source' && projectId && sessionToken && sourceTranscriptName),
@@ -1328,6 +1341,18 @@ export function App() {
         ? regenerateTranscript.error.message
         : null
     : null;
+  const cueSourceTimeSec = useMemo(
+    () => document ? locateVirtualPosition(document.timeline.clips, virtualTimeSec)?.sourceTimeSec ?? null : null,
+    [document, virtualTimeSec],
+  );
+  const seekTranscriptSourceTime = useCallback((sourceTimeSec: number) => {
+    if (!document) {
+      return;
+    }
+    const nextVirtualTimeSec = sourceToVirtualTime(document.timeline.clips, sourceTimeSec);
+    setVirtualTimeSec(nextVirtualTimeSec);
+    setSeekTarget({ timeSec: nextVirtualTimeSec, requestId: Date.now() });
+  }, [document]);
 
   return (
     <div className={appShellClassName} style={layoutStyle}>
@@ -1565,33 +1590,18 @@ export function App() {
           </div>
           <div className="preview-actions">
             <div className="preview-statuses">
-              <StatusChip label={sttStatus.label} detail={sttStatus.detail} tone={sttStatus.tone} />
+              <TranscriptionStatusButton
+                label={sttStatus.label}
+                detail={sttStatus.detail}
+                tone={sttStatus.tone}
+                onClick={() => setTranscriptModal('source')}
+                disabled={!projectId || !sessionToken}
+              />
               {exportStatus ? <StatusChip label={exportStatus.label} detail={exportStatus.detail} tone={exportStatus.tone} href={exportHref} /> : null}
             </div>
             <div className="preview-project-controls">
-              {projectCount > 1 ? (
-                <select
-                  className="project-select"
-                  value={projectId ?? ''}
-                  onChange={(event) => {
-                    setSelectedProjectId(event.target.value || null);
-                    setActiveSessionId(null);
-                  }}
-                  aria-label="Current project"
-                >
-                  {projectsQuery.data?.projects.map((project) => (
-                    <option key={project.id} value={project.id}>{project.title}</option>
-                  ))}
-                </select>
-              ) : (
-                <div className="project-title-pill compact">
-                  <span className="muted">Project</span>
-                  <strong>{document?.project.title ?? 'No video loaded'}</strong>
-                </div>
-              )}
-              <IconButton icon={FolderOpen} label="Load video" className="secondary" onClick={() => setLoadVideoOpen(true)} />
+              <IconButton icon={FolderOpen} label="Open projects" className="secondary" onClick={() => setLoadVideoOpen(true)} />
             </div>
-            <IconButton icon={FileText} label="Source transcript" className="secondary" onClick={() => setTranscriptModal('source')} disabled={!sourceTranscriptName} />
             <IconButton icon={Download} label={exportBusy ? 'Exporting' : 'Export'} onClick={() => exportVideo.mutate()} disabled={!document?.timeline.clips.length || !sessionToken || exportBusy} />
           </div>
         </div>
@@ -1622,13 +1632,14 @@ export function App() {
         <div className="transcript-panel-header">
           <div>
             <h2>Current Transcription</h2>
-            <p className="muted">Projection of the current DSL result.</p>
           </div>
         </div>
         <CurrentTranscriptView
           document={document ?? null}
           busy={!activeSessionId || sendChat.isPending || replaceTimeline.isPending}
           sourceDurationSec={primaryAsset?.durationSec ?? 0}
+          cueSourceTimeSec={cueSourceTimeSec}
+          onSeekSourceTime={seekTranscriptSourceTime}
           onReplaceTimeline={queueReplaceTimeline}
         />
       </aside>
@@ -1693,9 +1704,16 @@ export function App() {
 
       {loadVideoOpen ? (
         <LoadVideoDialog
+          projects={projectsQuery.data?.projects ?? []}
+          activeProjectId={projectId}
           busy={loadVideo.isPending}
           error={loadVideo.error instanceof Error ? loadVideo.error.message : null}
           onClose={() => setLoadVideoOpen(false)}
+          onSelectProject={(nextProjectId) => {
+            setSelectedProjectId(nextProjectId);
+            setActiveSessionId(null);
+            setLoadVideoOpen(false);
+          }}
           onLoad={(input) => loadVideo.mutate(input)}
         />
       ) : null}
@@ -1704,7 +1722,7 @@ export function App() {
         <TranscriptDialog
           title="Source Transcript"
           subtitle={sourceTranscriptName ?? 'No transcript artifact available yet.'}
-          content={sourceTranscriptQuery.data ?? ''}
+          content={sourceTranscriptQuery.data ?? (sourceTranscriptName ? '' : 'No source transcript artifact is available yet. You can regenerate the transcript from here.')}
           loading={sourceTranscriptQuery.isLoading}
           error={sourceTranscriptError}
           detectedLanguage={document?.transcript?.language}
@@ -1736,6 +1754,37 @@ function StatusChip({ label, detail, tone, href }: { label: string; detail: stri
         </a>
       ) : null}
     </div>
+  );
+}
+
+function TranscriptionStatusButton({
+  label,
+  detail,
+  tone,
+  disabled,
+  onClick,
+}: {
+  label: string;
+  detail: string;
+  tone: 'idle' | 'running' | 'ready' | 'error';
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`status-chip transcript-status-button ${tone}`}
+      title={`${label}: ${detail}`}
+      aria-label={`${label}: ${detail}. Open transcript options.`}
+      onClick={onClick}
+      disabled={disabled}
+    >
+      <span className="status-dot" aria-hidden="true" />
+      <span className="status-chip-copy">
+        <strong>{label}</strong>
+        <span className="muted">{detail}</span>
+      </span>
+    </button>
   );
 }
 
@@ -1882,49 +1931,90 @@ function SessionHistoryDialog({
 }
 
 function LoadVideoDialog({
+  projects,
+  activeProjectId,
   busy,
   error,
   onClose,
+  onSelectProject,
   onLoad,
 }: {
+  projects: ProjectSummary[];
+  activeProjectId: string | null;
   busy: boolean;
   error: string | null;
   onClose: () => void;
+  onSelectProject: (projectId: string) => void;
   onLoad: (input: { title: string; path: string }) => void;
 }) {
   const [title, setTitle] = useState('');
   const [path, setPath] = useState('');
+  const recentProjects = useMemo(
+    () => [...projects].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()).slice(0, 8),
+    [projects],
+  );
 
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true">
-      <section className="modal panel load-video-modal">
+      <section className="modal panel load-video-modal project-modal">
         <div className="modal-header">
           <div>
-            <h2>Load Video</h2>
-            <p className="muted">Enter a video path that exists on the machine running the Axcut server.</p>
+            <h2>Projects</h2>
+            <p className="muted">Open a recent project or create one from a server-local video.</p>
           </div>
           <IconButton icon={X} label="Close" className="secondary" onClick={onClose} />
         </div>
-        <form
-          className="provider-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (path.trim()) {
-              onLoad({ title, path: path.trim() });
-            }
-          }}
-        >
-          <label>
-            <span className="muted">Project title</span>
-            <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Defaults to the video filename" />
-          </label>
-          <label>
-            <span className="muted">Server-local video path</span>
-            <input value={path} onChange={(event) => setPath(event.target.value)} placeholder="/home/you/Videos/source.mp4" />
-          </label>
-          {error ? <p className="error-copy">{error}</p> : null}
-          <IconButton icon={Upload} label={busy ? 'Loading video' : 'Create project and ingest'} disabled={busy || !path.trim()} />
-        </form>
+        <div className="project-modal-grid">
+          <section className="project-modal-section">
+            <div className="project-modal-section-header">
+              <h3>Recent projects</h3>
+              <span className="muted">{recentProjects.length} available</span>
+            </div>
+            <div className="project-recent-list">
+              {recentProjects.length > 0 ? recentProjects.map((project) => (
+                <button
+                  key={project.id}
+                  type="button"
+                  className={project.id === activeProjectId ? 'project-recent-item active' : 'project-recent-item'}
+                  onClick={() => onSelectProject(project.id)}
+                >
+                  <span>
+                    <strong>{project.title}</strong>
+                    <small className="muted">{new Date(project.updatedAt).toLocaleString()}</small>
+                  </span>
+                  {project.id === activeProjectId ? <span className="status-pill ready">Open</span> : null}
+                </button>
+              )) : (
+                <p className="project-empty muted">No recent projects yet.</p>
+              )}
+            </div>
+          </section>
+          <section className="project-modal-section">
+            <div className="project-modal-section-header">
+              <h3>New project</h3>
+            </div>
+            <form
+              className="provider-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (path.trim()) {
+                  onLoad({ title, path: path.trim() });
+                }
+              }}
+            >
+              <label>
+                <span className="muted">Project title</span>
+                <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Defaults to the video filename" />
+              </label>
+              <label>
+                <span className="muted">Server-local video path</span>
+                <input value={path} onChange={(event) => setPath(event.target.value)} placeholder="/home/you/Videos/source.mp4" />
+              </label>
+              {error ? <p className="error-copy">{error}</p> : null}
+              <IconButton icon={Upload} label={busy ? 'Loading video' : 'Create project and ingest'} disabled={busy || !path.trim()} />
+            </form>
+          </section>
+        </div>
       </section>
     </div>
   );

@@ -1,14 +1,16 @@
 import { useCallback, useLayoutEffect, useMemo, useRef } from 'react';
-import type { ClipboardEvent as ReactClipboardEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
+import type { ClipboardEvent as ReactClipboardEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from 'react';
 import type { AxcutClip, AxcutDocument, AxcutWord } from '@axcut/schema';
 import { Trash2 } from 'lucide-react';
 
-import { formatSeconds, keptWordIdSet, selectWordRange } from '../lib/virtual-preview.js';
+import { formatSeconds, selectWordRange } from '../lib/virtual-preview.js';
 
 type CurrentTranscriptViewProps = {
   document: AxcutDocument | null;
   busy: boolean;
   sourceDurationSec: number;
+  cueSourceTimeSec: number | null;
+  onSeekSourceTime: (sourceTimeSec: number) => void;
   onReplaceTimeline: (intervals: Array<{ startSec: number; endSec: number }>, reason: string) => void;
 };
 
@@ -20,22 +22,38 @@ type TranscriptRun = {
   endSec: number;
 };
 
-export function CurrentTranscriptView({ document, busy, sourceDurationSec, onReplaceTimeline }: CurrentTranscriptViewProps) {
+const SILENCE_TOKEN_THRESHOLD_SEC = 0.5;
+
+export function CurrentTranscriptView({ document, busy, sourceDurationSec, cueSourceTimeSec, onSeekSourceTime, onReplaceTimeline }: CurrentTranscriptViewProps) {
   const editorRef = useRef<HTMLDivElement | null>(null);
   const pendingCaretWordIdRef = useRef<string | null>(null);
 
-  const words = useMemo(() => (
+  const transcriptWords = useMemo(() => (
     [...(document?.transcript?.words ?? [])].sort((a, b) => a.startSec - b.startSec)
   ), [document?.transcript?.words]);
-  const keptWords = useMemo(() => keptWordIdSet(document?.timeline.clips ?? []), [document?.timeline.clips]);
-  const runs = useMemo(() => buildTranscriptRuns(words, keptWords), [keptWords, words]);
   const sourceDuration = useMemo(() => (
     Math.max(
       sourceDurationSec,
       ...(document?.timeline.clips.map((clip) => clip.sourceEndSec) ?? [0]),
-      ...words.map((word) => word.endSec),
+      ...(document?.transcript?.segments.map((segment) => segment.endSec) ?? [0]),
+      ...transcriptWords.map((word) => word.endSec),
     )
-  ), [document?.timeline.clips, sourceDurationSec, words]);
+  ), [document?.timeline.clips, document?.transcript?.segments, sourceDurationSec, transcriptWords]);
+  const keptIntervals = useMemo(
+    () => normalizeIntervals(sourceDuration, timelineIntervals(document?.timeline.clips ?? [])),
+    [document?.timeline.clips, sourceDuration],
+  );
+  const displayTranscript = useMemo(
+    () => buildDisplayTranscriptWords(document, keptIntervals, sourceDuration),
+    [document, keptIntervals, sourceDuration],
+  );
+  const words = displayTranscript.words;
+  const keptWords = displayTranscript.keptWordIds;
+  const runs = useMemo(() => buildTranscriptRuns(words, keptWords), [keptWords, words]);
+  const cueWordId = useMemo(
+    () => findCueWordId(words, cueSourceTimeSec),
+    [cueSourceTimeSec, words],
+  );
 
   useLayoutEffect(() => {
     const wordId = pendingCaretWordIdRef.current;
@@ -138,6 +156,35 @@ export function CurrentTranscriptView({ document, busy, sourceDurationSec, onRep
     event.preventDefault();
   }, []);
 
+  const seekCaretSourceTime = useCallback(() => {
+    const selection = globalThis.getSelection();
+    const editor = editorRef.current;
+    if (!selection || !selection.isCollapsed || !editor || !editor.contains(selection.anchorNode)) {
+      return;
+    }
+    const sourceTimeSec = sourceTimeFromCaret(editor, selection.anchorNode, selection.anchorOffset, words);
+    if (sourceTimeSec === null) {
+      return;
+    }
+    onSeekSourceTime(sourceTimeSec);
+  }, [onSeekSourceTime, words]);
+
+  const handlePointerUp = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) {
+      return;
+    }
+    const targetElement = event.target instanceof Element ? event.target : null;
+    if (targetElement?.closest('button')) {
+      return;
+    }
+    const sourceTimeSec = sourceTimeFromPointer(event.target, event.clientX, words);
+    if (sourceTimeSec !== null) {
+      onSeekSourceTime(sourceTimeSec);
+      return;
+    }
+    requestAnimationFrame(seekCaretSourceTime);
+  }, [onSeekSourceTime, seekCaretSourceTime, words]);
+
   if (!document?.transcript) {
     return (
       <div className="transcript-empty muted">
@@ -168,7 +215,9 @@ export function CurrentTranscriptView({ document, busy, sourceDurationSec, onRep
         aria-multiline="true"
         onBeforeInput={handleBeforeInput}
         onKeyDown={handleKeyDown}
+        onKeyUp={seekCaretSourceTime}
         onPaste={handlePaste}
+        onPointerUp={handlePointerUp}
       >
         {runs.map((run) => (
           run.kind === 'cut' ? (
@@ -182,13 +231,18 @@ export function CurrentTranscriptView({ document, busy, sourceDurationSec, onRep
                   key={word.id}
                   word={word}
                   dropped
+                  cue={word.id === cueWordId}
                 />
               ))}
               <button
                 className="transcript-cut-delete"
                 type="button"
                 contentEditable={false}
-                onClick={() => restoreCutRun(run)}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  restoreCutRun(run);
+                }}
+                onPointerUp={(event) => event.stopPropagation()}
                 disabled={busy}
                 title="Delete cut"
                 aria-label={`Delete cut ${formatSeconds(run.startSec)}-${formatSeconds(run.endSec)}`}
@@ -203,6 +257,7 @@ export function CurrentTranscriptView({ document, busy, sourceDurationSec, onRep
                   key={word.id}
                   word={word}
                   dropped={false}
+                  cue={word.id === cueWordId}
                 />
               ))}
             </span>
@@ -216,22 +271,217 @@ export function CurrentTranscriptView({ document, busy, sourceDurationSec, onRep
 function TranscriptWord({
   word,
   dropped,
+  cue,
 }: {
   word: AxcutWord;
   dropped: boolean;
+  cue: boolean;
 }) {
   return (
     <span
       className={[
         'transcript-word',
+        isSilenceWord(word) ? 'silence' : '',
         dropped ? 'cut' : 'kept',
+        cue ? 'cue' : '',
       ].filter(Boolean).join(' ')}
       data-word-id={word.id}
+      data-start-sec={word.startSec}
+      data-end-sec={word.endSec}
+      title={isSilenceWord(word) ? `${formatSeconds(word.startSec)}-${formatSeconds(word.endSec)}` : undefined}
     >
       {word.text}
       {' '}
     </span>
   );
+}
+
+export function findCueWordId(words: AxcutWord[], cueSourceTimeSec: number | null): string | null {
+  if (cueSourceTimeSec === null) {
+    return null;
+  }
+  const exactSilence = words.find((word) => (
+    isSilenceWord(word)
+    && cueSourceTimeSec >= word.startSec
+    && cueSourceTimeSec < word.endSec
+  ));
+  if (exactSilence) {
+    return exactSilence.id;
+  }
+
+  let previousWordId: string | null = null;
+  const spokenWords = words
+    .filter((word) => !isSilenceWord(word))
+    .sort((a, b) => a.startSec - b.startSec || a.endSec - b.endSec);
+
+  for (const [index, word] of spokenWords.entries()) {
+    if (cueSourceTimeSec < word.startSec) {
+      return previousWordId;
+    }
+    const isLast = index === spokenWords.length - 1;
+    if (cueSourceTimeSec >= word.startSec && (cueSourceTimeSec < word.endSec || (isLast && cueSourceTimeSec <= word.endSec))) {
+      return word.id;
+    }
+    previousWordId = word.id;
+  }
+
+  return previousWordId;
+}
+
+function buildDisplayTranscriptWords(
+  document: AxcutDocument | null,
+  keptIntervals: Array<{ startSec: number; endSec: number }>,
+  sourceDuration: number,
+): { words: AxcutWord[]; keptWordIds: Set<string> } {
+  const transcript = document?.transcript;
+  if (!transcript) {
+    return { words: [], keptWordIds: new Set() };
+  }
+
+  const keptWordIds = new Set<string>();
+  const displayWords: AxcutWord[] = [];
+  const transcriptWords = [...transcript.words].sort((a, b) => a.startSec - b.startSec);
+  for (const word of transcriptWords) {
+    displayWords.push(word);
+    if (intervalOverlaps(word, keptIntervals)) {
+      keptWordIds.add(word.id);
+    }
+  }
+
+  const silenceWords: AxcutWord[] = [];
+  for (const [silenceIndex, silence] of collectSilenceIntervals(transcriptWords, transcript.segments, sourceDuration).entries()) {
+    for (const [partIndex, part] of splitIntervalByKept(silence.startSec, silence.endSec, keptIntervals).entries()) {
+      if (part.endSec - part.startSec < SILENCE_TOKEN_THRESHOLD_SEC) {
+        continue;
+      }
+      const silenceWord = createSilenceWord(`silence_${silenceIndex}`, partIndex, part.startSec, part.endSec);
+      silenceWords.push(silenceWord);
+      displayWords.push(silenceWord);
+      if (part.kept) {
+        keptWordIds.add(silenceWord.id);
+      }
+    }
+  }
+
+  const cutIntervals = invertIntervals(keptIntervals, sourceDuration);
+  for (const [index, cut] of cutIntervals.entries()) {
+    if (cut.endSec - cut.startSec < SILENCE_TOKEN_THRESHOLD_SEC) {
+      continue;
+    }
+    const overlapsTranscriptContent = [...transcriptWords, ...silenceWords]
+      .some((word) => intervalOverlaps(word, [cut]));
+    if (overlapsTranscriptContent) {
+      continue;
+    }
+    displayWords.push(createSilenceWord('implicit_cut', index, cut.startSec, cut.endSec));
+  }
+
+  return {
+    words: displayWords.sort((a, b) => a.startSec - b.startSec || a.endSec - b.endSec),
+    keptWordIds,
+  };
+}
+
+function createSilenceWord(segmentId: string, index: number, startSec: number, endSec: number): AxcutWord {
+  const durationSec = Math.max(0, endSec - startSec);
+  return {
+    id: `silence_${segmentId}_${index}_${startSec.toFixed(3)}_${endSec.toFixed(3)}`,
+    segmentId,
+    startSec,
+    endSec,
+    text: `(${durationSec.toFixed(1)}s)`,
+  };
+}
+
+function collectSilenceIntervals(
+  words: AxcutWord[],
+  segments: Array<{ kind: string; startSec: number; endSec: number }>,
+  sourceDuration: number,
+): Array<{ startSec: number; endSec: number }> {
+  const candidates: Array<{ startSec: number; endSec: number }> = [];
+  for (const segment of segments) {
+    if (segment.kind === 'silence') {
+      candidates.push({ startSec: segment.startSec, endSec: segment.endSec });
+    }
+  }
+  for (let index = 0; index < words.length - 1; index += 1) {
+    const current = words[index];
+    const next = words[index + 1];
+    if (next.startSec > current.endSec) {
+      candidates.push({ startSec: current.endSec, endSec: next.startSec });
+    }
+  }
+  const firstWord = words[0];
+  const lastWord = words.at(-1);
+  if (firstWord && firstWord.startSec > 0) {
+    candidates.push({ startSec: 0, endSec: firstWord.startSec });
+  }
+  if (lastWord && sourceDuration > lastWord.endSec) {
+    candidates.push({ startSec: lastWord.endSec, endSec: sourceDuration });
+  }
+  return normalizeIntervals(sourceDuration, candidates)
+    .filter((interval) => interval.endSec - interval.startSec >= SILENCE_TOKEN_THRESHOLD_SEC);
+}
+
+function splitIntervalByKept(
+  startSec: number,
+  endSec: number,
+  keptIntervals: Array<{ startSec: number; endSec: number }>,
+): Array<{ startSec: number; endSec: number; kept: boolean }> {
+  const boundaries = new Set([startSec, endSec]);
+  for (const interval of keptIntervals) {
+    if (interval.endSec <= startSec || interval.startSec >= endSec) {
+      continue;
+    }
+    boundaries.add(Math.max(startSec, interval.startSec));
+    boundaries.add(Math.min(endSec, interval.endSec));
+  }
+  const sortedBoundaries = [...boundaries].sort((a, b) => a - b);
+  const parts: Array<{ startSec: number; endSec: number; kept: boolean }> = [];
+  for (let index = 0; index < sortedBoundaries.length - 1; index += 1) {
+    const partStart = sortedBoundaries[index];
+    const partEnd = sortedBoundaries[index + 1];
+    if (partEnd - partStart < SILENCE_TOKEN_THRESHOLD_SEC) {
+      continue;
+    }
+    const midpoint = partStart + ((partEnd - partStart) / 2);
+    parts.push({
+      startSec: partStart,
+      endSec: partEnd,
+      kept: keptIntervals.some((interval) => midpoint >= interval.startSec && midpoint < interval.endSec),
+    });
+  }
+  return parts;
+}
+
+function invertIntervals(
+  intervals: Array<{ startSec: number; endSec: number }>,
+  durationSec: number,
+): Array<{ startSec: number; endSec: number }> {
+  const normalized = normalizeIntervals(durationSec, intervals);
+  const output: Array<{ startSec: number; endSec: number }> = [];
+  let cursor = 0;
+  for (const interval of normalized) {
+    if (interval.startSec > cursor) {
+      output.push({ startSec: cursor, endSec: interval.startSec });
+    }
+    cursor = Math.max(cursor, interval.endSec);
+  }
+  if (durationSec > cursor) {
+    output.push({ startSec: cursor, endSec: durationSec });
+  }
+  return output;
+}
+
+function intervalOverlaps(
+  range: { startSec: number; endSec: number },
+  intervals: Array<{ startSec: number; endSec: number }>,
+): boolean {
+  return intervals.some((interval) => range.endSec > interval.startSec && range.startSec < interval.endSec);
+}
+
+function isSilenceWord(word: AxcutWord): boolean {
+  return word.id.startsWith('silence_');
 }
 
 function buildTranscriptRuns(words: AxcutWord[], keptWords: Set<string>): TranscriptRun[] {
@@ -324,6 +574,52 @@ function findSelectionWordId(
   direction: 'backward' | 'forward',
 ): string | null {
   return findWordId(node) ?? findCollapsedDeletionWordId(editor, node, offset, direction);
+}
+
+export function sourceTimeFromCaret(
+  editor: HTMLElement,
+  node: Node | null,
+  offset: number,
+  words: AxcutWord[],
+): number | null {
+  const wordElement = closestWordElement(node);
+  if (wordElement?.dataset.wordId) {
+    const word = words.find((item) => item.id === wordElement.dataset.wordId);
+    if (!word) {
+      return null;
+    }
+    return interpolateWordSourceTime(word, node, offset);
+  }
+
+  const wordId = findSelectionWordId(editor, node, offset, 'forward')
+    ?? findSelectionWordId(editor, node, offset, 'backward');
+  const word = words.find((item) => item.id === wordId);
+  return word ? word.startSec : null;
+}
+
+function sourceTimeFromPointer(target: EventTarget | null, clientX: number, words: AxcutWord[]): number | null {
+  const targetElement = target instanceof Element ? target : null;
+  const wordElement = targetElement?.closest<HTMLElement>('[data-word-id]');
+  if (!wordElement?.dataset.wordId) {
+    return null;
+  }
+  const word = words.find((item) => item.id === wordElement.dataset.wordId);
+  if (!word) {
+    return null;
+  }
+  const rect = wordElement.getBoundingClientRect();
+  const ratio = rect.width > 0 ? Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) : 0;
+  return word.startSec + (Math.max(0, word.endSec - word.startSec) * ratio);
+}
+
+function interpolateWordSourceTime(word: AxcutWord, node: Node | null, offset: number): number {
+  const durationSec = Math.max(0, word.endSec - word.startSec);
+  if (durationSec <= 0 || node?.nodeType !== Node.TEXT_NODE) {
+    return word.startSec;
+  }
+  const textLength = Math.max(1, word.text.length);
+  const ratio = Math.max(0, Math.min(1, offset / textLength));
+  return word.startSec + (durationSec * ratio);
 }
 
 function findDescendantWordId(node: Node): string | null {
