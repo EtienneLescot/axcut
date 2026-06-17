@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { pipeline } from 'node:stream/promises';
 
 import { applyOperationInputSchema, exportInputSchema, transcribeInputSchema, type ApplyOperationInput } from '@axcut/schema';
 import cors from '@fastify/cors';
@@ -8,7 +9,7 @@ import Fastify from 'fastify';
 import { ZodError } from 'zod';
 
 import { streamFile } from './lib/media-stream.js';
-import { databasePath, dataRoot, projectArtifactsRoot, repoRoot, runtimeRoot } from './lib/paths.js';
+import { databasePath, dataRoot, projectArtifactsRoot, projectRoot, repoRoot, runtimeRoot } from './lib/paths.js';
 import type { SessionCheckpointMetadata } from './services/agent-session-service.js';
 import { AxcutAgentRuntime } from './services/axcut-agent-runtime.js';
 import { ChatService } from './services/chat-service.js';
@@ -105,6 +106,10 @@ export async function createServer() {
   await fastify.register(cors, {
     origin: ['http://127.0.0.1:5173', 'http://localhost:5173'],
   });
+  const rawUploadParser = async (_request: unknown, payload: NodeJS.ReadableStream) => payload;
+  fastify.addContentTypeParser('application/octet-stream', rawUploadParser);
+  fastify.addContentTypeParser('application/mp4', rawUploadParser);
+  fastify.addContentTypeParser(/^video\/.*/, rawUploadParser);
   const sessionToken = resolveSessionToken();
 
   fastify.addHook('preHandler', async (request, reply) => {
@@ -243,6 +248,11 @@ export async function createServer() {
     const document = documents.createProject(request.body);
     reply.code(201);
     return { document };
+  });
+
+  fastify.patch('/api/projects/:projectId', async (request) => {
+    const { projectId } = request.params as { projectId: string };
+    return { document: documents.updateProject(projectId, request.body) };
   });
 
   fastify.get('/api/projects/:projectId/sessions', async (request) => {
@@ -428,15 +438,52 @@ export async function createServer() {
     return { document, asset, job };
   });
 
+  fastify.post('/api/projects/:projectId/assets/upload', async (request, reply) => {
+    const { projectId } = request.params as { projectId: string };
+    documents.readDocument(projectId);
+    const filename = typeof (request.query as { filename?: unknown } | undefined)?.filename === 'string'
+      ? path.basename((request.query as { filename: string }).filename)
+      : 'source.mp4';
+    const uploadStream = request.body as NodeJS.ReadableStream | undefined;
+    const contentLength = Number.parseInt(String(request.headers['content-length'] ?? '0'), 10);
+    if (!uploadStream || (Number.isFinite(contentLength) && contentLength <= 0)) {
+      reply.code(400);
+      return { error: 'Uploaded file is empty.' };
+    }
+    const uploadRoot = path.join(projectRoot(projectId), 'uploads');
+    fs.mkdirSync(uploadRoot, { recursive: true });
+    const uploadPath = path.join(uploadRoot, `${Date.now()}-${randomUUID()}-${filename}`);
+    const pendingUploadPath = `${uploadPath}.uploading`;
+    try {
+      await pipeline(uploadStream, fs.createWriteStream(pendingUploadPath, { flags: 'wx' }));
+      const uploadedSize = fs.statSync(pendingUploadPath).size;
+      if (uploadedSize <= 0) {
+        fs.rmSync(pendingUploadPath, { force: true });
+        reply.code(400);
+        return { error: 'Uploaded file is empty.' };
+      }
+      fs.renameSync(pendingUploadPath, uploadPath);
+    } catch (error) {
+      fs.rmSync(pendingUploadPath, { force: true });
+      throw error;
+    }
+    const { document, asset } = documents.addAsset(projectId, { path: uploadPath, label: filename, autoTranscribe: true });
+    const job = jobs.enqueueAssetIngest(projectId, asset.id, { autoTranscribe: true });
+    reply.code(202);
+    return { document, asset, job };
+  });
+
   fastify.post('/api/projects/:projectId/transcribe', async (request, reply) => {
     const { projectId } = request.params as { projectId: string };
     const payload = transcribeInputSchema.parse(request.body ?? {});
     const language = payload.language === 'auto' ? undefined : payload.language;
     const document = documents.readDocument(projectId);
-    const asset = document.assets.find((item) => item.id === document.project.primaryAssetId) ?? document.assets[0];
+    const asset = payload.assetId
+      ? document.assets.find((item) => item.id === payload.assetId)
+      : document.assets.find((item) => item.id === document.project.primaryAssetId) ?? document.assets[0];
     if (!asset) {
       reply.code(400);
-      return { error: 'No asset available to transcribe.' };
+      return { error: payload.assetId ? `Unknown asset ${payload.assetId}.` : 'No asset available to transcribe.' };
     }
     const job = jobs.enqueueTranscription(projectId, asset.id, { language });
     reply.code(202);

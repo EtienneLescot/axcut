@@ -49,6 +49,7 @@ function createDocument(): AxcutDocument {
 test('searchTranscript returns matching spoken segments', () => {
   const hits = searchTranscript(createDocument(), 'config section');
   assert.equal(hits.length, 1);
+  assert.equal(hits[0].assetId, 'asset_main');
   assert.equal(hits[0].segmentId, 's2');
   assert.equal(hits[0].matches[0]?.startWordId, 'w6');
   assert.equal(hits[0].matches[0]?.endWordId, 'w7');
@@ -58,11 +59,49 @@ test('searchTranscript returns matching spoken segments', () => {
 test('buildFillerSuggestions detects kept filler words', () => {
   const suggestions = buildFillerSuggestions(createDocument());
   assert.equal(suggestions.length, 1);
-  assert.equal(suggestions[0].proposedOperation?.type, 'drop_word_range');
+  assert.deepEqual(suggestions[0].proposedOperation, {
+    type: 'add_skip_range',
+    assetId: 'asset_main',
+    startSec: 0,
+    endSec: 0.2,
+    reason: 'Skip filler word "uh".',
+  });
 });
 
 test('buildPauseSuggestions detects long silence ranges', () => {
   const suggestions = buildPauseSuggestions(createDocument());
   assert.equal(suggestions.length, 1);
-  assert.equal(suggestions[0].proposedOperation?.type, 'drop_range');
+  assert.deepEqual(suggestions[0].proposedOperation, {
+    type: 'add_skip_range',
+    assetId: 'asset_main',
+    startSec: 2.1,
+    endSec: 3,
+    reason: 'Skip a long silence gap.',
+  });
+});
+
+test('suggestions ignore transcribed assets that are not mounted in the timeline', () => {
+  const document = createDocument();
+  const extraTranscript: NonNullable<AxcutDocument['transcript']> = {
+    assetId: 'asset_extra',
+    language: 'en',
+    segments: [
+      { id: 'z_extra', kind: 'silence', startSec: 0, endSec: 5, text: '', wordIds: [] },
+    ],
+    words: [
+      { id: 'w1', segmentId: 's_extra', startSec: 0, endSec: 0.2, text: 'uh' },
+    ],
+  };
+  const withUnmountedAsset: AxcutDocument = {
+    ...document,
+    assets: [
+      ...document.assets,
+      { id: 'asset_extra', kind: 'video', label: 'extra.mp4', originalPath: '/tmp/extra.mp4', durationSec: 5 },
+    ],
+    transcripts: [document.transcript!, extraTranscript],
+  };
+
+  assert.equal(searchTranscript(withUnmountedAsset, 'anything from extra').length, 0);
+  assert.equal(buildPauseSuggestions(withUnmountedAsset).length, 1);
+  assert.equal(buildFillerSuggestions(withUnmountedAsset).length, 1);
 });

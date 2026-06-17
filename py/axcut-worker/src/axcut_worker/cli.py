@@ -12,6 +12,7 @@ from axcut_core.models import KeepInterval, Transcript
 from axcut_core.render import (
     create_proxy_video,
     read_keep_intervals,
+    render_clip_sequence,
     render_cut_video,
 )
 from axcut_core.transcribe import probe_media, transcribe_video
@@ -47,6 +48,10 @@ def main() -> None:
     export_parser.add_argument("--video", required=True)
     export_parser.add_argument("--intervals", required=True)
     export_parser.add_argument("--output", required=True)
+
+    export_sequence_parser = subparsers.add_parser("export-sequence")
+    export_sequence_parser.add_argument("--clips", required=True)
+    export_sequence_parser.add_argument("--output", required=True)
 
     args = parser.parse_args()
 
@@ -92,6 +97,12 @@ def main() -> None:
     if args.command == "export":
         intervals = read_keep_intervals(Path(args.intervals))
         render_cut_video(Path(args.video), Path(args.output), intervals)
+        _emit({"ok": True, "data": {"outputPath": str(Path(args.output))}})
+        return
+
+    if args.command == "export-sequence":
+        clips = json.loads(Path(args.clips).read_text(encoding="utf-8"))
+        render_clip_sequence(clips, Path(args.output))
         _emit({"ok": True, "data": {"outputPath": str(Path(args.output))}})
         return
 

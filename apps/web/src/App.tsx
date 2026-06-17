@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ButtonHTMLAttributes, CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { QueryKey } from '@tanstack/react-query';
-import type { AxcutClip, AxcutDocument } from '@axcut/schema';
+import { applySkipRangesToClips, type AxcutAsset, type AxcutClip, type AxcutDocument, type AxcutTimelineOperation } from '@axcut/schema';
 import {
   ArrowLeft,
   Brain,
@@ -14,6 +14,7 @@ import {
   FolderOpen,
   GitBranch,
   History,
+  LoaderCircle,
   LogIn,
   MessageSquarePlus,
   PanelBottom,
@@ -39,7 +40,8 @@ import { CurrentTranscriptView } from './components/CurrentTranscriptView.js';
 import { TimelinePane } from './components/TimelinePane.js';
 import { VirtualPreview } from './components/VirtualPreview.js';
 import { emptyLiveRunState, reduceLiveRunState, type LiveOperation, type LiveRunState, type ProjectStreamEvent } from './lib/live-run.js';
-import { locateVirtualPosition } from './lib/virtual-preview.js';
+import { applyOptimisticTimelineOperation } from './lib/optimistic-timeline.js';
+import { formatSeconds, locateVirtualPosition } from './lib/virtual-preview.js';
 
 type ProjectSummary = {
   id: string;
@@ -108,17 +110,20 @@ type ProjectSnapshot = {
   availableWorktrees: WorktreeInfo[];
 };
 
-type PendingTimelineEdit = {
+type PendingAssetInsert = {
+  assetId: string;
+  insertAtSec: number;
+};
+
+type TimelineOperationInput = {
   projectId: string;
-  intervals: Array<{ startSec: number; endSec: number }>;
-  reason: string;
-};
-
-type ReplaceTimelineInput = PendingTimelineEdit & {
   sessionId: string;
+  operation: AxcutTimelineOperation;
+  conversationMessage: string;
+  optimisticApplied?: boolean;
 };
 
-type ReplaceTimelineResult = { document: AxcutDocument; revisionId: string; message: Message | null };
+type TimelineOperationResult = { document: AxcutDocument; revisionId: string; message: Message | null };
 
 type JobSummary = {
   id: string;
@@ -126,13 +131,17 @@ type JobSummary = {
   status: string;
   progress: number;
   message: string;
+  payloadJson: string;
   resultJson: string | null;
 };
 
 type VideoSource = {
+  assetId: string;
   src: string;
   label: string;
 };
+
+type AssetTranscriptStatus = 'running' | 'complete' | 'failed' | 'pending';
 
 type SessionPayload = {
   token: string;
@@ -229,9 +238,17 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function sourceToVirtualTime(clips: AxcutClip[], sourceTimeSec: number): number {
+function sourceToVirtualTime(clips: AxcutClip[], sourceTimeSec: number, assetId?: string, clipId?: string): number {
   let cursor = 0;
   for (const clip of clips) {
+    if (clipId && structuralClipId(clip.id) !== clipId) {
+      cursor += clip.sourceEndSec - clip.sourceStartSec;
+      continue;
+    }
+    if (assetId && clip.assetId !== assetId) {
+      cursor += clip.sourceEndSec - clip.sourceStartSec;
+      continue;
+    }
     if (sourceTimeSec <= clip.sourceStartSec) {
       return cursor;
     }
@@ -241,6 +258,10 @@ function sourceToVirtualTime(clips: AxcutClip[], sourceTimeSec: number): number 
     cursor += clip.sourceEndSec - clip.sourceStartSec;
   }
   return cursor;
+}
+
+function structuralClipId(clipId: string): string {
+  return clipId.replace(/__skip_part_\d+$/, '');
 }
 
 function getProviderUserDescription(provider: Pick<LlmProviderState, 'id' | 'defaultModel'>) {
@@ -339,6 +360,16 @@ function ClosedPanelBottomIcon({ size = 16, strokeWidth = 1.8, ...props }: Lucid
   );
 }
 
+function CompactContextIcon({ size = 16, strokeWidth = 1.8, ...props }: LucideProps) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <path d="M8 4l4 4 4-4" />
+      <path d="M8 20l4-4 4 4" />
+      <path d="M6 12h12" />
+    </svg>
+  );
+}
+
 function popoverStyle(anchor: PopoverAnchor | null, width: number): CSSProperties | undefined {
   if (!anchor || typeof window === 'undefined') {
     return undefined;
@@ -426,6 +457,31 @@ function artifactName(filePath?: string): string | null {
   return name || null;
 }
 
+function assetDisplayLabel(asset: Pick<AxcutAsset, 'label' | 'originalPath'>): string {
+  return cleanUploadedFilename(asset.label) || cleanUploadedFilename(artifactName(asset.originalPath) ?? '') || asset.label;
+}
+
+function cleanUploadedFilename(value: string): string {
+  return value.replace(/^\d{10,}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-/i, '');
+}
+
+function jobAssetId(job: Pick<JobSummary, 'payloadJson' | 'resultJson'>): string | null {
+  for (const raw of [job.payloadJson, job.resultJson]) {
+    if (!raw) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(raw) as { assetId?: unknown };
+      if (typeof parsed.assetId === 'string') {
+        return parsed.assetId;
+      }
+    } catch {
+      // Ignore malformed legacy payloads.
+    }
+  }
+  return null;
+}
+
 function parseJobResult(job?: JobSummary | null): Record<string, unknown> | null {
   if (!job?.resultJson) {
     return null;
@@ -436,96 +492,6 @@ function parseJobResult(job?: JobSummary | null): Record<string, unknown> | null
   } catch {
     return null;
   }
-}
-
-function buildOptimisticTimelineDocument(
-  document: AxcutDocument,
-  intervals: Array<{ startSec: number; endSec: number }>,
-  reason: string,
-): AxcutDocument {
-  const assetId = document.project.primaryAssetId ?? document.assets[0]?.id;
-  if (!assetId) {
-    return document;
-  }
-  const asset = document.assets.find((item) => item.id === assetId);
-  const normalized = normalizeTimelineIntervals(asset?.durationSec ?? 0, intervals);
-  return {
-    ...document,
-    project: {
-      ...document.project,
-      updatedAt: new Date().toISOString(),
-    },
-    timeline: {
-      ...document.timeline,
-      clips: buildOptimisticClips(document, assetId, normalized, reason),
-      gaps: [],
-    },
-    preview: {
-      ...document.preview,
-      revision: document.preview.revision + 1,
-    },
-  };
-}
-
-function normalizeTimelineIntervals(durationSec: number, intervals: Array<{ startSec: number; endSec: number }>): Array<{ startSec: number; endSec: number }> {
-  const bounded = intervals
-    .map((interval) => ({
-      startSec: Math.max(0, Math.min(durationSec, interval.startSec)),
-      endSec: Math.max(0, Math.min(durationSec, interval.endSec)),
-    }))
-    .filter((interval) => interval.endSec > interval.startSec)
-    .sort((a, b) => a.startSec - b.startSec);
-  const merged: Array<{ startSec: number; endSec: number }> = [];
-  for (const interval of bounded) {
-    const previous = merged.at(-1);
-    if (!previous || interval.startSec > previous.endSec) {
-      merged.push({ ...interval });
-      continue;
-    }
-    previous.endSec = Math.max(previous.endSec, interval.endSec);
-  }
-  return merged;
-}
-
-function buildOptimisticClips(
-  document: AxcutDocument,
-  assetId: string,
-  intervals: Array<{ startSec: number; endSec: number }>,
-  reason: string,
-): AxcutClip[] {
-  let cursor = 0;
-  return intervals.map((interval, index) => {
-    const duration = interval.endSec - interval.startSec;
-    const clip: AxcutClip = {
-      id: `clip_${index + 1}`,
-      assetId,
-      sourceStartSec: interval.startSec,
-      sourceEndSec: interval.endSec,
-      timelineStartSec: cursor,
-      timelineEndSec: cursor + duration,
-      wordRefs: collectOptimisticWordRefs(document, interval.startSec, interval.endSec),
-      origin: 'user',
-      reason,
-    };
-    cursor = clip.timelineEndSec;
-    return clip;
-  });
-}
-
-function collectOptimisticWordRefs(document: AxcutDocument, startSec: number, endSec: number): string[] {
-  return document.transcript?.words
-    .filter((word) => word.endSec > startSec && word.startSec < endSec)
-    .map((word) => word.id) ?? [];
-}
-
-function applyPendingTimelineEdit(snapshot: ProjectSnapshot, pendingEdit: PendingTimelineEdit | null): ProjectSnapshot {
-  if (!pendingEdit || snapshot.document.project.id !== pendingEdit.projectId) {
-    return snapshot;
-  }
-  return {
-    ...snapshot,
-    document: buildOptimisticTimelineDocument(snapshot.document, pendingEdit.intervals, pendingEdit.reason),
-  };
 }
 
 function getSttStatus(document: AxcutDocument | undefined, jobs: JobSummary[] | undefined) {
@@ -718,12 +684,16 @@ export function App() {
   const [reasoningOpen, setReasoningOpen] = useState(false);
   const [reasoningAnchor, setReasoningAnchor] = useState<PopoverAnchor | null>(null);
   const [rewindConfirmation, setRewindConfirmation] = useState<{ messageId: string; anchor: PopoverAnchor } | null>(null);
+  const [leftPanel, setLeftPanel] = useState<'axcut' | 'project'>('axcut');
   const [loadVideoOpen, setLoadVideoOpen] = useState(false);
-  const [transcriptModal, setTranscriptModal] = useState<'source' | null>(null);
+  const [pendingAssetInsert, setPendingAssetInsert] = useState<PendingAssetInsert | null>(null);
+  const [transcriptModalAssetId, setTranscriptModalAssetId] = useState<string | null>(null);
   const [transcriptLanguage, setTranscriptLanguage] = useState<TranscriptLanguageSelection>('auto');
+  const [projectTitleEditing, setProjectTitleEditing] = useState(false);
+  const [projectTitleDraft, setProjectTitleDraft] = useState('');
   const [virtualTimeSec, setVirtualTimeSec] = useState(0);
   const [seekTarget, setSeekTarget] = useState<{ timeSec: number; requestId: number } | null>(null);
-  const [sourcePreviewTarget, setSourcePreviewTarget] = useState<{ sourceTimeSec: number; requestId: number } | null>(null);
+  const [sourcePreviewTarget, setSourcePreviewTarget] = useState<{ assetId?: string; sourceTimeSec: number; requestId: number } | null>(null);
   const [liveRun, setLiveRun] = useState<LiveRunState>(emptyLiveRunState);
   const [autoScrollMessages, setAutoScrollMessages] = useState(true);
   const [chatPanelOpen, setChatPanelOpen] = useState(() => readStoredBoolean(CHAT_OPEN_STORAGE_KEY, true));
@@ -733,9 +703,10 @@ export function App() {
   const [timelinePanelHeight, setTimelinePanelHeight] = useState(() => readStoredNumber(TIMELINE_HEIGHT_STORAGE_KEY, DEFAULT_TIMELINE_HEIGHT));
   const [transcriptPanelWidth, setTranscriptPanelWidth] = useState(() => readStoredNumber(TRANSCRIPT_WIDTH_STORAGE_KEY, DEFAULT_TRANSCRIPT_WIDTH));
   const messagesRef = useRef<HTMLDivElement | null>(null);
+  const projectTitleInputRef = useRef<HTMLInputElement | null>(null);
+  const sourceFileInputRef = useRef<HTMLInputElement | null>(null);
   const providerButtonRef = useRef<HTMLButtonElement | null>(null);
   const reasoningButtonRef = useRef<HTMLButtonElement | null>(null);
-  const pendingTimelineEditRef = useRef<PendingTimelineEdit | null>(null);
 
   const layoutStyle = useMemo(() => ({
     '--chat-panel-width': `${chatPanelWidth}px`,
@@ -876,10 +847,9 @@ export function App() {
     queryKey: ['project', projectId, activeSessionId],
     queryFn: () => {
       const sessionQueryPart = activeSessionId ? `?sessionId=${encodeURIComponent(activeSessionId)}` : '';
-      const pendingEdit = pendingTimelineEditRef.current;
       return requestJson<ProjectSnapshot>(`/api/projects/${projectId}${sessionQueryPart}`, {
         headers: authHeaders(sessionToken!),
-      }).then((snapshot) => applyPendingTimelineEdit(snapshot, pendingEdit));
+      });
     },
   });
 
@@ -891,10 +861,6 @@ export function App() {
 
   const invalidateProject = useCallback(() => {
     if (!projectId) {
-      return;
-    }
-    if (pendingTimelineEditRef.current?.projectId === projectId) {
-      void queryClient.invalidateQueries({ queryKey: ['projects'] });
       return;
     }
     void queryClient.invalidateQueries({ queryKey: ['project', projectId] });
@@ -1015,23 +981,34 @@ export function App() {
     },
   });
 
-  const loadVideo = useMutation({
-    mutationFn: async ({ title, path }: { title: string; path: string }) => {
+  const renameProject = useMutation({
+    mutationFn: async (title: string) => {
+      if (!projectId || !sessionToken) {
+        throw new Error('No active project.');
+      }
+      return requestJson<{ document: AxcutDocument }>(`/api/projects/${projectId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ title }),
+        headers: authHeaders(sessionToken),
+      });
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['project', projectId] });
+      await queryClient.invalidateQueries({ queryKey: ['projects'] });
+    },
+  });
+
+  const createProject = useMutation({
+    mutationFn: async () => {
       if (!sessionToken) {
         throw new Error('No Axcut browser session token.');
       }
       const created = await requestJson<{ document: AxcutDocument }>('/api/projects', {
         method: 'POST',
-        body: JSON.stringify({ title: title.trim() || path.split('/').at(-1) || 'Untitled Project' }),
+        body: JSON.stringify({ title: 'Untitled project' }),
         headers: authHeaders(sessionToken),
       });
-      const createdProjectId = created.document.project.id;
-      await requestJson(`/api/projects/${createdProjectId}/assets`, {
-        method: 'POST',
-        body: JSON.stringify({ path, autoTranscribe: true }),
-        headers: authHeaders(sessionToken),
-      });
-      return createdProjectId;
+      return created.document.project.id;
     },
     onSuccess: async (createdProjectId) => {
       setSelectedProjectId(createdProjectId);
@@ -1039,6 +1016,97 @@ export function App() {
       setLoadVideoOpen(false);
       await queryClient.invalidateQueries({ queryKey: ['projects'] });
       await queryClient.invalidateQueries({ queryKey: ['project', createdProjectId] });
+    },
+  });
+
+  const addAsset = useMutation({
+    mutationFn: async (file: File) => {
+      if (!projectId || !sessionToken) {
+        throw new Error('No active project.');
+      }
+      const response = await fetch(`/api/projects/${projectId}/assets/upload?filename=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        body: file,
+        headers: {
+          ...authHeaders(sessionToken),
+          'Content-Type': file.type || 'application/octet-stream',
+        },
+      });
+      if (!response.ok) {
+        throw await ApiRequestError.fromResponse(response);
+      }
+      return response.json() as Promise<{ document: AxcutDocument }>;
+    },
+    onSuccess: async () => {
+      invalidateProject();
+    },
+  });
+
+  const applyOptimisticTimelineOperationToCache = useCallback((input: TimelineOperationInput) => {
+    void queryClient.cancelQueries({ queryKey: ['project', input.projectId] }, { revert: false, silent: true });
+    queryClient.setQueriesData<ProjectSnapshot>({ queryKey: ['project', input.projectId] }, (current) => (
+      current
+        ? {
+          ...current,
+          document: applyOptimisticTimelineOperation(current.document, input.operation),
+        }
+        : current
+    ));
+  }, [queryClient]);
+
+  const commitTimelineOperationResultToCache = useCallback(async (projectId: string, result: TimelineOperationResult) => {
+    await queryClient.cancelQueries({ queryKey: ['project', projectId] });
+    queryClient.setQueriesData<ProjectSnapshot>({ queryKey: ['project', projectId] }, (current) => {
+      if (!current) {
+        return current;
+      }
+      const message = result.message;
+      const shouldAppendMessage = Boolean(
+        message
+        && current.activeSessionId === message.sessionId
+        && !current.messages.some((item) => item.id === message.id),
+      );
+      return {
+        ...current,
+        document: result.document,
+        messages: shouldAppendMessage && message ? [...current.messages, message] : current.messages,
+      };
+    });
+  }, [queryClient]);
+
+  const timelineOperation = useMutation({
+    mutationFn: async (input: TimelineOperationInput) => {
+      if (!sessionToken) {
+        throw new Error('No active conversation.');
+      }
+      return requestJson<TimelineOperationResult>(`/api/projects/${input.projectId}/operations`, {
+        method: 'POST',
+        body: JSON.stringify({
+          sessionId: input.sessionId,
+          conversationMessage: input.conversationMessage,
+          operation: input.operation,
+        }),
+        headers: authHeaders(sessionToken),
+      });
+    },
+    onMutate: async (input) => {
+      if (!input.optimisticApplied) {
+        applyOptimisticTimelineOperationToCache(input);
+      }
+      if (input.operation.type === 'insert_asset_clip') {
+        setPendingAssetInsert(null);
+      }
+      return { projectId: input.projectId };
+    },
+    onSuccess: async (result, input, context) => {
+      const targetProjectId = context?.projectId ?? input.projectId;
+      await commitTimelineOperationResultToCache(targetProjectId, result);
+      if (input.operation.type === 'insert_asset_clip') {
+        setPendingAssetInsert(null);
+      }
+      setAutoScrollMessages(true);
+      await queryClient.invalidateQueries({ queryKey: ['project', targetProjectId] });
+      await queryClient.invalidateQueries({ queryKey: ['projects'] });
     },
   });
 
@@ -1075,90 +1143,110 @@ export function App() {
     },
   });
 
-  const replaceTimeline = useMutation({
-    mutationFn: async (input: ReplaceTimelineInput) => {
-      if (!sessionToken) {
-        throw new Error('No active conversation.');
-      }
-      return requestJson<ReplaceTimelineResult>(`/api/projects/${input.projectId}/operations`, {
-        method: 'POST',
-        body: JSON.stringify({
-          sessionId: input.sessionId,
-          conversationMessage: `Timeline edit: ${input.reason}`,
-          operation: {
-            type: 'replace_timeline',
-            reason: input.reason,
-            intervals: input.intervals,
-          },
-        }),
-        headers: authHeaders(sessionToken),
-      });
-    },
-    onMutate: async (input) => {
-      const pendingEdit: PendingTimelineEdit = {
-        projectId: input.projectId,
-        intervals: input.intervals,
-        reason: input.reason,
-      };
-      pendingTimelineEditRef.current = pendingEdit;
-      await queryClient.cancelQueries({ queryKey: ['project', input.projectId] });
-      const previousSnapshots = queryClient.getQueriesData<ProjectSnapshot>({ queryKey: ['project', input.projectId] });
-      queryClient.setQueriesData<ProjectSnapshot>({ queryKey: ['project', input.projectId] }, (current) => (
-        current ? applyPendingTimelineEdit(current, pendingEdit) : current
-      ));
-      return { projectId: input.projectId, previousSnapshots };
-    },
-    onError: async (error, _input, context) => {
-      if (!context) {
-        return;
-      }
-      await queryClient.cancelQueries({ queryKey: ['project', context.projectId] });
-      pendingTimelineEditRef.current = null;
-      for (const [queryKey, snapshot] of context.previousSnapshots) {
-        queryClient.setQueryData(queryKey, snapshot);
-      }
-    },
-    onSuccess: async (result, _input, context) => {
-      await queryClient.cancelQueries({ queryKey: ['project', context.projectId] });
-      queryClient.setQueriesData<ProjectSnapshot>({ queryKey: ['project', context.projectId] }, (current) => {
-        if (!current) {
-          return current;
-        }
-        const message = result.message;
-        const shouldAppendMessage = Boolean(
-          message
-          && current.activeSessionId === message.sessionId
-          && !current.messages.some((item) => item.id === message.id),
-        );
-        return {
-          ...current,
-          document: result.document,
-          messages: shouldAppendMessage && message ? [...current.messages, message] : current.messages,
-        };
-      });
-      pendingTimelineEditRef.current = null;
-      setAutoScrollMessages(true);
-      await queryClient.invalidateQueries({ queryKey: ['project', context.projectId] });
-      await queryClient.invalidateQueries({ queryKey: ['projects'] });
-    },
-  });
-
-  const queueReplaceTimeline = useCallback((intervals: Array<{ startSec: number; endSec: number }>, reason: string) => {
-    if (!projectId || !activeSessionId || replaceTimeline.isPending) {
+  const queueTimelineOperation = useCallback((operation: AxcutTimelineOperation, conversationMessage: string) => {
+    if (!projectId || !activeSessionId || timelineOperation.isPending) {
       return;
     }
-    pendingTimelineEditRef.current = {
-      projectId,
-      intervals,
-      reason,
-    };
-    replaceTimeline.mutate({
+    const input: TimelineOperationInput = {
       projectId,
       sessionId: activeSessionId,
-      intervals,
+      operation,
+      conversationMessage,
+      optimisticApplied: true,
+    };
+    applyOptimisticTimelineOperationToCache(input);
+    if (operation.type === 'insert_asset_clip') {
+      setPendingAssetInsert(null);
+    }
+    timelineOperation.mutate(input);
+  }, [activeSessionId, applyOptimisticTimelineOperationToCache, projectId, timelineOperation]);
+
+  const queueReplaceTimeline = useCallback((intervals: Array<{ startSec: number; endSec: number }>, reason: string) => {
+    queueTimelineOperation({
+      type: 'replace_timeline',
       reason,
-    });
-  }, [activeSessionId, projectId, replaceTimeline]);
+      intervals,
+    }, `Timeline edit: ${reason}`);
+  }, [queueTimelineOperation]);
+
+  const queueDropSourceRange = useCallback((assetId: string, startSec: number, endSec: number, reason: string) => {
+    queueTimelineOperation({
+      type: 'drop_range',
+      reason,
+      assetId,
+      startSec,
+      endSec,
+    }, `Timeline edit: ${reason}`);
+  }, [queueTimelineOperation]);
+
+  const queueAddSkipRange = useCallback((assetId: string, startSec: number, endSec: number, reason: string) => {
+    queueTimelineOperation({
+      type: 'add_skip_range',
+      reason,
+      assetId,
+      startSec,
+      endSec,
+    }, `Timeline edit: ${reason}`);
+  }, [queueTimelineOperation]);
+
+  const queueRemoveSkipRange = useCallback((skipId: string) => {
+    queueTimelineOperation({
+      type: 'remove_skip_range',
+      reason: 'Removed skip.',
+      skipId,
+    }, 'Timeline edit: removed skip.');
+  }, [queueTimelineOperation]);
+
+  const queueUpdateSkipRange = useCallback((skipId: string, startSec: number, endSec: number, reason: string) => {
+    queueTimelineOperation({
+      type: 'update_skip_range',
+      reason,
+      skipId,
+      startSec,
+      endSec,
+    }, `Timeline edit: ${reason}`);
+  }, [queueTimelineOperation]);
+
+  const queueUpdateClipRange = useCallback((clipId: string, sourceStartSec: number, sourceEndSec: number, reason: string) => {
+    queueTimelineOperation({
+      type: 'update_clip_range',
+      reason,
+      clipId,
+      sourceStartSec,
+      sourceEndSec,
+    }, `Timeline edit: ${reason}`);
+  }, [queueTimelineOperation]);
+
+  const queueDuplicateClip = useCallback((clipId: string) => {
+    const reason = `Duplicated clip ${clipId}.`;
+    queueTimelineOperation({
+      type: 'duplicate_clip',
+      clipId,
+      reason,
+    }, `Timeline edit: ${reason}`);
+  }, [queueTimelineOperation]);
+
+  const queueMoveClip = useCallback((clipId: string, insertIndex: number) => {
+    const reason = `Moved clip ${clipId} to position ${insertIndex + 1}.`;
+    queueTimelineOperation({
+      type: 'move_clip',
+      reason,
+      clipId,
+      insertIndex,
+    }, `Timeline edit: ${reason}`);
+  }, [queueTimelineOperation]);
+
+  const queueInsertAssetClip = useCallback(({ assetId, insertAtSec, mode }: PendingAssetInsert & { mode: 'before' | 'after' | 'split' }) => {
+    const reason = mode === 'split' ? 'Split clip and inserted source.' : `Inserted source ${mode} the target clip.`;
+    queueTimelineOperation({
+      type: 'insert_asset_clip',
+      reason,
+      assetId,
+      insertAtSec,
+      mode,
+      sourceStartSec: 0,
+    }, `Timeline edit: inserted source ${assetId}.`);
+  }, [queueTimelineOperation]);
 
   const compactContext = useMutation({
     mutationFn: async () => {
@@ -1271,13 +1359,13 @@ export function App() {
   });
 
   const regenerateTranscript = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (assetId: string) => {
       if (!projectId || !sessionToken) {
         throw new Error('No active project.');
       }
       return requestJson<{ job: JobSummary }>(`/api/projects/${projectId}/transcribe`, {
         method: 'POST',
-        body: JSON.stringify({ language: transcriptLanguage }),
+        body: JSON.stringify({ language: transcriptLanguage, assetId }),
         headers: authHeaders(sessionToken),
       });
     },
@@ -1289,36 +1377,46 @@ export function App() {
 
   const snapshot = snapshotQuery.data;
   const document = snapshot?.document;
+  const displayDocument = useMemo<AxcutDocument | undefined>(() => (
+    document
+      ? {
+        ...document,
+        assets: document.assets.map((asset) => ({ ...asset, label: assetDisplayLabel(asset) })),
+      }
+      : undefined
+  ), [document]);
+  const playbackClips = useMemo(
+    () => displayDocument
+      ? applySkipRangesToClips(displayDocument.timeline.clips, displayDocument.timeline.skipRanges)
+      : [],
+    [displayDocument],
+  );
   const activeSession = snapshot?.sessions.find((session) => session.id === snapshot.activeSessionId) ?? snapshot?.sessions[0];
+  const activeSessionTitle = activeSession?.title && activeSession.title !== document?.project.title
+    ? activeSession.title
+    : 'New conversation';
   const contextUsage = snapshot?.contextUsage;
   const activeWorktreeLabel = snapshot?.activeWorktree?.branch?.replace(/^refs\/heads\//, '') || artifactName(snapshot?.activeWorktree?.path);
-  const primaryAsset = useMemo(
-    () => document?.assets.find((asset) => asset.id === document.project.primaryAssetId) ?? document?.assets[0],
-    [document],
-  );
   const videoSources = useMemo<VideoSource[]>(() => {
-    if (!projectId || !primaryAsset || !sessionToken) {
+    if (!projectId || !displayDocument || !sessionToken) {
       return [];
     }
-    const baseUrl = `/api/projects/${projectId}/assets/${primaryAsset.id}/media`;
     const token = encodeURIComponent(sessionToken);
-    const original = { src: `${baseUrl}?variant=original&token=${token}`, label: 'original source' };
-    if (!primaryAsset.proxyPath) {
-      return [original];
-    }
-    return [
-      { src: `${baseUrl}?variant=proxy&token=${token}`, label: 'proxy preview' },
-      original,
-    ];
-  }, [primaryAsset, projectId, sessionToken]);
+    return displayDocument.assets.flatMap((asset) => {
+      const label = asset.label;
+      const baseUrl = `/api/projects/${projectId}/assets/${asset.id}/media`;
+      const original = { assetId: asset.id, src: `${baseUrl}?variant=original&token=${token}`, label: `${label} original` };
+      if (!asset.proxyPath) {
+        return [original];
+      }
+      return [
+        { assetId: asset.id, src: `${baseUrl}?variant=proxy&token=${token}`, label: `${label} proxy` },
+        original,
+      ];
+    });
+  }, [displayDocument, projectId, sessionToken]);
   const latestExportJob = snapshot?.jobs.find((job) => job.kind === 'export') ?? null;
-  const exportJobResult = parseJobResult(latestExportJob);
-  const exportArtifactName = artifactName(typeof exportJobResult?.outputPath === 'string' ? exportJobResult.outputPath : undefined);
-  const exportHref = projectId && sessionToken && latestExportJob?.status === 'completed' && exportArtifactName
-    ? `/api/projects/${projectId}/artifacts/${encodeURIComponent(exportArtifactName)}?token=${encodeURIComponent(sessionToken)}`
-    : null;
   const exportBusy = exportVideo.isPending || latestExportJob?.status === 'queued' || latestExportJob?.status === 'running';
-  const exportStatus = getExportStatus(latestExportJob, exportVideo.isPending, exportVideo.error);
   const effectiveLlm = llmConfigQuery.data?.effective;
   const providerLabel = llmConfigQuery.data?.ready && effectiveLlm
     ? [
@@ -1327,80 +1425,183 @@ export function App() {
       ].filter(Boolean).join(' / ')
     : 'LLM not configured';
   const agentResponsePending = sendChat.isPending && liveRun.active && !liveRun.assistantDraft;
-  const sourceTranscriptName = artifactName(document?.transcript?.sourceDslPath ?? document?.transcript?.sourceJsonPath);
+  const transcriptModalAsset = useMemo(
+    () => transcriptModalAssetId ? displayDocument?.assets.find((asset) => asset.id === transcriptModalAssetId) ?? null : null,
+    [displayDocument, transcriptModalAssetId],
+  );
+  const transcriptModalTranscript = useMemo(
+    () => transcriptModalAssetId ? document?.transcripts.find((transcript) => transcript.assetId === transcriptModalAssetId) ?? null : null,
+    [document, transcriptModalAssetId],
+  );
+  const sourceTranscriptName = artifactName(transcriptModalTranscript?.sourceDslPath ?? transcriptModalTranscript?.sourceJsonPath);
   const sourceTranscriptQuery = useQuery({
-    enabled: Boolean(transcriptModal === 'source' && projectId && sessionToken && sourceTranscriptName),
-    queryKey: ['source-transcript', projectId, sourceTranscriptName],
+    enabled: Boolean(transcriptModalAssetId && projectId && sessionToken && sourceTranscriptName),
+    queryKey: ['source-transcript', projectId, transcriptModalAssetId, sourceTranscriptName],
     queryFn: () => requestText(`/api/projects/${projectId}/artifacts/${encodeURIComponent(sourceTranscriptName!)}?token=${encodeURIComponent(sessionToken!)}`),
   });
-  const sttStatus = getSttStatus(document, snapshot?.jobs);
-  const sourceTranscriptError = transcriptModal === 'source'
+  const sourceTranscriptError = transcriptModalAssetId
     ? sourceTranscriptQuery.error instanceof Error
       ? sourceTranscriptQuery.error.message
       : regenerateTranscript.error instanceof Error
         ? regenerateTranscript.error.message
         : null
     : null;
-  const cueSourceTimeSec = useMemo(
-    () => document ? locateVirtualPosition(document.timeline.clips, virtualTimeSec)?.sourceTimeSec ?? null : null,
-    [document, virtualTimeSec],
-  );
-  const seekTranscriptSourceTime = useCallback((sourceTimeSec: number) => {
-    if (!document) {
+  const transcriptModalStatus = useMemo<AssetTranscriptStatus>(() => {
+    if (!transcriptModalAssetId) {
+      return 'pending';
+    }
+    if (regenerateTranscript.isPending) {
+      return 'running';
+    }
+    for (const job of snapshot?.jobs ?? []) {
+      if (job.kind !== 'ingest_asset' && job.kind !== 'transcribe_asset') {
+        continue;
+      }
+      if (jobAssetId(job) !== transcriptModalAssetId) {
+        continue;
+      }
+      if (job.status === 'queued' || job.status === 'running') {
+        return 'running';
+      }
+      if (job.status === 'failed') {
+        return 'failed';
+      }
+    }
+    return transcriptModalTranscript ? 'complete' : 'pending';
+  }, [regenerateTranscript.isPending, snapshot?.jobs, transcriptModalAssetId, transcriptModalTranscript]);
+  useEffect(() => {
+    if (!projectTitleEditing) {
+      setProjectTitleDraft(document?.project.title ?? '');
+    }
+  }, [document?.project.title, projectTitleEditing]);
+
+  useEffect(() => {
+    if (projectTitleEditing) {
+      projectTitleInputRef.current?.focus();
+      projectTitleInputRef.current?.select();
+    }
+  }, [projectTitleEditing]);
+
+  const startProjectRename = useCallback(() => {
+    if (!document || renameProject.isPending) {
       return;
     }
-    const nextVirtualTimeSec = sourceToVirtualTime(document.timeline.clips, sourceTimeSec);
+    setProjectTitleDraft(document.project.title);
+    setProjectTitleEditing(true);
+  }, [document, renameProject.isPending]);
+
+  const submitProjectRename = useCallback(() => {
+    const nextTitle = projectTitleDraft.trim();
+    const currentTitle = document?.project.title ?? '';
+    setProjectTitleEditing(false);
+    if (!nextTitle || nextTitle === currentTitle) {
+      setProjectTitleDraft(currentTitle);
+      return;
+    }
+    renameProject.mutate(nextTitle);
+  }, [document?.project.title, projectTitleDraft, renameProject]);
+
+  const cancelProjectRename = useCallback(() => {
+    setProjectTitleDraft(document?.project.title ?? '');
+    setProjectTitleEditing(false);
+  }, [document?.project.title]);
+
+  useEffect(() => {
+    setTranscriptModalAssetId(null);
+  }, [projectId]);
+  const cuePosition = useMemo(() => {
+    const position = playbackClips.length > 0 ? locateVirtualPosition(playbackClips, virtualTimeSec) : null;
+    return position ? { assetId: position.clip.assetId, clipId: structuralClipId(position.clip.id), sourceTimeSec: position.sourceTimeSec } : null;
+  },
+    [playbackClips, virtualTimeSec],
+  );
+  const seekTranscriptSourceTime = useCallback((sourceTimeSec: number, assetId?: string, clipId?: string) => {
+    if (!displayDocument) {
+      return;
+    }
+    const nextVirtualTimeSec = sourceToVirtualTime(playbackClips, sourceTimeSec, assetId, clipId);
     setVirtualTimeSec(nextVirtualTimeSec);
     setSeekTarget({ timeSec: nextVirtualTimeSec, requestId: Date.now() });
-  }, [document]);
+  }, [displayDocument, playbackClips]);
+  const timelineCurrentTimeSec = useMemo(() => {
+    if (!displayDocument || playbackClips.length === 0) {
+      return 0;
+    }
+    const position = locateVirtualPosition(playbackClips, virtualTimeSec);
+    if (!position) {
+      return 0;
+    }
+    return sourceToVirtualTime(
+      displayDocument.timeline.clips,
+      position.sourceTimeSec,
+      position.clip.assetId,
+      structuralClipId(position.clip.id),
+    );
+  }, [displayDocument, playbackClips, virtualTimeSec]);
+  const seekTimelineTime = useCallback((timelineTimeSec: number) => {
+    if (!displayDocument) {
+      setSeekTarget({ timeSec: 0, requestId: Date.now() });
+      return;
+    }
+    const position = locateVirtualPosition(displayDocument.timeline.clips, timelineTimeSec);
+    if (!position) {
+      setVirtualTimeSec(0);
+      setSeekTarget({ timeSec: 0, requestId: Date.now() });
+      return;
+    }
+    const nextVirtualTimeSec = sourceToVirtualTime(playbackClips, position.sourceTimeSec, position.clip.assetId, position.clip.id);
+    setVirtualTimeSec(nextVirtualTimeSec);
+    setSeekTarget({ timeSec: nextVirtualTimeSec, requestId: Date.now() });
+  }, [displayDocument, playbackClips]);
 
   return (
     <div className={appShellClassName} style={layoutStyle}>
-      <IconButton
-        icon={chatPanelOpen ? PanelLeft : ClosedPanelLeftIcon}
-        label={chatPanelOpen ? 'Hide chat panel' : 'Show chat panel'}
-        className="panel-toggle chat-panel-toggle"
-        aria-pressed={chatPanelOpen}
-        onClick={() => setChatPanelOpen((open) => {
-          const nextOpen = !open;
-          writeStoredBoolean(CHAT_OPEN_STORAGE_KEY, nextOpen);
-          return nextOpen;
-        })}
-      />
-      <IconButton
-        icon={transcriptPanelOpen ? PanelRight : ClosedPanelRightIcon}
-        label={transcriptPanelOpen ? 'Hide transcription panel' : 'Show transcription panel'}
-        className="panel-toggle transcript-panel-toggle"
-        aria-pressed={transcriptPanelOpen}
-        onClick={() => setTranscriptPanelOpen((open) => {
-          const nextOpen = !open;
-          writeStoredBoolean(TRANSCRIPT_OPEN_STORAGE_KEY, nextOpen);
-          return nextOpen;
-        })}
-      />
-      <IconButton
-        icon={timelinePanelOpen ? PanelBottom : ClosedPanelBottomIcon}
-        label={timelinePanelOpen ? 'Hide timeline panel' : 'Show timeline panel'}
-        className="panel-toggle timeline-panel-toggle"
-        aria-pressed={timelinePanelOpen}
-        onClick={() => setTimelinePanelOpen((open) => {
-          const nextOpen = !open;
-          writeStoredBoolean(TIMELINE_OPEN_STORAGE_KEY, nextOpen);
-          return nextOpen;
-        })}
+      <input
+        ref={sourceFileInputRef}
+        className="sr-only"
+        type="file"
+        accept="video/*,.mp4,.mov,.m4v,.webm,.mkv"
+        onChange={(event) => {
+          const file = event.currentTarget.files?.[0];
+          event.currentTarget.value = '';
+          if (file) {
+            addAsset.mutate(file);
+          }
+        }}
       />
       <aside className="left-rail panel">
+        <nav className="left-tab-rail" aria-label="Workbench panels">
+          <button
+            type="button"
+            className={leftPanel === 'project' ? 'left-tab active' : 'left-tab'}
+            onClick={() => {
+              setLeftPanel('project');
+              setChatPanelOpen(true);
+              writeStoredBoolean(CHAT_OPEN_STORAGE_KEY, true);
+            }}
+            aria-pressed={leftPanel === 'project'}
+          >
+            <FolderOpen size={18} strokeWidth={1.8} aria-hidden="true" />
+            <span>Project</span>
+          </button>
+          <button
+            type="button"
+            className={leftPanel === 'axcut' ? 'left-tab active' : 'left-tab'}
+            onClick={() => {
+              setLeftPanel('axcut');
+              setChatPanelOpen(true);
+              writeStoredBoolean(CHAT_OPEN_STORAGE_KEY, true);
+            }}
+            aria-pressed={leftPanel === 'axcut'}
+          >
+            <img src="/assets/logo_mascot_64.png" alt="" />
+            <span>Axcut</span>
+          </button>
+        </nav>
+        <div className="left-panel-content">
+        {leftPanel === 'axcut' ? (
+          <>
         <header className="chat-header">
-          <div className="chat-title-block">
-            <h1 className="app-title">
-              <img src="/assets/logo_mascot_128.png" alt="" />
-              <span>Axcut</span>
-              <span className="title-separator muted">-</span>
-              <span className="chat-session-title muted" title={activeSession?.title ?? 'New conversation'}>
-                {activeSession?.title ?? 'New conversation'}
-              </span>
-            </h1>
-          </div>
           <div className="header-actions">
             {contextUsage ? (
               <span className="context-pill" title={`${contextUsage.promptTokens} estimated prompt tokens of ${contextUsage.contextWindowTokens}`}>
@@ -1414,7 +1615,7 @@ export function App() {
               </button>
             ) : null}
             <IconButton icon={GitBranch} label="Worktrees" className="secondary" onClick={() => setWorktreeOpen(true)} disabled={!projectId || !activeSessionId} />
-            <IconButton icon={Brain} label="Compact context" className="secondary" onClick={() => compactContext.mutate()} disabled={!activeSessionId || compactContext.isPending || sendChat.isPending} />
+            <IconButton icon={CompactContextIcon} label="Compact context" className="secondary" onClick={() => compactContext.mutate()} disabled={!activeSessionId || compactContext.isPending || sendChat.isPending} />
             <IconButton
               icon={Settings}
               label="Settings"
@@ -1428,6 +1629,13 @@ export function App() {
             />
             <IconButton icon={History} label="History" className="secondary" onClick={() => setHistoryOpen(true)} disabled={!projectId} />
             <IconButton icon={MessageSquarePlus} label="New chat" onClick={() => createSession.mutate()} disabled={!projectId || createSession.isPending} />
+          </div>
+          <div className="chat-title-block">
+            <h1 className="app-title">
+              <span className="chat-session-title muted" title={activeSessionTitle}>
+                {activeSessionTitle}
+              </span>
+            </h1>
           </div>
         </header>
 
@@ -1573,6 +1781,30 @@ export function App() {
           </div>
           {sendChat.isError ? <p className="error-copy">{sendChat.error instanceof Error ? sendChat.error.message : 'Chat request failed.'}</p> : null}
         </form>
+          </>
+        ) : (
+          <ProjectPanel
+            projects={projectsQuery.data?.projects ?? []}
+            activeProjectId={projectId}
+            document={displayDocument}
+            jobs={snapshot?.jobs ?? []}
+            onSelectProject={(nextProjectId) => {
+              setSelectedProjectId(nextProjectId);
+              setActiveSessionId(null);
+            }}
+            onOpenProjects={() => setLoadVideoOpen(true)}
+            onAddAsset={() => {
+              if (!projectId || addAsset.isPending) {
+                return;
+              }
+              sourceFileInputRef.current?.click();
+            }}
+            addAssetBusy={addAsset.isPending}
+            addAssetError={addAsset.error instanceof Error ? addAsset.error.message : null}
+            onOpenAssetTranscript={(assetId) => setTranscriptModalAssetId(assetId)}
+          />
+        )}
+        </div>
       </aside>
 
       <div
@@ -1583,34 +1815,94 @@ export function App() {
         onPointerDown={startChatResize}
       />
 
-      <main className="preview-pane panel">
-        <div className="preview-header">
-          <div>
-            <h2>{document?.project.title ?? 'Video Preview'}</h2>
-          </div>
-          <div className="preview-actions">
-            <div className="preview-statuses">
-              <TranscriptionStatusButton
-                label={sttStatus.label}
-                detail={sttStatus.detail}
-                tone={sttStatus.tone}
-                onClick={() => setTranscriptModal('source')}
-                disabled={!projectId || !sessionToken}
+      <header className="scene-header">
+        <div className="scene-title-block">
+          <h2 className="scene-title-heading">
+            {projectTitleEditing ? (
+              <input
+                ref={projectTitleInputRef}
+                className="scene-title-input"
+                aria-label="Project title"
+                value={projectTitleDraft}
+                onChange={(event) => setProjectTitleDraft(event.target.value)}
+                onBlur={submitProjectRename}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    event.currentTarget.blur();
+                  }
+                  if (event.key === 'Escape') {
+                    event.preventDefault();
+                    cancelProjectRename();
+                  }
+                }}
+                disabled={renameProject.isPending}
               />
-              {exportStatus ? <StatusChip label={exportStatus.label} detail={exportStatus.detail} tone={exportStatus.tone} href={exportHref} /> : null}
-            </div>
-            <div className="preview-project-controls">
-              <IconButton icon={FolderOpen} label="Open projects" className="secondary" onClick={() => setLoadVideoOpen(true)} />
-            </div>
-            <IconButton icon={Download} label={exportBusy ? 'Exporting' : 'Export'} onClick={() => exportVideo.mutate()} disabled={!document?.timeline.clips.length || !sessionToken || exportBusy} />
+            ) : (
+              <button
+                type="button"
+                className="scene-title-button"
+                onClick={startProjectRename}
+                disabled={!document || renameProject.isPending}
+                title="Rename project"
+              >
+                <span>{document?.project.title ?? 'Untitled project'}</span>
+              </button>
+            )}
+          </h2>
+          {renameProject.error ? <p className="error-copy">{renameProject.error instanceof Error ? renameProject.error.message : 'Project rename failed.'}</p> : null}
+        </div>
+        <div className="scene-header-actions">
+          <IconButton
+            icon={Download}
+            label={exportBusy ? 'Exporting' : 'Export'}
+            onClick={() => exportVideo.mutate()}
+            disabled={!document?.timeline.clips.length || !sessionToken || exportBusy}
+          />
+          <div className="scene-panel-actions" aria-label="Panel controls">
+            <IconButton
+              icon={chatPanelOpen ? PanelLeft : ClosedPanelLeftIcon}
+              label={chatPanelOpen ? 'Hide chat panel' : 'Show chat panel'}
+              className="panel-toggle scene-header-toggle"
+              aria-pressed={chatPanelOpen}
+              onClick={() => setChatPanelOpen((open) => {
+                const nextOpen = !open;
+                writeStoredBoolean(CHAT_OPEN_STORAGE_KEY, nextOpen);
+                return nextOpen;
+              })}
+            />
+            <IconButton
+              icon={timelinePanelOpen ? PanelBottom : ClosedPanelBottomIcon}
+              label={timelinePanelOpen ? 'Hide timeline panel' : 'Show timeline panel'}
+              className="panel-toggle scene-header-toggle"
+              aria-pressed={timelinePanelOpen}
+              onClick={() => setTimelinePanelOpen((open) => {
+                const nextOpen = !open;
+                writeStoredBoolean(TIMELINE_OPEN_STORAGE_KEY, nextOpen);
+                return nextOpen;
+              })}
+            />
+            <IconButton
+              icon={transcriptPanelOpen ? PanelRight : ClosedPanelRightIcon}
+              label={transcriptPanelOpen ? 'Hide transcription panel' : 'Show transcription panel'}
+              className="panel-toggle scene-header-toggle"
+              aria-pressed={transcriptPanelOpen}
+              onClick={() => setTranscriptPanelOpen((open) => {
+                const nextOpen = !open;
+                writeStoredBoolean(TRANSCRIPT_OPEN_STORAGE_KEY, nextOpen);
+                return nextOpen;
+              })}
+            />
           </div>
         </div>
+      </header>
 
-        {document ? (
+      <main className="preview-pane panel">
+        {displayDocument ? (
           <VirtualPreview
             videoSources={videoSources}
-            clips={document.timeline.clips}
-            revision={document.preview.revision}
+            clips={playbackClips}
+            revision={displayDocument.preview.revision}
             seekTarget={seekTarget}
             sourcePreviewTarget={sourcePreviewTarget}
             onTimeChange={setVirtualTimeSec}
@@ -1635,12 +1927,12 @@ export function App() {
           </div>
         </div>
         <CurrentTranscriptView
-          document={document ?? null}
-          busy={!activeSessionId || sendChat.isPending || replaceTimeline.isPending}
-          sourceDurationSec={primaryAsset?.durationSec ?? 0}
-          cueSourceTimeSec={cueSourceTimeSec}
+          document={displayDocument ?? null}
+          busy={!activeSessionId || sendChat.isPending || timelineOperation.isPending}
+          cuePosition={cuePosition}
           onSeekSourceTime={seekTranscriptSourceTime}
-          onReplaceTimeline={queueReplaceTimeline}
+          onAddSkipRange={queueAddSkipRange}
+          onRemoveSkipRange={queueRemoveSkipRange}
         />
       </aside>
 
@@ -1653,13 +1945,22 @@ export function App() {
       />
 
       <TimelinePane
-        clips={document?.timeline.clips ?? []}
-        currentTimeSec={virtualTimeSec}
-        sourceDurationSec={primaryAsset?.durationSec ?? 0}
-        busy={!activeSessionId || sendChat.isPending || replaceTimeline.isPending}
-        onSeek={(timeSec) => setSeekTarget({ timeSec, requestId: Date.now() })}
-        onPreviewSource={(sourceTimeSec) => setSourcePreviewTarget({ sourceTimeSec, requestId: Date.now() })}
-        onReplaceTimeline={queueReplaceTimeline}
+        clips={displayDocument?.timeline.clips ?? []}
+        assets={displayDocument?.assets ?? []}
+        videoSources={videoSources}
+        previewRevision={displayDocument?.preview.revision ?? 0}
+        skipRanges={displayDocument?.timeline.skipRanges ?? []}
+        currentTimeSec={timelineCurrentTimeSec}
+        busy={!activeSessionId || sendChat.isPending || timelineOperation.isPending}
+        onSeek={seekTimelineTime}
+        onPreviewSource={(sourceTimeSec, assetId) => setSourcePreviewTarget({ assetId, sourceTimeSec, requestId: Date.now() })}
+        onAddSkipRange={queueAddSkipRange}
+        onUpdateSkipRange={queueUpdateSkipRange}
+        onRemoveSkipRange={queueRemoveSkipRange}
+        onUpdateClipRange={queueUpdateClipRange}
+        onDuplicateClip={queueDuplicateClip}
+        onMoveClip={queueMoveClip}
+        onAssetDrop={(input) => setPendingAssetInsert(input)}
       />
 
       {historyOpen ? (
@@ -1706,35 +2007,242 @@ export function App() {
         <LoadVideoDialog
           projects={projectsQuery.data?.projects ?? []}
           activeProjectId={projectId}
-          busy={loadVideo.isPending}
-          error={loadVideo.error instanceof Error ? loadVideo.error.message : null}
+          busy={createProject.isPending}
+          error={createProject.error instanceof Error ? createProject.error.message : null}
           onClose={() => setLoadVideoOpen(false)}
           onSelectProject={(nextProjectId) => {
             setSelectedProjectId(nextProjectId);
             setActiveSessionId(null);
             setLoadVideoOpen(false);
           }}
-          onLoad={(input) => loadVideo.mutate(input)}
+          onCreate={() => createProject.mutate()}
         />
       ) : null}
 
-      {transcriptModal ? (
+      {pendingAssetInsert ? (
+        <InsertAssetDialog
+          asset={displayDocument?.assets.find((asset) => asset.id === pendingAssetInsert.assetId) ?? null}
+          insertAtSec={pendingAssetInsert.insertAtSec}
+          busy={timelineOperation.isPending}
+          error={timelineOperation.error instanceof Error ? timelineOperation.error.message : null}
+          onClose={() => setPendingAssetInsert(null)}
+          onInsert={(mode) => queueInsertAssetClip({ ...pendingAssetInsert, mode })}
+        />
+      ) : null}
+
+      {transcriptModalAssetId ? (
         <TranscriptDialog
           title="Source Transcript"
-          subtitle={sourceTranscriptName ?? 'No transcript artifact available yet.'}
-          content={sourceTranscriptQuery.data ?? (sourceTranscriptName ? '' : 'No source transcript artifact is available yet. You can regenerate the transcript from here.')}
+          subtitle={transcriptModalAsset?.label ?? sourceTranscriptName ?? 'No transcript artifact available yet.'}
+          asset={transcriptModalAsset}
+          videoSources={videoSources}
+          revision={displayDocument?.preview.revision ?? 0}
+          content={sourceTranscriptQuery.data ?? (sourceTranscriptName ? '' : 'No source transcript artifact is available yet for this file. You can regenerate the transcript from here.')}
           loading={sourceTranscriptQuery.isLoading}
           error={sourceTranscriptError}
-          detectedLanguage={document?.transcript?.language}
+          status={transcriptModalStatus}
+          detectedLanguage={transcriptModalTranscript?.language}
           language={transcriptLanguage}
           languageOptions={transcriptLanguageOptions}
           regenerateLabel="Regenerate transcript"
           regenerating={regenerateTranscript.isPending}
           onLanguageChange={setTranscriptLanguage}
-          onRegenerate={() => regenerateTranscript.mutate()}
-          onClose={() => setTranscriptModal(null)}
+          onRegenerate={() => {
+            if (transcriptModalAssetId) {
+              regenerateTranscript.mutate(transcriptModalAssetId);
+            }
+          }}
+          onClose={() => setTranscriptModalAssetId(null)}
         />
       ) : null}
+    </div>
+  );
+}
+
+function ProjectPanel({
+  projects,
+  activeProjectId,
+  document,
+  jobs,
+  onSelectProject,
+  onOpenProjects,
+  onAddAsset,
+  addAssetBusy,
+  addAssetError,
+  onOpenAssetTranscript,
+}: {
+  projects: ProjectSummary[];
+  activeProjectId: string | null;
+  document?: AxcutDocument;
+  jobs: JobSummary[];
+  onSelectProject: (projectId: string) => void;
+  onOpenProjects: () => void;
+  onAddAsset: () => void;
+  addAssetBusy: boolean;
+  addAssetError: string | null;
+  onOpenAssetTranscript: (assetId: string) => void;
+}) {
+  const sortedProjects = useMemo(
+    () => [...projects].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()),
+    [projects],
+  );
+  const transcriptStatusByAsset = useMemo(() => {
+    const statuses = new Map<string, AssetTranscriptStatus>();
+    for (const job of jobs) {
+      if (job.kind !== 'ingest_asset' && job.kind !== 'transcribe_asset') {
+        continue;
+      }
+      const assetId = jobAssetId(job);
+      if (!assetId || statuses.has(assetId)) {
+        continue;
+      }
+      if (job.status === 'queued' || job.status === 'running') {
+        statuses.set(assetId, 'running');
+      } else if (job.status === 'failed') {
+        statuses.set(assetId, 'failed');
+      }
+    }
+    for (const transcript of document?.transcripts ?? []) {
+      if (statuses.get(transcript.assetId) !== 'running') {
+        statuses.set(transcript.assetId, 'complete');
+      }
+    }
+    return statuses;
+  }, [document?.transcripts, jobs]);
+
+  return (
+    <section className="project-panel" aria-label="Project assets">
+      <div className="project-panel-top">
+        <strong>Project</strong>
+      </div>
+      <div className="project-panel-section">
+        <div className="project-panel-section-header">
+          <h2>Compositions</h2>
+          <IconButton icon={Plus} label="Open projects" className="secondary" onClick={onOpenProjects} />
+        </div>
+        <div className="project-composition-list">
+          {sortedProjects.slice(0, 4).map((project) => (
+            <button
+              key={project.id}
+              type="button"
+              className={project.id === activeProjectId ? 'project-composition active' : 'project-composition'}
+              onClick={() => onSelectProject(project.id)}
+            >
+              <span aria-hidden="true">{project.id === activeProjectId ? '✓' : ''}</span>
+              <strong>{project.title}</strong>
+            </button>
+          ))}
+          {sortedProjects.length === 0 ? <p className="project-empty muted">No compositions yet.</p> : null}
+        </div>
+      </div>
+      <div className="project-panel-section">
+        <div className="project-panel-section-header">
+          <h2>Files</h2>
+          <IconButton icon={Upload} label={addAssetBusy ? 'Uploading source file' : 'Upload source file'} className="secondary" onClick={onAddAsset} disabled={addAssetBusy || !activeProjectId} />
+        </div>
+        {addAssetError ? <p className="error-copy project-empty">{addAssetError}</p> : null}
+        <div className="project-file-search">
+          <input aria-label="Search files" placeholder="Search your files" readOnly />
+        </div>
+        <div className="project-file-list">
+          {addAssetBusy ? (
+            <div className="project-file-uploading" role="status" aria-live="polite">
+              <LoaderCircle size={16} strokeWidth={1.8} aria-hidden="true" />
+              <span>
+                <strong>Uploading video...</strong>
+                <small className="muted">The file will appear here when it is attached.</small>
+              </span>
+            </div>
+          ) : null}
+          {(document?.assets ?? []).map((asset) => {
+            const transcriptStatus = transcriptStatusByAsset.get(asset.id) ?? 'pending';
+            const label = assetDisplayLabel(asset);
+            return (
+              <button
+                key={asset.id}
+                type="button"
+                className="project-file-item"
+                draggable={Boolean(asset.durationSec)}
+                onClick={() => onOpenAssetTranscript(asset.id)}
+                onDragStart={(event) => {
+                  event.dataTransfer.setData('application/x-axcut-asset', asset.id);
+                  event.dataTransfer.effectAllowed = 'copy';
+                }}
+                title={asset.durationSec ? 'Click to open this file transcript or drag into the timeline to insert this source.' : 'Click to manage transcript generation for this file.'}
+              >
+                <AssetTranscriptIndicator status={transcriptStatus} />
+                <span>
+                  <strong>{label}</strong>
+                  <small className="muted">{asset.durationSec ? formatSeconds(asset.durationSec) : 'Preparing'}</small>
+                </span>
+              </button>
+            );
+          })}
+          {document && document.assets.length === 0 ? <p className="project-empty muted">No files in this project.</p> : null}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function AssetTranscriptIndicator({ status }: { status: AssetTranscriptStatus }) {
+  if (status === 'running') {
+    return (
+      <span className="project-file-transcript-status running" title="Transcription in progress" aria-label="Transcription in progress">
+        <LoaderCircle size={14} strokeWidth={2} aria-hidden="true" />
+      </span>
+    );
+  }
+  return (
+    <span
+      className={`project-file-transcript-status ${status}`}
+      title={status === 'complete' ? 'Transcription complete' : status === 'failed' ? 'Transcription failed' : 'Transcription pending'}
+      aria-label={status === 'complete' ? 'Transcription complete' : status === 'failed' ? 'Transcription failed' : 'Transcription pending'}
+    />
+  );
+}
+
+function InsertAssetDialog({
+  asset,
+  insertAtSec,
+  busy,
+  error,
+  onClose,
+  onInsert,
+}: {
+  asset: AxcutDocument['assets'][number] | null;
+  insertAtSec: number;
+  busy: boolean;
+  error: string | null;
+  onClose: () => void;
+  onInsert: (mode: 'before' | 'after' | 'split') => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="dialog" aria-modal="true">
+      <section className="modal panel insert-asset-modal">
+        <div className="modal-header">
+          <div>
+            <h2>Insert Source</h2>
+            <p className="muted">{asset?.label ?? 'Source'} at {formatSeconds(insertAtSec)}</p>
+          </div>
+          <IconButton icon={X} label="Close" className="secondary" onClick={onClose} />
+        </div>
+        <div className="insert-choice-list">
+          <button type="button" onClick={() => onInsert('before')} disabled={busy || !asset?.durationSec}>
+            <strong>Add before</strong>
+            <span className="muted">Place this whole source before the target clip.</span>
+          </button>
+          <button type="button" onClick={() => onInsert('after')} disabled={busy || !asset?.durationSec}>
+            <strong>Add after</strong>
+            <span className="muted">Place this whole source after the target clip.</span>
+          </button>
+          <button type="button" onClick={() => onInsert('split')} disabled={busy || !asset?.durationSec}>
+            <strong>Split here and insert</strong>
+            <span className="muted">Cut the target clip at this point, then insert this source.</span>
+          </button>
+        </div>
+        {error ? <p className="error-copy">{error}</p> : null}
+      </section>
     </div>
   );
 }
@@ -1757,43 +2265,16 @@ function StatusChip({ label, detail, tone, href }: { label: string; detail: stri
   );
 }
 
-function TranscriptionStatusButton({
-  label,
-  detail,
-  tone,
-  disabled,
-  onClick,
-}: {
-  label: string;
-  detail: string;
-  tone: 'idle' | 'running' | 'ready' | 'error';
-  disabled: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      className={`status-chip transcript-status-button ${tone}`}
-      title={`${label}: ${detail}`}
-      aria-label={`${label}: ${detail}. Open transcript options.`}
-      onClick={onClick}
-      disabled={disabled}
-    >
-      <span className="status-dot" aria-hidden="true" />
-      <span className="status-chip-copy">
-        <strong>{label}</strong>
-        <span className="muted">{detail}</span>
-      </span>
-    </button>
-  );
-}
-
 function TranscriptDialog({
   title,
   subtitle,
+  asset,
+  videoSources,
+  revision,
   content,
   loading,
   error,
+  status,
   detectedLanguage,
   language,
   languageOptions,
@@ -1805,9 +2286,13 @@ function TranscriptDialog({
 }: {
   title: string;
   subtitle: string;
+  asset: AxcutAsset | null;
+  videoSources: VideoSource[];
+  revision: number;
   content: string;
   loading: boolean;
   error: string | null;
+  status: AssetTranscriptStatus;
   detectedLanguage?: string;
   language: TranscriptLanguageSelection;
   languageOptions: typeof transcriptLanguageOptions;
@@ -1818,6 +2303,30 @@ function TranscriptDialog({
   onClose: () => void;
 }) {
   const showControls = Boolean(onRegenerate);
+  const isGenerating = regenerating || status === 'running';
+  const previewClip = useMemo<AxcutClip | null>(() => {
+    if (!asset?.durationSec) {
+      return null;
+    }
+    return {
+      id: `${asset.id}:source-transcript-preview`,
+      assetId: asset.id,
+      sourceStartSec: 0,
+      sourceEndSec: asset.durationSec,
+      timelineStartSec: 0,
+      timelineEndSec: asset.durationSec,
+      wordRefs: [],
+      origin: 'system',
+      reason: 'source transcript preview',
+    };
+  }, [asset]);
+  const statusLabel = status === 'complete'
+    ? 'Generated'
+    : status === 'running'
+      ? 'Generating'
+      : status === 'failed'
+        ? 'Generation failed'
+        : 'Not generated yet';
   return (
     <div className="modal-backdrop" role="dialog" aria-modal="true">
       <section className="modal panel transcript-modal">
@@ -1829,25 +2338,46 @@ function TranscriptDialog({
           <IconButton icon={X} label="Close" className="secondary" onClick={onClose} />
         </div>
         {showControls ? (
-          <div className="transcript-toolbar">
-            <span className="status-pill ready">Detected language: {detectedLanguage || 'unknown'}</span>
-            <label>
-              <span className="muted">Regenerate as</span>
-              <select
-                value={language}
-                onChange={(event) => onLanguageChange(event.target.value as TranscriptLanguageSelection)}
-                disabled={regenerating}
-              >
-                {languageOptions.map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
-                ))}
-              </select>
-            </label>
-            <IconButton icon={RefreshCw} label={regenerating ? 'Regenerating' : regenerateLabel ?? 'Regenerate transcript'} onClick={onRegenerate} disabled={regenerating} />
+          <div className="source-transcript-overview">
+            <div className="source-transcript-preview">
+              {previewClip ? (
+                <VirtualPreview videoSources={videoSources} clips={[previewClip]} revision={revision} />
+              ) : (
+                <div className="video placeholder">Video preview unavailable.</div>
+              )}
+            </div>
+            <div className="transcript-toolbar">
+              <span className={`source-transcript-status ${status}`}>
+                <AssetTranscriptIndicator status={status} />
+                <span>{statusLabel}</span>
+              </span>
+              <span className="status-pill ready">Detected language: {detectedLanguage || 'unknown'}</span>
+              <label>
+                <span className="muted">Regenerate as</span>
+                <select
+                  value={language}
+                  onChange={(event) => onLanguageChange(event.target.value as TranscriptLanguageSelection)}
+                  disabled={isGenerating}
+                >
+                  {languageOptions.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <IconButton icon={isGenerating ? LoaderCircle : RefreshCw} label={isGenerating ? 'Regenerating' : regenerateLabel ?? 'Regenerate transcript'} onClick={onRegenerate} disabled={isGenerating} className={isGenerating ? 'spinning' : undefined} />
+            </div>
           </div>
         ) : null}
         {error ? <p className="error-copy">{error}</p> : null}
-        <pre className="transcript-viewer">{loading ? 'Loading transcript...' : content || 'Transcript is empty.'}</pre>
+        <div className="transcript-viewer-wrap">
+          {isGenerating ? (
+            <div className="transcript-regenerating" role="status" aria-live="polite">
+              <LoaderCircle size={18} strokeWidth={2} aria-hidden="true" />
+              <span>Regenerating transcript...</span>
+            </div>
+          ) : null}
+          <pre className="transcript-viewer">{loading ? 'Loading transcript...' : content || 'Transcript is empty.'}</pre>
+        </div>
       </section>
     </div>
   );
@@ -1937,7 +2467,7 @@ function LoadVideoDialog({
   error,
   onClose,
   onSelectProject,
-  onLoad,
+  onCreate,
 }: {
   projects: ProjectSummary[];
   activeProjectId: string | null;
@@ -1945,10 +2475,8 @@ function LoadVideoDialog({
   error: string | null;
   onClose: () => void;
   onSelectProject: (projectId: string) => void;
-  onLoad: (input: { title: string; path: string }) => void;
+  onCreate: () => void;
 }) {
-  const [title, setTitle] = useState('');
-  const [path, setPath] = useState('');
   const recentProjects = useMemo(
     () => [...projects].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()).slice(0, 8),
     [projects],
@@ -1960,7 +2488,7 @@ function LoadVideoDialog({
         <div className="modal-header">
           <div>
             <h2>Projects</h2>
-            <p className="muted">Open a recent project or create one from a server-local video.</p>
+            <p className="muted">Open a recent project or create a new one.</p>
           </div>
           <IconButton icon={X} label="Close" className="secondary" onClick={onClose} />
         </div>
@@ -1993,26 +2521,13 @@ function LoadVideoDialog({
             <div className="project-modal-section-header">
               <h3>New project</h3>
             </div>
-            <form
-              className="provider-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                if (path.trim()) {
-                  onLoad({ title, path: path.trim() });
-                }
-              }}
-            >
-              <label>
-                <span className="muted">Project title</span>
-                <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Defaults to the video filename" />
-              </label>
-              <label>
-                <span className="muted">Server-local video path</span>
-                <input value={path} onChange={(event) => setPath(event.target.value)} placeholder="/home/you/Videos/source.mp4" />
-              </label>
+            <div className="project-modal-create">
+              <p className="muted">Create an empty project, then upload source files from the Files section.</p>
               {error ? <p className="error-copy">{error}</p> : null}
-              <IconButton icon={Upload} label={busy ? 'Loading video' : 'Create project and ingest'} disabled={busy || !path.trim()} />
-            </form>
+              <IconButton icon={Plus} label={busy ? 'Creating project' : 'New project'} onClick={onCreate} disabled={busy}>
+                New project
+              </IconButton>
+            </div>
           </section>
         </div>
       </section>

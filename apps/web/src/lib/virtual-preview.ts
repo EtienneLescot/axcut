@@ -36,11 +36,23 @@ export function locateVirtualPosition(clips: AxcutClip[], virtualTimeSec: number
     return null;
   }
   const clamped = clampVirtualTime(clips, virtualTimeSec);
-  const clipIndex = clips.findIndex((clip, index) => {
-    const isLast = index === clips.length - 1;
-    return clamped >= clip.timelineStartSec && (clamped < clip.timelineEndSec || isLast);
-  });
-  const resolvedIndex = clipIndex >= 0 ? clipIndex : clips.length - 1;
+  let low = 0;
+  let high = clips.length - 1;
+  let resolvedIndex = clips.length - 1;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const clip = clips[mid];
+    const isLast = mid === clips.length - 1;
+    if (clamped < clip.timelineStartSec) {
+      high = mid - 1;
+      continue;
+    }
+    if (clamped < clip.timelineEndSec || isLast) {
+      resolvedIndex = mid;
+      break;
+    }
+    low = mid + 1;
+  }
   const clip = clips[resolvedIndex];
   const clipOffset = Math.max(0, Math.min(clip.sourceEndSec - clip.sourceStartSec, clamped - clip.timelineStartSec));
   return {
@@ -51,8 +63,11 @@ export function locateVirtualPosition(clips: AxcutClip[], virtualTimeSec: number
   };
 }
 
-export function locateSourcePosition(clips: AxcutClip[], sourceTimeSec: number, epsilon = 0.05): VirtualPosition | null {
+export function locateSourcePosition(clips: AxcutClip[], sourceTimeSec: number, assetId?: string, epsilon = 0.05): VirtualPosition | null {
   const clipIndex = clips.findIndex((clip, index) => {
+    if (assetId && clip.assetId !== assetId) {
+      return false;
+    }
     const lowerBound = clip.sourceStartSec - epsilon;
     const upperBound = index === clips.length - 1 ? clip.sourceEndSec + epsilon : clip.sourceEndSec - epsilon;
     return sourceTimeSec >= lowerBound && sourceTimeSec <= upperBound;
@@ -72,13 +87,13 @@ export function locateSourcePosition(clips: AxcutClip[], sourceTimeSec: number, 
   };
 }
 
-export function resolvePlaybackPosition(clips: AxcutClip[], sourceTimeSec: number, epsilon = 0.05): PlaybackPosition {
-  const position = locateSourcePosition(clips, sourceTimeSec, epsilon);
+export function resolvePlaybackPosition(clips: AxcutClip[], sourceTimeSec: number, assetId?: string, epsilon = 0.05): PlaybackPosition {
+  const position = locateSourcePosition(clips, sourceTimeSec, assetId, epsilon);
   if (position) {
     return { kind: 'inside', position };
   }
 
-  const nextClip = clips.find((clip) => clip.sourceStartSec > sourceTimeSec);
+  const nextClip = clips.find((clip) => (!assetId || clip.assetId === assetId) && clip.sourceStartSec > sourceTimeSec);
   if (nextClip) {
     const nextPosition = locateVirtualPosition(clips, nextClip.timelineStartSec);
     return nextPosition ? { kind: 'next', position: nextPosition } : { kind: 'empty' };

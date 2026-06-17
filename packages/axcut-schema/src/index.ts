@@ -6,6 +6,7 @@ export const isoDateSchema = z.string().datetime({ offset: true });
 
 export const wordSchema = z.object({
   id: z.string().min(1),
+  assetId: z.string().min(1).optional(),
   segmentId: z.string().min(1),
   startSec: z.number().nonnegative(),
   endSec: z.number().nonnegative(),
@@ -14,6 +15,7 @@ export const wordSchema = z.object({
 
 export const transcriptSegmentSchema = z.object({
   id: z.string().min(1),
+  assetId: z.string().min(1).optional(),
   kind: z.enum(['speech', 'silence']),
   startSec: z.number().nonnegative(),
   endSec: z.number().nonnegative(),
@@ -80,9 +82,19 @@ export const rangeSchema = z.object({
   reason: z.string().default(''),
 });
 
+export const skipRangeSchema = z.object({
+  id: z.string().min(1),
+  assetId: z.string().min(1),
+  startSec: z.number().nonnegative(),
+  endSec: z.number().nonnegative(),
+  reason: z.string().default(''),
+  origin: z.enum(['system', 'agent', 'user']),
+});
+
 export const timelineSchema = z.object({
   clips: z.array(clipSchema).default([]),
   gaps: z.array(gapSchema).default([]),
+  skipRanges: z.array(skipRangeSchema).default([]),
   muteRanges: z.array(rangeSchema).default([]),
   speedRanges: z.array(rangeSchema).default([]),
   captionRanges: z.array(rangeSchema).default([]),
@@ -115,6 +127,7 @@ export const timelineOperationSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('drop_range'),
     reason: z.string().default(''),
+    assetId: z.string().min(1).optional(),
     startSec: z.number().nonnegative(),
     endSec: z.number().nonnegative(),
   }),
@@ -125,8 +138,54 @@ export const timelineOperationSchema = z.discriminatedUnion('type', [
     endWordId: z.string().min(1),
   }),
   z.object({
+    type: z.literal('add_skip_range'),
+    reason: z.string().default(''),
+    assetId: z.string().min(1),
+    startSec: z.number().nonnegative(),
+    endSec: z.number().nonnegative(),
+  }),
+  z.object({
+    type: z.literal('update_skip_range'),
+    reason: z.string().default(''),
+    skipId: z.string().min(1),
+    startSec: z.number().nonnegative(),
+    endSec: z.number().nonnegative(),
+  }),
+  z.object({
+    type: z.literal('remove_skip_range'),
+    reason: z.string().default(''),
+    skipId: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal('update_clip_range'),
+    reason: z.string().default(''),
+    clipId: z.string().min(1),
+    sourceStartSec: z.number().nonnegative(),
+    sourceEndSec: z.number().nonnegative(),
+  }),
+  z.object({
+    type: z.literal('duplicate_clip'),
+    reason: z.string().default(''),
+    clipId: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal('move_clip'),
+    reason: z.string().default(''),
+    clipId: z.string().min(1),
+    insertIndex: z.number().int().nonnegative(),
+  }),
+  z.object({
     type: z.literal('restore_full_timeline'),
     reason: z.string().default(''),
+  }),
+  z.object({
+    type: z.literal('insert_asset_clip'),
+    reason: z.string().default(''),
+    assetId: z.string().min(1),
+    insertAtSec: z.number().nonnegative(),
+    mode: z.enum(['before', 'after', 'split']),
+    sourceStartSec: z.number().nonnegative().default(0),
+    sourceEndSec: z.number().nonnegative().optional(),
   }),
 ]);
 
@@ -184,7 +243,8 @@ export const documentSchema = z.object({
   }),
   assets: z.array(assetSchema).default([]),
   transcript: transcriptSchema.nullable().default(null),
-  timeline: timelineSchema.default({ clips: [], gaps: [], muteRanges: [], speedRanges: [], captionRanges: [] }),
+  transcripts: z.array(transcriptSchema).default([]),
+  timeline: timelineSchema.default({ clips: [], gaps: [], skipRanges: [], muteRanges: [], speedRanges: [], captionRanges: [] }),
   agent: agentStateSchema.default({ pendingQuestions: [], suggestions: [], lastAppliedOperations: [] }),
   preview: previewSchema.default({ strategy: 'seek', revision: 0 }),
   export: exportStateSchema.default({ preset: 'final-balanced', lastJobId: null }),
@@ -195,6 +255,10 @@ export const documentSchema = z.object({
 
 export const createProjectInputSchema = z.object({
   title: z.string().trim().min(1).default('Untitled Project'),
+});
+
+export const updateProjectInputSchema = z.object({
+  title: z.string().trim().min(1),
 });
 
 export const addAssetInputSchema = z.object({
@@ -212,6 +276,7 @@ export const transcriptLanguageSchema = z.enum(['auto', 'en', 'fr', 'de', 'es', 
 
 export const transcribeInputSchema = z.object({
   language: transcriptLanguageSchema.default('auto'),
+  assetId: z.string().trim().min(1).optional(),
 });
 
 export const exportInputSchema = z.object({
@@ -229,6 +294,7 @@ export type AxcutTranscriptSegment = z.infer<typeof transcriptSegmentSchema>;
 export type AxcutTranscript = z.infer<typeof transcriptSchema>;
 export type AxcutAsset = z.infer<typeof assetSchema>;
 export type AxcutClip = z.infer<typeof clipSchema>;
+export type AxcutSkipRange = z.infer<typeof skipRangeSchema>;
 export type AxcutTimeline = z.infer<typeof timelineSchema>;
 export type AxcutSuggestion = z.infer<typeof suggestionSchema>;
 export type AxcutAgentState = z.infer<typeof agentStateSchema>;
@@ -237,6 +303,7 @@ export type AxcutOperation = z.infer<typeof operationSchema>;
 export type AxcutRevision = z.infer<typeof revisionSchema>;
 export type AxcutDocument = z.infer<typeof documentSchema>;
 export type CreateProjectInput = z.infer<typeof createProjectInputSchema>;
+export type UpdateProjectInput = z.infer<typeof updateProjectInputSchema>;
 export type AddAssetInput = z.infer<typeof addAssetInputSchema>;
 export type ChatInput = z.infer<typeof chatInputSchema>;
 export type TranscribeInput = z.infer<typeof transcribeInputSchema>;
@@ -255,7 +322,7 @@ export function createEmptyDocument(input: CreateProjectInput & { projectId: str
     },
     assets: [],
     transcript: null,
-    timeline: { clips: [], gaps: [], muteRanges: [], speedRanges: [], captionRanges: [] },
+    timeline: { clips: [], gaps: [], skipRanges: [], muteRanges: [], speedRanges: [], captionRanges: [] },
     agent: { pendingQuestions: [], suggestions: [], lastAppliedOperations: [] },
     preview: { strategy: 'seek', revision: 0 },
     export: { preset: 'final-balanced', lastJobId: null },
@@ -265,4 +332,53 @@ export function createEmptyDocument(input: CreateProjectInput & { projectId: str
 
 export function ensureDocument(value: unknown): AxcutDocument {
   return documentSchema.parse(value);
+}
+
+export function applySkipRangesToClips(clips: AxcutClip[], skipRanges: AxcutSkipRange[]): AxcutClip[] {
+  let cursor = 0;
+  let sequence = 1;
+  const materialized: AxcutClip[] = [];
+
+  for (const clip of [...clips].sort((a, b) => a.timelineStartSec - b.timelineStartSec)) {
+    const skips = skipRanges
+      .filter((skip) => skip.assetId === clip.assetId && skip.endSec > clip.sourceStartSec && skip.startSec < clip.sourceEndSec)
+      .sort((a, b) => a.startSec - b.startSec);
+    let segments = [{ startSec: clip.sourceStartSec, endSec: clip.sourceEndSec }];
+
+    for (const skip of skips) {
+      const nextSegments: Array<{ startSec: number; endSec: number }> = [];
+      for (const segment of segments) {
+        if (skip.endSec <= segment.startSec || skip.startSec >= segment.endSec) {
+          nextSegments.push(segment);
+          continue;
+        }
+        if (skip.startSec > segment.startSec) {
+          nextSegments.push({ startSec: segment.startSec, endSec: skip.startSec });
+        }
+        if (skip.endSec < segment.endSec) {
+          nextSegments.push({ startSec: skip.endSec, endSec: segment.endSec });
+        }
+      }
+      segments = nextSegments;
+    }
+
+    for (const segment of segments) {
+      const durationSec = segment.endSec - segment.startSec;
+      if (durationSec <= 0) {
+        continue;
+      }
+      materialized.push({
+        ...clip,
+        id: segments.length === 1 && skips.length === 0 ? clip.id : `${clip.id}__skip_part_${sequence}`,
+        sourceStartSec: segment.startSec,
+        sourceEndSec: segment.endSec,
+        timelineStartSec: cursor,
+        timelineEndSec: cursor + durationSec,
+      });
+      cursor += durationSec;
+      sequence += 1;
+    }
+  }
+
+  return materialized;
 }

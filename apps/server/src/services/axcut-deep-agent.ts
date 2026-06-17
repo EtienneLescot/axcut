@@ -8,7 +8,7 @@ import { z } from 'zod';
 import type { AxcutDocument, AxcutOperation, AxcutSuggestion } from '@axcut/schema';
 
 import { buildFillerSuggestions, buildPauseSuggestions, searchTranscript } from '../lib/structured-agent.js';
-import { normalizeIntervals, timelineIntervals } from '../lib/timeline.js';
+import { normalizeIntervals } from '../lib/timeline.js';
 import { agentSessionsRoot } from '../lib/paths.js';
 import { createAxcutChatModel } from '../llm/create-chat-model.js';
 import {
@@ -45,11 +45,17 @@ const suggestCutsToolSchema = z.object({
 }).strict();
 
 const timelineOperationToolSchema = z.object({
-  type: z.string().min(1).describe('Operation type: "replace_timeline", "drop_range", "drop_word_range", or "restore_full_timeline".'),
+  type: z.string().min(1).describe('Operation type: "add_skip_range", "update_skip_range", "remove_skip_range", "drop_word_range", "update_clip_range", "duplicate_clip", "move_clip", "restore_full_timeline", "replace_timeline", or "drop_range". Use skip operations for cleanup; replace_timeline/drop_range are structural clip edits.'),
   reason: nullableString,
-  intervalsJson: nullableString.describe('For replace_timeline only: JSON array like [{"startSec":0,"endSec":12.5}] or [[0,12.5]].'),
-  startSec: z.number().nonnegative().nullable().default(null).describe('For drop_range only.'),
-  endSec: z.number().nonnegative().nullable().default(null).describe('For drop_range only.'),
+  intervalsJson: nullableString.describe('For replace_timeline only: JSON array like [{"startSec":0,"endSec":12.5}] or [[0,12.5]]. Avoid for normal silence/filler cleanup.'),
+  assetId: nullableString.describe('For add_skip_range or structural drop_range on a specific asset. Required for add_skip_range.'),
+  skipId: nullableString.describe('For update_skip_range or remove_skip_range only.'),
+  clipId: nullableString.describe('For update_clip_range, duplicate_clip, or move_clip only.'),
+  insertIndex: z.number().int().nonnegative().nullable().default(null).describe('For move_clip only: final clip order index after removing the moved clip.'),
+  startSec: z.number().nonnegative().nullable().default(null).describe('For drop_range, add_skip_range, or update_skip_range.'),
+  endSec: z.number().nonnegative().nullable().default(null).describe('For drop_range, add_skip_range, or update_skip_range.'),
+  sourceStartSec: z.number().nonnegative().nullable().default(null).describe('For update_clip_range only.'),
+  sourceEndSec: z.number().nonnegative().nullable().default(null).describe('For update_clip_range only.'),
   startWordId: nullableString.describe('For drop_word_range only.'),
   endWordId: nullableString.describe('For drop_word_range only.'),
 }).strict();
@@ -61,8 +67,10 @@ const suggestionDecisionToolSchema = z.object({
 
 const MAX_CONTEXT_SEGMENTS = 240;
 const MAX_CONTEXT_WORDS = 800;
+const MAX_SKIP_HINTS = 80;
 
 type TimelineOperationToolInput = z.infer<typeof timelineOperationToolSchema>;
+type AxcutTranscript = NonNullable<AxcutDocument['transcript']>;
 
 function withDefault<T>(value: T | null | undefined, defaultValue: T): T {
   return value ?? defaultValue;
@@ -84,6 +92,7 @@ function buildTimelineOperationFromToolInput(input: TimelineOperationToolInput):
       return {
         type: 'drop_range',
         reason,
+        assetId: input.assetId ?? undefined,
         startSec: withDefault(input.startSec, 0),
         endSec: withDefault(input.endSec, 0),
       };
@@ -96,6 +105,67 @@ function buildTimelineOperationFromToolInput(input: TimelineOperationToolInput):
         reason,
         startWordId: input.startWordId,
         endWordId: input.endWordId,
+      };
+    case 'add_skip_range':
+      if (!input.assetId || withDefault(input.endSec, 0) <= withDefault(input.startSec, 0)) {
+        throw new Error('add_skip_range requires assetId and endSec to be greater than startSec.');
+      }
+      return {
+        type: 'add_skip_range',
+        reason,
+        assetId: input.assetId,
+        startSec: withDefault(input.startSec, 0),
+        endSec: withDefault(input.endSec, 0),
+      };
+    case 'update_skip_range':
+      if (!input.skipId || withDefault(input.endSec, 0) <= withDefault(input.startSec, 0)) {
+        throw new Error('update_skip_range requires skipId and endSec to be greater than startSec.');
+      }
+      return {
+        type: 'update_skip_range',
+        reason,
+        skipId: input.skipId,
+        startSec: withDefault(input.startSec, 0),
+        endSec: withDefault(input.endSec, 0),
+      };
+    case 'remove_skip_range':
+      if (!input.skipId) {
+        throw new Error('remove_skip_range requires skipId.');
+      }
+      return {
+        type: 'remove_skip_range',
+        reason,
+        skipId: input.skipId,
+      };
+    case 'update_clip_range':
+      if (!input.clipId || withDefault(input.sourceEndSec, 0) <= withDefault(input.sourceStartSec, 0)) {
+        throw new Error('update_clip_range requires clipId and sourceEndSec to be greater than sourceStartSec.');
+      }
+      return {
+        type: 'update_clip_range',
+        reason,
+        clipId: input.clipId,
+        sourceStartSec: withDefault(input.sourceStartSec, 0),
+        sourceEndSec: withDefault(input.sourceEndSec, 0),
+      };
+    case 'duplicate_clip':
+      if (!input.clipId) {
+        throw new Error('duplicate_clip requires clipId.');
+      }
+      return {
+        type: 'duplicate_clip',
+        reason,
+        clipId: input.clipId,
+      };
+    case 'move_clip':
+      if (!input.clipId || input.insertIndex === null) {
+        throw new Error('move_clip requires clipId and insertIndex.');
+      }
+      return {
+        type: 'move_clip',
+        reason,
+        clipId: input.clipId,
+        insertIndex: input.insertIndex,
       };
     case 'restore_full_timeline':
       return {
@@ -231,18 +301,10 @@ export function buildAgentInputMessages(prompt: string, history: AgentConversati
 }
 
 export function buildAxcutInvocationPrompt(document: AxcutDocument, prompt: string): string {
-  const speechKeepIntervals = buildSpeechKeepIntervals(document);
-  const firstSpeechRange = findFirstCurrentSpeechRange(document);
-  const transcriptSegments = document.transcript?.segments.slice(0, MAX_CONTEXT_SEGMENTS).map((segment) => ({
-    id: segment.id,
-    kind: segment.kind,
-    startSec: segment.startSec,
-    endSec: segment.endSec,
-    text: segment.text,
-    wordIds: segment.wordIds,
-  })) ?? [];
-  const transcriptTruncated = (document.transcript?.segments.length ?? 0) > transcriptSegments.length;
-  const wordContext = buildCurrentTimelineWordContext(document);
+  const timelineByAsset = buildTimelineIntervalsByAsset(document);
+  const transcripts = buildTimelineTranscriptContexts(document, timelineByAsset);
+  const skipCandidates = buildSkipCandidates(document, timelineByAsset);
+  const firstSpeechRange = findFirstCurrentSpeechRange(document, timelineByAsset);
   const context = {
     project: document.project,
     assets: document.assets.map((asset) => ({
@@ -253,27 +315,18 @@ export function buildAxcutInvocationPrompt(document: AxcutDocument, prompt: stri
     })),
     timeline: document.timeline.clips.map((clip) => ({
       id: clip.id,
+      assetId: clip.assetId,
       sourceStartSec: clip.sourceStartSec,
       sourceEndSec: clip.sourceEndSec,
       timelineStartSec: clip.timelineStartSec,
       timelineEndSec: clip.timelineEndSec,
       reason: clip.reason,
     })),
-    transcript: document.transcript
-      ? {
-          language: document.transcript.language,
-          segmentCount: document.transcript.segments.length,
-          wordCount: document.transcript.words.length,
-          truncated: transcriptTruncated,
-          segments: transcriptSegments,
-          words: wordContext.words,
-          wordsScope: 'current_timeline_source_words',
-          wordsTruncated: wordContext.truncated,
-        }
-      : null,
+    transcripts,
     suggestions: document.agent.suggestions,
     operationHints: {
-      speechKeepIntervalsForNonSpeakingRemoval: speechKeepIntervals,
+      silenceSkipCandidates: skipCandidates.silences,
+      fillerSkipCandidates: skipCandidates.fillers,
       firstCurrentSpeechRange: firstSpeechRange,
     },
   };
@@ -284,81 +337,163 @@ export function buildAxcutInvocationPrompt(document: AxcutDocument, prompt: stri
     '',
     'Operation guidance:',
     '- The LLM must decide whether an edit is appropriate. Do not edit unless the user requested it.',
-    '- For removing non-speaking/silence ranges, call apply_timeline_operation with type "replace_timeline" and intervalsJson set to operationHints.speechKeepIntervalsForNonSpeakingRemoval.',
-    '- For removing the first phrase/first spoken segment, call apply_timeline_operation with type "drop_range" using operationHints.firstCurrentSpeechRange.',
-    '- For removing exact words or phrases, use transcript.words or search_transcript word ids/timestamps, then call apply_timeline_operation with type "drop_word_range" using startWordId and endWordId.',
+    '- For cleanup requests such as removing blanks, silences, hesitations, filler words, or verbal habits, create non-destructive skips. Use apply_timeline_operation with type "add_skip_range" and the assetId/source timestamps from operationHints or transcripts.',
+    '- Do not use replace_timeline or drop_range for normal cleanup. Those are structural clip operations and can split/rebuild clips; reserve them for explicit structural timeline requests.',
+    '- For removing the first phrase/first spoken segment, prefer add_skip_range with operationHints.firstCurrentSpeechRange.assetId/startSec/endSec.',
+    '- For skipping exact words, phrases, hesitations, or filler tokens, prefer add_skip_range with assetId/startSec/endSec. Use drop_word_range only when the word ids are unambiguous for the current asset.',
+    '- For timeline-level skip edits, use add_skip_range, update_skip_range, or remove_skip_range. A skip excludes playback/export but does not alter clip source bounds.',
+    '- For structural clip editing, use update_clip_range to change clip source bounds, duplicate_clip to copy a clip instance, or move_clip to reorder clips. Do not use skip operations for clip trimming/reordering.',
     '- search_transcript returns source transcript segments plus word ids/timestamps and exact phrase matches when available.',
-    '- The transcript context is the canonical source transcript with source timestamps. The UI timeline transcript is only a reconstruction of the current clips.',
-    '- If the requested edit is not covered by operationHints, derive the minimal operation from the source timeline/transcript context or use search_transcript first.',
+    '- The transcript contexts include only assets that are currently used by timeline clips. Uploaded-but-not-mounted assets must not affect cleanup edits or the visible transcript.',
+    '- If the requested edit is not covered by operationHints, derive the minimal skip operation from the source timeline/transcript context or use search_transcript first.',
+    '- Prefer the fewest tool calls that accurately express the requested edit; cleanup can require multiple add_skip_range calls.',
     '',
     'User request:',
     prompt,
   ].join('\n');
 }
 
-function buildCurrentTimelineWordContext(document: AxcutDocument): { words: Array<{ id: string; segmentId: string; startSec: number; endSec: number; text: string }>; truncated: boolean } {
-  const transcript = document.transcript;
-  if (!transcript) {
-    return { words: [], truncated: false };
+function buildTimelineTranscriptContexts(
+  document: AxcutDocument,
+  timelineByAsset: Map<string, Array<{ startSec: number; endSec: number }>>,
+) {
+  return documentTranscripts(document)
+    .filter((transcript) => (timelineByAsset.get(transcript.assetId) ?? []).length > 0)
+    .map((transcript) => {
+      const intervals = timelineByAsset.get(transcript.assetId) ?? [];
+      const segments = transcript.segments
+        .filter((segment) => overlapsIntervals(intervals, segment.startSec, segment.endSec));
+      const words = transcript.words
+        .filter((word) => overlapsIntervals(intervals, word.startSec, word.endSec));
+      return {
+        assetId: transcript.assetId,
+        language: transcript.language,
+        segmentCount: transcript.segments.length,
+        wordCount: transcript.words.length,
+        includedTimelineIntervals: intervals,
+        segmentsTruncated: segments.length > MAX_CONTEXT_SEGMENTS,
+        wordsTruncated: words.length > MAX_CONTEXT_WORDS,
+        segments: segments.slice(0, MAX_CONTEXT_SEGMENTS).map((segment) => ({
+          id: segment.id,
+          assetId: segment.assetId ?? transcript.assetId,
+          kind: segment.kind,
+          startSec: segment.startSec,
+          endSec: segment.endSec,
+          text: segment.text,
+          wordIds: segment.wordIds,
+        })),
+        words: words.slice(0, MAX_CONTEXT_WORDS).map((word) => ({
+          id: word.id,
+          assetId: word.assetId ?? transcript.assetId,
+          segmentId: word.segmentId,
+          startSec: word.startSec,
+          endSec: word.endSec,
+          text: word.text,
+        })),
+      };
+    });
+}
+
+function buildSkipCandidates(
+  document: AxcutDocument,
+  timelineByAsset: Map<string, Array<{ startSec: number; endSec: number }>>,
+) {
+  const silences: Array<{ assetId: string; startSec: number; endSec: number; durationSec: number; reason: string }> = [];
+  const fillers: Array<{ assetId: string; wordId: string; startSec: number; endSec: number; text: string; reason: string }> = [];
+  const fillerLexicon = new Set(['uh', 'um', 'erm', 'hmm', 'hm', 'ah', 'eh', 'er', 'mm', 'euh', 'heu']);
+
+  for (const transcript of documentTranscripts(document)) {
+    const intervals = timelineByAsset.get(transcript.assetId) ?? [];
+    if (intervals.length === 0) {
+      continue;
+    }
+    for (const segment of transcript.segments) {
+      const durationSec = segment.endSec - segment.startSec;
+      if (segment.kind !== 'silence' || durationSec < 0.35 || !overlapsIntervals(intervals, segment.startSec, segment.endSec)) {
+        continue;
+      }
+      silences.push({
+        assetId: segment.assetId ?? transcript.assetId,
+        startSec: segment.startSec,
+        endSec: segment.endSec,
+        durationSec,
+        reason: 'silence',
+      });
+    }
+    for (const word of transcript.words) {
+      if (!overlapsIntervals(intervals, word.startSec, word.endSec) || !fillerLexicon.has(normalizePromptToken(word.text))) {
+        continue;
+      }
+      fillers.push({
+        assetId: word.assetId ?? transcript.assetId,
+        wordId: word.id,
+        startSec: word.startSec,
+        endSec: word.endSec,
+        text: word.text,
+        reason: 'filler_or_hesitation',
+      });
+    }
   }
 
-  const intervals = timelineIntervals(document);
-  const scopedWords = intervals.length > 0
-    ? transcript.words.filter((word) => intervals.some((interval) => word.endSec > interval.startSec && word.startSec < interval.endSec))
-    : transcript.words;
   return {
-    words: scopedWords.slice(0, MAX_CONTEXT_WORDS).map((word) => ({
-      id: word.id,
-      segmentId: word.segmentId,
-      startSec: word.startSec,
-      endSec: word.endSec,
-      text: word.text,
-    })),
-    truncated: scopedWords.length > MAX_CONTEXT_WORDS,
+    silences: silences.slice(0, MAX_SKIP_HINTS),
+    fillers: fillers.slice(0, MAX_SKIP_HINTS),
   };
 }
 
-function buildSpeechKeepIntervals(document: AxcutDocument): Array<{ startSec: number; endSec: number }> {
-  const transcript = document.transcript;
-  if (!transcript) {
-    return [];
-  }
-  const currentIntervals = timelineIntervals(document);
-  const speechSegments = transcript.segments.filter((segment) => segment.kind === 'speech' && segment.endSec > segment.startSec);
-  const intersections: Array<{ startSec: number; endSec: number }> = [];
-  for (const segment of speechSegments) {
-    for (const interval of currentIntervals) {
-      const startSec = Math.max(segment.startSec, interval.startSec);
-      const endSec = Math.min(segment.endSec, interval.endSec);
-      if (endSec > startSec) {
-        intersections.push({ startSec, endSec });
+function findFirstCurrentSpeechRange(
+  document: AxcutDocument,
+  timelineByAsset: Map<string, Array<{ startSec: number; endSec: number }>>,
+): { assetId: string; startSec: number; endSec: number } | null {
+  const candidates: Array<{ assetId: string; startSec: number; endSec: number }> = [];
+  for (const transcript of documentTranscripts(document)) {
+    const intervals = timelineByAsset.get(transcript.assetId) ?? [];
+    if (intervals.length === 0) {
+      continue;
+    }
+    for (const segment of transcript.segments.filter((item) => item.kind === 'speech')) {
+      for (const interval of intervals) {
+        const startSec = Math.max(segment.startSec, interval.startSec);
+        const endSec = Math.min(segment.endSec, interval.endSec);
+        if (endSec > startSec) {
+          candidates.push({ assetId: segment.assetId ?? transcript.assetId, startSec, endSec });
+        }
       }
     }
   }
-  return normalizeIntervals(primaryDuration(document), intersections);
+  return candidates.sort((left, right) => left.startSec - right.startSec)[0] ?? null;
 }
 
-function findFirstCurrentSpeechRange(document: AxcutDocument): { startSec: number; endSec: number } | null {
-  const transcript = document.transcript;
-  if (!transcript) {
-    return null;
-  }
-  const currentIntervals = timelineIntervals(document);
-  for (const segment of [...transcript.segments].filter((item) => item.kind === 'speech').sort((left, right) => left.startSec - right.startSec)) {
-    for (const interval of currentIntervals) {
-      const startSec = Math.max(segment.startSec, interval.startSec);
-      const endSec = Math.min(segment.endSec, interval.endSec);
-      if (endSec > startSec) {
-        return { startSec, endSec };
-      }
-    }
-  }
-  return null;
+function documentTranscripts(document: AxcutDocument): AxcutTranscript[] {
+  return document.transcripts.length > 0
+    ? document.transcripts
+    : document.transcript ? [document.transcript] : [];
 }
 
-function primaryDuration(document: AxcutDocument): number {
-  const asset = document.assets.find((item) => item.id === document.project.primaryAssetId) ?? document.assets[0];
-  return asset?.durationSec ?? 0;
+function buildTimelineIntervalsByAsset(document: AxcutDocument): Map<string, Array<{ startSec: number; endSec: number }>> {
+  const rawIntervals = new Map<string, Array<{ startSec: number; endSec: number }>>();
+  for (const clip of document.timeline.clips) {
+    const intervals = rawIntervals.get(clip.assetId) ?? [];
+    intervals.push({ startSec: clip.sourceStartSec, endSec: clip.sourceEndSec });
+    rawIntervals.set(clip.assetId, intervals);
+  }
+
+  return new Map([...rawIntervals].map(([assetId, intervals]) => [
+    assetId,
+    normalizeIntervals(assetDuration(document, assetId), intervals),
+  ]));
+}
+
+function assetDuration(document: AxcutDocument, assetId: string): number {
+  return document.assets.find((asset) => asset.id === assetId)?.durationSec ?? 0;
+}
+
+function overlapsIntervals(intervals: Array<{ startSec: number; endSec: number }>, startSec: number, endSec: number): boolean {
+  return intervals.some((interval) => interval.endSec > startSec && interval.startSec < endSec);
+}
+
+function normalizePromptToken(value: string): string {
+  return value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
 export class AxcutDeepAgentService {
@@ -374,10 +509,9 @@ export class AxcutDeepAgentService {
   }
 
   getOrCreateSession(projectId: string): DeepAgentSessionRecord {
-    const document = this.documents.readDocument(projectId);
     const scope = this.projectScope(projectId);
     return this.sessions.getActiveForScope(scope)
-      ?? this.sessions.ensure(projectId, { title: document.project.title || 'New conversation', scope });
+      ?? this.sessions.ensure(projectId, { title: 'New conversation', scope });
   }
 
   createSession(projectId: string): DeepAgentSessionRecord {
@@ -488,7 +622,7 @@ export class AxcutDeepAgentService {
       };
     }, {
       name: 'apply_timeline_operation',
-      description: 'Apply a structured timeline mutation directly to the Axcut project. For replace_timeline, pass intervalsJson as a JSON string array of {startSec,endSec} objects or [start,end] pairs.',
+      description: 'Apply a structured Axcut DSL mutation. Use add_skip_range/update_skip_range/remove_skip_range for non-destructive cleanup. Use clip operations only when the user asks for structural timeline editing.',
       schema: timelineOperationToolSchema,
     });
 
@@ -699,10 +833,12 @@ Your job is to edit a local video project through structured tools rather than b
 Rules:
 - The current project state, timeline, transcript segments, and suggestions are included in each user turn as Axcut project context.
 - For direct editing requests, decide from that context and call an editing tool. Do not ask the user to restate information already present in the context.
-- Prefer a single editing tool call when the context is sufficient, especially with Codex OAuth providers.
+- Prefer the fewest editing tool calls that accurately express the edit; multiple skip ranges are appropriate for cleanup.
 - Use transcript search only when the provided context is insufficient for locating a passage.
 - When the user explicitly asks for options, suggestions, or proposals, use suggest_cuts and do not apply edits immediately.
 - When the user gives a direct editing command with clear intent, apply the minimal structured operation needed.
+- Cleanup edits such as removing silences, blanks, hesitations, filler words, or verbal habits must use non-destructive skip operations unless the user explicitly asks to split, trim, rebuild, or reorder clips.
+- Structural clip operations are for montage structure only: clip source bounds, duplication, insertion, and ordering.
 - Use approve_suggestion or reject_suggestion when interacting with existing suggestions.
 - Keep replies concise and explain what you changed or suggested.
 - Never invent transcript content or timestamps.

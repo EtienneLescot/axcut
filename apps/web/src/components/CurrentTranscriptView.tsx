@@ -1,6 +1,6 @@
 import { useCallback, useLayoutEffect, useMemo, useRef } from 'react';
 import type { ClipboardEvent as ReactClipboardEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from 'react';
-import type { AxcutClip, AxcutDocument, AxcutWord } from '@axcut/schema';
+import type { AxcutAsset, AxcutClip, AxcutDocument, AxcutTranscript, AxcutWord } from '@axcut/schema';
 import { Trash2 } from 'lucide-react';
 
 import { formatSeconds, selectWordRange } from '../lib/virtual-preview.js';
@@ -8,51 +8,57 @@ import { formatSeconds, selectWordRange } from '../lib/virtual-preview.js';
 type CurrentTranscriptViewProps = {
   document: AxcutDocument | null;
   busy: boolean;
-  sourceDurationSec: number;
-  cueSourceTimeSec: number | null;
-  onSeekSourceTime: (sourceTimeSec: number) => void;
-  onReplaceTimeline: (intervals: Array<{ startSec: number; endSec: number }>, reason: string) => void;
+  cuePosition: { assetId: string; clipId: string; sourceTimeSec: number } | null;
+  onSeekSourceTime: (sourceTimeSec: number, assetId?: string, clipId?: string) => void;
+  onAddSkipRange: (assetId: string, startSec: number, endSec: number, reason: string) => void;
+  onRemoveSkipRange: (skipId: string) => void;
+};
+
+type ProjectedWord = AxcutWord & {
+  timelineClipId: string;
+  skipId?: string;
+};
+
+type ResolvedWord = {
+  word: AxcutWord & Partial<ProjectedWord>;
+  sourceTimeSec: number;
 };
 
 type TranscriptRun = {
   id: string;
-  kind: 'kept' | 'cut';
-  words: AxcutWord[];
+  kind: 'kept' | 'skip';
+  words: ProjectedWord[];
   startSec: number;
   endSec: number;
+  skipId?: string;
+};
+
+type TranscriptClipProjection = {
+  clip: AxcutClip;
+  asset: AxcutAsset | null;
+  transcript: AxcutTranscript | null;
+  words: ProjectedWord[];
+  keptWordIds: Set<string>;
 };
 
 const SILENCE_TOKEN_THRESHOLD_SEC = 0.5;
 
-export function CurrentTranscriptView({ document, busy, sourceDurationSec, cueSourceTimeSec, onSeekSourceTime, onReplaceTimeline }: CurrentTranscriptViewProps) {
+export function CurrentTranscriptView({ document, busy, cuePosition, onSeekSourceTime, onAddSkipRange, onRemoveSkipRange }: CurrentTranscriptViewProps) {
   const editorRef = useRef<HTMLDivElement | null>(null);
   const pendingCaretWordIdRef = useRef<string | null>(null);
 
-  const transcriptWords = useMemo(() => (
-    [...(document?.transcript?.words ?? [])].sort((a, b) => a.startSec - b.startSec)
-  ), [document?.transcript?.words]);
-  const sourceDuration = useMemo(() => (
-    Math.max(
-      sourceDurationSec,
-      ...(document?.timeline.clips.map((clip) => clip.sourceEndSec) ?? [0]),
-      ...(document?.transcript?.segments.map((segment) => segment.endSec) ?? [0]),
-      ...transcriptWords.map((word) => word.endSec),
-    )
-  ), [document?.timeline.clips, document?.transcript?.segments, sourceDurationSec, transcriptWords]);
-  const keptIntervals = useMemo(
-    () => normalizeIntervals(sourceDuration, timelineIntervals(document?.timeline.clips ?? [])),
-    [document?.timeline.clips, sourceDuration],
-  );
-  const displayTranscript = useMemo(
-    () => buildDisplayTranscriptWords(document, keptIntervals, sourceDuration),
-    [document, keptIntervals, sourceDuration],
-  );
-  const words = displayTranscript.words;
-  const keptWords = displayTranscript.keptWordIds;
-  const runs = useMemo(() => buildTranscriptRuns(words, keptWords), [keptWords, words]);
+  const clipProjections = useMemo(() => buildClipTranscriptProjections(document), [document]);
+  const words = useMemo(() => clipProjections.flatMap((projection) => projection.words), [clipProjections]);
+  const keptWords = useMemo(() => new Set(clipProjections.flatMap((projection) => Array.from(projection.keptWordIds))), [clipProjections]);
+  const runsByClipId = useMemo(() => (
+    new Map(clipProjections.map((projection) => [
+      projection.clip.id,
+      buildTranscriptRuns(projection.words, projection.keptWordIds),
+    ]))
+  ), [clipProjections]);
   const cueWordId = useMemo(
-    () => findCueWordId(words, cueSourceTimeSec),
-    [cueSourceTimeSec, words],
+    () => findCueWordId(words, cuePosition),
+    [cuePosition, words],
   );
 
   useLayoutEffect(() => {
@@ -62,16 +68,9 @@ export function CurrentTranscriptView({ document, busy, sourceDurationSec, cueSo
     }
     pendingCaretWordIdRef.current = null;
     restoreCaretBeforeWord(editorRef.current, wordId);
-  }, [runs]);
+  }, [runsByClipId]);
 
-  const replaceTimelineFromCutRange = useCallback((range: { startSec: number; endSec: number }, reason: string) => {
-    if (!document) {
-      return;
-    }
-    onReplaceTimeline(subtractInterval(timelineIntervals(document.timeline.clips), range), reason);
-  }, [document, onReplaceTimeline]);
-
-  const cutWordRange = useCallback((rangeWords: AxcutWord[]) => {
+  const skipWordRange = useCallback((rangeWords: AxcutWord[]) => {
     if (busy || rangeWords.length === 0) {
       return;
     }
@@ -82,25 +81,24 @@ export function CurrentTranscriptView({ document, busy, sourceDurationSec, cueSo
     pendingCaretWordIdRef.current = keptRangeWords[0].id;
     const startSec = Math.min(...keptRangeWords.map((word) => word.startSec));
     const endSec = Math.max(...keptRangeWords.map((word) => word.endSec));
-    replaceTimelineFromCutRange(
-      { startSec, endSec },
-      `Cut transcript selection ${formatSeconds(startSec)}-${formatSeconds(endSec)}.`,
-    );
-  }, [busy, keptWords, replaceTimelineFromCutRange]);
-
-  const restoreCutRun = useCallback((run: TranscriptRun) => {
-    if (busy || !document) {
+    const assetId = keptRangeWords[0].assetId;
+    if (!assetId || keptRangeWords.some((word) => word.assetId !== assetId)) {
       return;
     }
-    const intervals = normalizeIntervals(sourceDuration, [
-      ...timelineIntervals(document.timeline.clips),
-      { startSec: run.startSec, endSec: run.endSec },
-    ]);
-    onReplaceTimeline(
-      intervals,
-      `Deleted cut ${formatSeconds(run.startSec)}-${formatSeconds(run.endSec)} from the transcript view.`,
+    onAddSkipRange(
+      assetId,
+      startSec,
+      endSec,
+      `Skip transcript selection ${formatSeconds(startSec)}-${formatSeconds(endSec)} from ${assetId}.`,
     );
-  }, [busy, document, onReplaceTimeline, sourceDuration]);
+  }, [busy, keptWords, onAddSkipRange]);
+
+  const removeSkipRun = useCallback((run: TranscriptRun) => {
+    if (busy || !run.skipId) {
+      return;
+    }
+    onRemoveSkipRange(run.skipId);
+  }, [busy, onRemoveSkipRange]);
 
   const cutNativeSelection = useCallback((direction: 'backward' | 'forward') => {
     const selection = globalThis.getSelection();
@@ -117,7 +115,7 @@ export function CurrentTranscriptView({ document, busy, sourceDurationSec, cueSo
       if (!word) {
         return false;
       }
-      cutWordRange([word]);
+      skipWordRange([word]);
       return true;
     }
     const anchorId = findSelectionWordId(editor, selection.anchorNode, selection.anchorOffset, 'forward')
@@ -128,9 +126,9 @@ export function CurrentTranscriptView({ document, busy, sourceDurationSec, cueSo
     if (!range) {
       return false;
     }
-    cutWordRange(range.words);
+    skipWordRange(range.words);
     return true;
-  }, [cutWordRange, words]);
+  }, [skipWordRange, words]);
 
   const handleKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (event.key !== 'Backspace' && event.key !== 'Delete') {
@@ -162,11 +160,11 @@ export function CurrentTranscriptView({ document, busy, sourceDurationSec, cueSo
     if (!selection || !selection.isCollapsed || !editor || !editor.contains(selection.anchorNode)) {
       return;
     }
-    const sourceTimeSec = sourceTimeFromCaret(editor, selection.anchorNode, selection.anchorOffset, words);
-    if (sourceTimeSec === null) {
+    const resolved = wordFromCaret(editor, selection.anchorNode, selection.anchorOffset, words);
+    if (!resolved) {
       return;
     }
-    onSeekSourceTime(sourceTimeSec);
+    onSeekSourceTime(resolved.sourceTimeSec, resolved.word.assetId, resolved.word.timelineClipId);
   }, [onSeekSourceTime, words]);
 
   const handlePointerUp = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
@@ -177,18 +175,18 @@ export function CurrentTranscriptView({ document, busy, sourceDurationSec, cueSo
     if (targetElement?.closest('button')) {
       return;
     }
-    const sourceTimeSec = sourceTimeFromPointer(event.target, event.clientX, words);
-    if (sourceTimeSec !== null) {
-      onSeekSourceTime(sourceTimeSec);
+    const resolved = wordFromPointer(event.target, event.clientX, words);
+    if (resolved) {
+      onSeekSourceTime(resolved.sourceTimeSec, resolved.word.assetId, resolved.word.timelineClipId);
       return;
     }
     requestAnimationFrame(seekCaretSourceTime);
   }, [onSeekSourceTime, seekCaretSourceTime, words]);
 
-  if (!document?.transcript) {
+  if (!document || document.timeline.clips.length === 0) {
     return (
       <div className="transcript-empty muted">
-        No transcript is available yet.
+        No timeline clips yet.
       </div>
     );
   }
@@ -196,7 +194,7 @@ export function CurrentTranscriptView({ document, busy, sourceDurationSec, cueSo
   if (words.length === 0) {
     return (
       <div className="transcript-empty muted">
-        Transcript is empty.
+        No transcript is available for timeline clips yet.
       </div>
     );
   }
@@ -219,49 +217,62 @@ export function CurrentTranscriptView({ document, busy, sourceDurationSec, cueSo
         onPaste={handlePaste}
         onPointerUp={handlePointerUp}
       >
-        {runs.map((run) => (
-          run.kind === 'cut' ? (
-            <span
-              key={run.id}
-              className="transcript-cut-run"
-              title={`Cut ${formatSeconds(run.startSec)}-${formatSeconds(run.endSec)}`}
-            >
-              {run.words.map((word) => (
-                <TranscriptWord
-                  key={word.id}
-                  word={word}
-                  dropped
-                  cue={word.id === cueWordId}
-                />
-              ))}
-              <button
-                className="transcript-cut-delete"
-                type="button"
-                contentEditable={false}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  restoreCutRun(run);
-                }}
-                onPointerUp={(event) => event.stopPropagation()}
-                disabled={busy}
-                title="Delete cut"
-                aria-label={`Delete cut ${formatSeconds(run.startSec)}-${formatSeconds(run.endSec)}`}
-              >
-                <Trash2 size={12} strokeWidth={1.9} aria-hidden="true" />
-              </button>
+        {clipProjections.map((projection, index) => (
+          <span key={projection.clip.id} className="transcript-clip-block">
+            <span className="transcript-clip-header" contentEditable={false}>
+              <span className="transcript-clip-vignette" aria-hidden="true">{index + 1}</span>
+              <span>
+                <strong>{projection.asset?.label ?? projection.clip.assetId}</strong>
+                <small className="muted">
+                  Clip {index + 1} · {formatSeconds(projection.clip.timelineStartSec)}-{formatSeconds(projection.clip.timelineEndSec)}
+                </small>
+              </span>
             </span>
-          ) : (
-            <span key={run.id} className="transcript-kept-run">
-              {run.words.map((word) => (
-                <TranscriptWord
-                  key={word.id}
-                  word={word}
-                  dropped={false}
-                  cue={word.id === cueWordId}
-                />
-              ))}
-            </span>
-          )
+            {(runsByClipId.get(projection.clip.id) ?? []).map((run) => (
+              run.kind === 'skip' ? (
+                <span
+                  key={run.id}
+                  className="transcript-cut-run"
+                  title={`Skip ${formatSeconds(run.startSec)}-${formatSeconds(run.endSec)}`}
+                >
+                  {run.words.map((word) => (
+                    <TranscriptWord
+                      key={word.id}
+                      word={word}
+                      dropped
+                      cue={word.id === cueWordId}
+                    />
+                  ))}
+                  <button
+                    className="transcript-cut-delete"
+                    type="button"
+                    contentEditable={false}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      removeSkipRun(run);
+                    }}
+                    onPointerUp={(event) => event.stopPropagation()}
+                    disabled={busy || !run.skipId}
+                    title="Remove skip"
+                    aria-label={`Remove skip ${formatSeconds(run.startSec)}-${formatSeconds(run.endSec)}`}
+                  >
+                    <Trash2 size={12} strokeWidth={1.9} aria-hidden="true" />
+                  </button>
+                </span>
+              ) : (
+                <span key={run.id} className="transcript-kept-run">
+                  {run.words.map((word) => (
+                    <TranscriptWord
+                      key={word.id}
+                      word={word}
+                      dropped={false}
+                      cue={word.id === cueWordId}
+                    />
+                  ))}
+                </span>
+              )
+            ))}
+          </span>
         ))}
       </div>
     </div>
@@ -296,30 +307,94 @@ function TranscriptWord({
   );
 }
 
-export function findCueWordId(words: AxcutWord[], cueSourceTimeSec: number | null): string | null {
-  if (cueSourceTimeSec === null) {
+function buildClipTranscriptProjections(document: AxcutDocument | null): TranscriptClipProjection[] {
+  if (!document) {
+    return [];
+  }
+  const clips = [...document.timeline.clips].sort((a, b) => a.timelineStartSec - b.timelineStartSec);
+  return clips.map((clip) => {
+    const transcript = document.transcripts.find((item) => item.assetId === clip.assetId)
+      ?? (document.transcript?.assetId === clip.assetId ? document.transcript : null);
+    const asset = document.assets.find((item) => item.id === clip.assetId) ?? null;
+    if (!transcript) {
+      return {
+        clip,
+        asset,
+        transcript: null,
+        words: [],
+        keptWordIds: new Set<string>(),
+      };
+    }
+    const clipSkips = document.timeline.skipRanges.filter((skip) => (
+      skip.assetId === clip.assetId
+      && skip.endSec > clip.sourceStartSec
+      && skip.startSec < clip.sourceEndSec
+    ));
+    const clipWords = transcript.words
+      .filter((word) => word.endSec > clip.sourceStartSec && word.startSec < clip.sourceEndSec)
+      .sort((a, b) => a.startSec - b.startSec || a.endSec - b.endSec)
+      .map((word): ProjectedWord => ({
+        ...word,
+        id: `${clip.id}:${word.id}`,
+        assetId: word.assetId ?? transcript.assetId,
+        timelineClipId: clip.id,
+        skipId: matchingSkipId(word, clipSkips),
+        startSec: Math.max(clip.sourceStartSec, word.startSec),
+        endSec: Math.min(clip.sourceEndSec, word.endSec),
+    }));
+    const silenceWords = collectClipSilenceIntervals(clipWords, transcript.segments, clip.sourceStartSec, clip.sourceEndSec)
+      .map((silence, index) => {
+        const word = createSilenceWord(`${clip.id}_silence`, index, silence.startSec, silence.endSec, clip.assetId, clip.id);
+        return { ...word, skipId: matchingSkipId(word, clipSkips) };
+      });
+    const words = [...clipWords, ...silenceWords].sort((a, b) => a.startSec - b.startSec || a.endSec - b.endSec);
+    return {
+      clip,
+      asset,
+      transcript,
+      words,
+      keptWordIds: new Set(words.filter((word) => !word.skipId).map((word) => word.id)),
+    };
+  });
+}
+
+function matchingSkipId(word: Pick<AxcutWord, 'startSec' | 'endSec'>, skips: AxcutDocument['timeline']['skipRanges']): string | undefined {
+  return skips.find((skip) => word.endSec > skip.startSec && word.startSec < skip.endSec)?.id;
+}
+
+export function findCueWordId(words: AxcutWord[], cuePosition: { assetId: string; clipId?: string; sourceTimeSec: number } | number | null): string | null {
+  if (cuePosition === null) {
     return null;
   }
+  const assetId = typeof cuePosition === 'number' ? undefined : cuePosition.assetId;
+  const clipId = typeof cuePosition === 'number' ? undefined : cuePosition.clipId;
+  const sourceTimeSec = typeof cuePosition === 'number' ? cuePosition : cuePosition.sourceTimeSec;
+  const assetWords = words.filter((word) => (
+    (!assetId || word.assetId === assetId)
+    && (!clipId || (word as Partial<ProjectedWord>).timelineClipId === clipId)
+  ));
   const exactSilence = words.find((word) => (
     isSilenceWord(word)
-    && cueSourceTimeSec >= word.startSec
-    && cueSourceTimeSec < word.endSec
+    && (!assetId || word.assetId === assetId)
+    && (!clipId || (word as Partial<ProjectedWord>).timelineClipId === clipId)
+    && sourceTimeSec >= word.startSec
+    && sourceTimeSec < word.endSec
   ));
   if (exactSilence) {
     return exactSilence.id;
   }
 
   let previousWordId: string | null = null;
-  const spokenWords = words
+  const spokenWords = assetWords
     .filter((word) => !isSilenceWord(word))
     .sort((a, b) => a.startSec - b.startSec || a.endSec - b.endSec);
 
   for (const [index, word] of spokenWords.entries()) {
-    if (cueSourceTimeSec < word.startSec) {
+    if (sourceTimeSec < word.startSec) {
       return previousWordId;
     }
     const isLast = index === spokenWords.length - 1;
-    if (cueSourceTimeSec >= word.startSec && (cueSourceTimeSec < word.endSec || (isLast && cueSourceTimeSec <= word.endSec))) {
+    if (sourceTimeSec >= word.startSec && (sourceTimeSec < word.endSec || (isLast && sourceTimeSec <= word.endSec))) {
       return word.id;
     }
     previousWordId = word.id;
@@ -328,80 +403,32 @@ export function findCueWordId(words: AxcutWord[], cueSourceTimeSec: number | nul
   return previousWordId;
 }
 
-function buildDisplayTranscriptWords(
-  document: AxcutDocument | null,
-  keptIntervals: Array<{ startSec: number; endSec: number }>,
-  sourceDuration: number,
-): { words: AxcutWord[]; keptWordIds: Set<string> } {
-  const transcript = document?.transcript;
-  if (!transcript) {
-    return { words: [], keptWordIds: new Set() };
-  }
-
-  const keptWordIds = new Set<string>();
-  const displayWords: AxcutWord[] = [];
-  const transcriptWords = [...transcript.words].sort((a, b) => a.startSec - b.startSec);
-  for (const word of transcriptWords) {
-    displayWords.push(word);
-    if (intervalOverlaps(word, keptIntervals)) {
-      keptWordIds.add(word.id);
-    }
-  }
-
-  const silenceWords: AxcutWord[] = [];
-  for (const [silenceIndex, silence] of collectSilenceIntervals(transcriptWords, transcript.segments, sourceDuration).entries()) {
-    for (const [partIndex, part] of splitIntervalByKept(silence.startSec, silence.endSec, keptIntervals).entries()) {
-      if (part.endSec - part.startSec < SILENCE_TOKEN_THRESHOLD_SEC) {
-        continue;
-      }
-      const silenceWord = createSilenceWord(`silence_${silenceIndex}`, partIndex, part.startSec, part.endSec);
-      silenceWords.push(silenceWord);
-      displayWords.push(silenceWord);
-      if (part.kept) {
-        keptWordIds.add(silenceWord.id);
-      }
-    }
-  }
-
-  const cutIntervals = invertIntervals(keptIntervals, sourceDuration);
-  for (const [index, cut] of cutIntervals.entries()) {
-    if (cut.endSec - cut.startSec < SILENCE_TOKEN_THRESHOLD_SEC) {
-      continue;
-    }
-    const overlapsTranscriptContent = [...transcriptWords, ...silenceWords]
-      .some((word) => intervalOverlaps(word, [cut]));
-    if (overlapsTranscriptContent) {
-      continue;
-    }
-    displayWords.push(createSilenceWord('implicit_cut', index, cut.startSec, cut.endSec));
-  }
-
-  return {
-    words: displayWords.sort((a, b) => a.startSec - b.startSec || a.endSec - b.endSec),
-    keptWordIds,
-  };
-}
-
-function createSilenceWord(segmentId: string, index: number, startSec: number, endSec: number): AxcutWord {
+function createSilenceWord(segmentId: string, index: number, startSec: number, endSec: number, assetId: string, timelineClipId: string): ProjectedWord {
   const durationSec = Math.max(0, endSec - startSec);
   return {
     id: `silence_${segmentId}_${index}_${startSec.toFixed(3)}_${endSec.toFixed(3)}`,
+    assetId,
     segmentId,
     startSec,
     endSec,
     text: `(${durationSec.toFixed(1)}s)`,
+    timelineClipId,
   };
 }
 
-function collectSilenceIntervals(
+function collectClipSilenceIntervals(
   words: AxcutWord[],
   segments: Array<{ kind: string; startSec: number; endSec: number }>,
-  sourceDuration: number,
+  clipStartSec: number,
+  clipEndSec: number,
 ): Array<{ startSec: number; endSec: number }> {
   const candidates: Array<{ startSec: number; endSec: number }> = [];
   for (const segment of segments) {
-    if (segment.kind === 'silence') {
-      candidates.push({ startSec: segment.startSec, endSec: segment.endSec });
+    if (segment.kind === 'silence' && segment.endSec > clipStartSec && segment.startSec < clipEndSec) {
+      candidates.push({
+        startSec: Math.max(clipStartSec, segment.startSec),
+        endSec: Math.min(clipEndSec, segment.endSec),
+      });
     }
   }
   for (let index = 0; index < words.length - 1; index += 1) {
@@ -413,83 +440,30 @@ function collectSilenceIntervals(
   }
   const firstWord = words[0];
   const lastWord = words.at(-1);
-  if (firstWord && firstWord.startSec > 0) {
-    candidates.push({ startSec: 0, endSec: firstWord.startSec });
+  if (firstWord && firstWord.startSec > clipStartSec) {
+    candidates.push({ startSec: clipStartSec, endSec: firstWord.startSec });
   }
-  if (lastWord && sourceDuration > lastWord.endSec) {
-    candidates.push({ startSec: lastWord.endSec, endSec: sourceDuration });
+  if (lastWord && clipEndSec > lastWord.endSec) {
+    candidates.push({ startSec: lastWord.endSec, endSec: clipEndSec });
   }
-  return normalizeIntervals(sourceDuration, candidates)
+  if (!firstWord && !lastWord) {
+    candidates.push({ startSec: clipStartSec, endSec: clipEndSec });
+  }
+  return normalizeIntervals(clipEndSec, candidates)
+    .map((interval) => ({ startSec: Math.max(clipStartSec, interval.startSec), endSec: Math.min(clipEndSec, interval.endSec) }))
     .filter((interval) => interval.endSec - interval.startSec >= SILENCE_TOKEN_THRESHOLD_SEC);
-}
-
-function splitIntervalByKept(
-  startSec: number,
-  endSec: number,
-  keptIntervals: Array<{ startSec: number; endSec: number }>,
-): Array<{ startSec: number; endSec: number; kept: boolean }> {
-  const boundaries = new Set([startSec, endSec]);
-  for (const interval of keptIntervals) {
-    if (interval.endSec <= startSec || interval.startSec >= endSec) {
-      continue;
-    }
-    boundaries.add(Math.max(startSec, interval.startSec));
-    boundaries.add(Math.min(endSec, interval.endSec));
-  }
-  const sortedBoundaries = [...boundaries].sort((a, b) => a - b);
-  const parts: Array<{ startSec: number; endSec: number; kept: boolean }> = [];
-  for (let index = 0; index < sortedBoundaries.length - 1; index += 1) {
-    const partStart = sortedBoundaries[index];
-    const partEnd = sortedBoundaries[index + 1];
-    if (partEnd - partStart < SILENCE_TOKEN_THRESHOLD_SEC) {
-      continue;
-    }
-    const midpoint = partStart + ((partEnd - partStart) / 2);
-    parts.push({
-      startSec: partStart,
-      endSec: partEnd,
-      kept: keptIntervals.some((interval) => midpoint >= interval.startSec && midpoint < interval.endSec),
-    });
-  }
-  return parts;
-}
-
-function invertIntervals(
-  intervals: Array<{ startSec: number; endSec: number }>,
-  durationSec: number,
-): Array<{ startSec: number; endSec: number }> {
-  const normalized = normalizeIntervals(durationSec, intervals);
-  const output: Array<{ startSec: number; endSec: number }> = [];
-  let cursor = 0;
-  for (const interval of normalized) {
-    if (interval.startSec > cursor) {
-      output.push({ startSec: cursor, endSec: interval.startSec });
-    }
-    cursor = Math.max(cursor, interval.endSec);
-  }
-  if (durationSec > cursor) {
-    output.push({ startSec: cursor, endSec: durationSec });
-  }
-  return output;
-}
-
-function intervalOverlaps(
-  range: { startSec: number; endSec: number },
-  intervals: Array<{ startSec: number; endSec: number }>,
-): boolean {
-  return intervals.some((interval) => range.endSec > interval.startSec && range.startSec < interval.endSec);
 }
 
 function isSilenceWord(word: AxcutWord): boolean {
   return word.id.startsWith('silence_');
 }
 
-function buildTranscriptRuns(words: AxcutWord[], keptWords: Set<string>): TranscriptRun[] {
+function buildTranscriptRuns(words: ProjectedWord[], keptWords: Set<string>): TranscriptRun[] {
   const runs: TranscriptRun[] = [];
   for (const word of words) {
-    const kind: TranscriptRun['kind'] = keptWords.has(word.id) ? 'kept' : 'cut';
+    const kind: TranscriptRun['kind'] = keptWords.has(word.id) ? 'kept' : 'skip';
     const previous = runs.at(-1);
-    if (previous && previous.kind === kind && word.startSec - previous.endSec <= 1) {
+    if (previous && previous.kind === kind && previous.skipId === word.skipId && word.startSec - previous.endSec <= 1) {
       previous.words.push(word);
       previous.endSec = Math.max(previous.endSec, word.endSec);
       continue;
@@ -500,6 +474,7 @@ function buildTranscriptRuns(words: AxcutWord[], keptWords: Set<string>): Transc
       words: [word],
       startSec: word.startSec,
       endSec: word.endSec,
+      skipId: word.skipId,
     });
   }
   return runs;
@@ -582,22 +557,32 @@ export function sourceTimeFromCaret(
   offset: number,
   words: AxcutWord[],
 ): number | null {
+  const resolved = wordFromCaret(editor, node, offset, words);
+  return resolved ? resolved.sourceTimeSec : null;
+}
+
+function wordFromCaret(
+  editor: HTMLElement,
+  node: Node | null,
+  offset: number,
+  words: AxcutWord[],
+): ResolvedWord | null {
   const wordElement = closestWordElement(node);
   if (wordElement?.dataset.wordId) {
     const word = words.find((item) => item.id === wordElement.dataset.wordId);
     if (!word) {
       return null;
     }
-    return interpolateWordSourceTime(word, node, offset);
+    return { word, sourceTimeSec: interpolateWordSourceTime(word, node, offset) };
   }
 
   const wordId = findSelectionWordId(editor, node, offset, 'forward')
     ?? findSelectionWordId(editor, node, offset, 'backward');
   const word = words.find((item) => item.id === wordId);
-  return word ? word.startSec : null;
+  return word ? { word, sourceTimeSec: word.startSec } : null;
 }
 
-function sourceTimeFromPointer(target: EventTarget | null, clientX: number, words: AxcutWord[]): number | null {
+function wordFromPointer(target: EventTarget | null, clientX: number, words: AxcutWord[]): ResolvedWord | null {
   const targetElement = target instanceof Element ? target : null;
   const wordElement = targetElement?.closest<HTMLElement>('[data-word-id]');
   if (!wordElement?.dataset.wordId) {
@@ -609,7 +594,7 @@ function sourceTimeFromPointer(target: EventTarget | null, clientX: number, word
   }
   const rect = wordElement.getBoundingClientRect();
   const ratio = rect.width > 0 ? Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) : 0;
-  return word.startSec + (Math.max(0, word.endSec - word.startSec) * ratio);
+  return { word, sourceTimeSec: word.startSec + (Math.max(0, word.endSec - word.startSec) * ratio) };
 }
 
 function interpolateWordSourceTime(word: AxcutWord, node: Node | null, offset: number): number {
@@ -664,30 +649,6 @@ function restoreCaretBeforeWord(editor: HTMLElement | null, wordId: string) {
   const selection = globalThis.getSelection();
   selection?.removeAllRanges();
   selection?.addRange(range);
-}
-
-function timelineIntervals(clips: AxcutClip[]): Array<{ startSec: number; endSec: number }> {
-  return clips.map((clip) => ({ startSec: clip.sourceStartSec, endSec: clip.sourceEndSec }));
-}
-
-function subtractInterval(
-  intervals: Array<{ startSec: number; endSec: number }>,
-  cut: { startSec: number; endSec: number },
-): Array<{ startSec: number; endSec: number }> {
-  const output: Array<{ startSec: number; endSec: number }> = [];
-  for (const interval of intervals) {
-    if (cut.endSec <= interval.startSec || cut.startSec >= interval.endSec) {
-      output.push(interval);
-      continue;
-    }
-    if (cut.startSec > interval.startSec) {
-      output.push({ startSec: interval.startSec, endSec: cut.startSec });
-    }
-    if (cut.endSec < interval.endSec) {
-      output.push({ startSec: cut.endSec, endSec: interval.endSec });
-    }
-  }
-  return normalizeIntervals(Number.POSITIVE_INFINITY, output);
 }
 
 function normalizeIntervals(durationSec: number, intervals: Array<{ startSec: number; endSec: number }>): Array<{ startSec: number; endSec: number }> {
