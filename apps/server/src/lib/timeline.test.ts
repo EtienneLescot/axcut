@@ -78,10 +78,135 @@ test('applyTimelineOperation drops a selected word range and increments preview 
   });
 
   assert.equal(updated.preview.revision, document.preview.revision + 1);
-  assert.equal(updated.timeline.clips.length, 2);
+  assert.equal(updated.timeline.clips.length, 1);
   assert.deepEqual(
     updated.timeline.clips.map((clip) => [clip.sourceStartSec, clip.sourceEndSec]),
-    [[0, 1], [4, 5]],
+    [[0, 5]],
   );
-  assert.ok(updated.timeline.clips.every((clip) => clip.origin === 'user'));
+  assert.deepEqual(updated.timeline.skipRanges.map((skip) => [skip.assetId, skip.startSec, skip.endSec]), [
+    ['asset_main', 1, 4],
+  ]);
+  assert.equal(updated.timeline.skipRanges[0].origin, 'user');
+});
+
+test('applyTimelineOperation rejects ambiguous word ids across mounted assets', () => {
+  const document = createDocument();
+  const extraTranscript: NonNullable<AxcutDocument['transcript']> = {
+    assetId: 'asset_extra',
+    language: 'en',
+    segments: [
+      { id: 's1', kind: 'speech', startSec: 0, endSec: 1, text: 'other words', wordIds: ['w1', 'w2'] },
+    ],
+    words: [
+      { id: 'w1', segmentId: 's1', startSec: 0, endSec: 0.4, text: 'other' },
+      { id: 'w2', segmentId: 's1', startSec: 0.5, endSec: 1, text: 'words' },
+    ],
+  };
+  const withExtraMounted: AxcutDocument = {
+    ...document,
+    assets: [
+      ...document.assets,
+      { id: 'asset_extra', kind: 'video', label: 'extra.mp4', originalPath: '/tmp/extra.mp4', durationSec: 1 },
+    ],
+    transcripts: [document.transcript!, extraTranscript],
+    timeline: {
+      ...document.timeline,
+      clips: [
+        ...document.timeline.clips,
+        ...buildTimelineFromIntervals('asset_extra', [{ startSec: 0, endSec: 1 }], {
+          origin: 'system',
+          reason: 'extra',
+          transcript: extraTranscript,
+        }),
+      ],
+    },
+  };
+
+  assert.throws(() => applyTimelineOperation(withExtraMounted, {
+    type: 'drop_word_range',
+    startWordId: 'w1',
+    endWordId: 'w2',
+    reason: 'ambiguous',
+  }), /ambiguous across multiple assets/);
+});
+
+test('applyTimelineOperation updates a skip range without changing clip bounds', () => {
+  const document = applyTimelineOperation(createDocument(), {
+    type: 'add_skip_range',
+    assetId: 'asset_main',
+    startSec: 1,
+    endSec: 2,
+    reason: 'skip',
+  });
+
+  const updated = applyTimelineOperation(document, {
+    type: 'update_skip_range',
+    skipId: 'skip_1',
+    startSec: 1.5,
+    endSec: 3,
+    reason: 'resize skip',
+  });
+
+  assert.deepEqual(updated.timeline.clips.map((clip) => [clip.sourceStartSec, clip.sourceEndSec]), [[0, 5]]);
+  assert.deepEqual(updated.timeline.skipRanges.map((skip) => [skip.id, skip.startSec, skip.endSec]), [['skip_1', 1.5, 3]]);
+});
+
+test('applyTimelineOperation updates clip bounds and retimes the timeline', () => {
+  const document = createDocument();
+
+  const updated = applyTimelineOperation(document, {
+    type: 'update_clip_range',
+    clipId: 'clip_1',
+    sourceStartSec: 1,
+    sourceEndSec: 4,
+    reason: 'trim clip',
+  });
+
+  assert.deepEqual(updated.timeline.clips.map((clip) => [clip.sourceStartSec, clip.sourceEndSec, clip.timelineStartSec, clip.timelineEndSec]), [
+    [1, 4, 0, 3],
+  ]);
+});
+
+test('applyTimelineOperation duplicates a clip after the selected clip', () => {
+  const document = createDocument();
+
+  const updated = applyTimelineOperation(document, {
+    type: 'duplicate_clip',
+    clipId: 'clip_1',
+    reason: 'duplicate',
+  });
+
+  assert.deepEqual(updated.timeline.clips.map((clip) => [clip.sourceStartSec, clip.sourceEndSec, clip.timelineStartSec, clip.timelineEndSec]), [
+    [0, 5, 0, 5],
+    [0, 5, 5, 10],
+  ]);
+});
+
+test('applyTimelineOperation moves a clip to a new order and retimes the timeline', () => {
+  const baseDocument = createDocument();
+  const baseClip = baseDocument.timeline.clips[0];
+  const document = {
+    ...baseDocument,
+    timeline: {
+      ...baseDocument.timeline,
+      clips: [
+        { ...baseClip, id: 'clip_1', sourceStartSec: 0, sourceEndSec: 1, timelineStartSec: 0, timelineEndSec: 1 },
+        { ...baseClip, id: 'clip_2', sourceStartSec: 1, sourceEndSec: 3, timelineStartSec: 1, timelineEndSec: 3 },
+        { ...baseClip, id: 'clip_3', sourceStartSec: 3, sourceEndSec: 5, timelineStartSec: 3, timelineEndSec: 5 },
+      ],
+    },
+  };
+
+  const updated = applyTimelineOperation(document, {
+    type: 'move_clip',
+    clipId: 'clip_1',
+    insertIndex: 2,
+    reason: 'move clip',
+  });
+
+  assert.deepEqual(updated.timeline.clips.map((clip) => [clip.id, clip.timelineStartSec, clip.timelineEndSec]), [
+    ['clip_2', 0, 2],
+    ['clip_3', 2, 4],
+    ['clip_1', 4, 5],
+  ]);
 });

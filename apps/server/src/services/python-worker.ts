@@ -38,6 +38,10 @@ export class PythonWorker {
     return this.runJson(['export', '--video', videoPath, '--intervals', intervalsPath, '--output', outputPath]);
   }
 
+  async exportSequence(clipsPath: string, outputPath: string): Promise<WorkerResponse<Record<string, unknown>>> {
+    return this.runJson(['export-sequence', '--clips', clipsPath, '--output', outputPath]);
+  }
+
   private async runJson<T>(args: string[]): Promise<WorkerResponse<T>> {
     return new Promise((resolve, reject) => {
       const child = spawn(this.pythonExecutable, ['-m', 'axcut_worker.cli', ...args], {

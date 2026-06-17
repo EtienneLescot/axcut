@@ -171,3 +171,70 @@ def render_cut_video(
         ]
         subprocess.run(concat_cmd, check=True, cwd=temp_dir)
         shutil.move(temp_output, output_path)
+
+
+def render_clip_sequence(
+    clips: list[dict[str, object]], output_path: Path
+) -> None:
+    if not clips:
+        raise RuntimeError("No timeline clips available for export.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(
+        dir=output_path.parent, prefix=".axcut-render-"
+    ) as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        clip_paths: list[Path] = []
+
+        for index, item in enumerate(clips):
+            source_path = Path(str(item["path"]))
+            clip_path = temp_dir / f"clip_{index:03d}.mp4"
+            clip_paths.append(clip_path)
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                f"{float(item['start']):.3f}",
+                "-to",
+                f"{float(item['end']):.3f}",
+                "-i",
+                str(source_path),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                str(clip_path),
+            ]
+            subprocess.run(cmd, check=True)
+
+        concat_manifest = temp_dir / "concat.txt"
+        concat_manifest.write_text(
+            "\n".join(f"file '{clip_path.name}'" for clip_path in clip_paths) + "\n",
+            encoding="utf-8",
+        )
+
+        temp_output = temp_dir / "assembled.mp4"
+        concat_cmd = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_manifest),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(temp_output),
+        ]
+        subprocess.run(concat_cmd, check=True, cwd=temp_dir)
+        shutil.move(temp_output, output_path)

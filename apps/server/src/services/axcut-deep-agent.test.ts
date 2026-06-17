@@ -54,8 +54,11 @@ test('buildAxcutInvocationPrompt includes source word timestamps for precise edi
   };
 
   const prompt = buildAxcutInvocationPrompt(document, 'remove for me');
-  assert.match(prompt, /"wordsScope":"current_timeline_source_words"/);
+  assert.match(prompt, /"transcripts":\[/);
+  assert.match(prompt, /"assetId":"asset_1"/);
   assert.match(prompt, /"id":"w1"/);
   assert.match(prompt, /"startSec":0.1/);
+  assert.match(prompt, /add_skip_range/);
   assert.match(prompt, /drop_word_range/);
+  assert.doesNotMatch(prompt, /speechKeepIntervalsForNonSpeakingRemoval/);
 });

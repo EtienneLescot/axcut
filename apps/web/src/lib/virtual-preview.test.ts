@@ -47,6 +47,13 @@ test('locateVirtualPosition maps virtual time to source time', () => {
   assert.equal(position.sourceTimeSec, 21.5);
 });
 
+test('locateVirtualPosition resolves clip boundaries to the following clip', () => {
+  const position = locateVirtualPosition(clips, 4);
+  assert.ok(position);
+  assert.equal(position.clip.id, 'clip_2');
+  assert.equal(position.sourceTimeSec, 20);
+});
+
 test('locateSourcePosition maps source time back to virtual time', () => {
   const position = locateSourcePosition(clips, 12.25);
   assert.ok(position);

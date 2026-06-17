@@ -1,88 +1,94 @@
-import type { AxcutClip, AxcutDocument, AxcutOperation, AxcutTimelineOperation, AxcutTranscript } from '@axcut/schema';
+import type { AxcutClip, AxcutDocument, AxcutTimelineOperation, AxcutTranscript } from '@axcut/schema';
+
+type OperationOrigin = 'system' | 'agent' | 'user';
+type TimeInterval = { startSec: number; endSec: number };
 
 function byStart(a: { startSec: number }, b: { startSec: number }): number {
   return a.startSec - b.startSec;
 }
 
-export function normalizeIntervals(durationSec: number, intervals: Array<{ startSec: number; endSec: number }>): Array<{ startSec: number; endSec: number }> {
+function normalizeIntervals(durationSec: number, intervals: TimeInterval[]): TimeInterval[] {
   const bounded = intervals
-    .map((item) => ({
-      startSec: Math.max(0, Math.min(durationSec, item.startSec)),
-      endSec: Math.max(0, Math.min(durationSec, item.endSec)),
+    .map((interval) => ({
+      startSec: Math.max(0, Math.min(durationSec, interval.startSec)),
+      endSec: Math.max(0, Math.min(durationSec, interval.endSec)),
     }))
-    .filter((item) => item.endSec > item.startSec)
+    .filter((interval) => interval.endSec > interval.startSec)
     .sort(byStart);
 
-  const merged: Array<{ startSec: number; endSec: number }> = [];
-  for (const item of bounded) {
-    const last = merged.at(-1);
-    if (!last || item.startSec > last.endSec) {
-      merged.push({ ...item });
+  const merged: TimeInterval[] = [];
+  for (const interval of bounded) {
+    const previous = merged.at(-1);
+    if (!previous || interval.startSec > previous.endSec) {
+      merged.push({ ...interval });
       continue;
     }
-    last.endSec = Math.max(last.endSec, item.endSec);
+    previous.endSec = Math.max(previous.endSec, interval.endSec);
   }
   return merged;
 }
 
-export function timelineIntervals(document: AxcutDocument): Array<{ startSec: number; endSec: number }> {
-  const assetId = document.project.primaryAssetId ?? document.assets[0]?.id;
-  return normalizeIntervals(
-    primaryAssetDuration(document),
-    document.timeline.clips
-      .filter((clip) => !assetId || clip.assetId === assetId)
-      .map((clip) => ({ startSec: clip.sourceStartSec, endSec: clip.sourceEndSec })),
-  );
+function primaryAssetId(document: AxcutDocument): string | null {
+  return document.project.primaryAssetId ?? document.assets[0]?.id ?? null;
 }
 
-export function primaryAssetDuration(document: AxcutDocument): number {
+function primaryAssetDuration(document: AxcutDocument): number {
   const asset = document.assets.find((item) => item.id === document.project.primaryAssetId) ?? document.assets[0];
   return asset?.durationSec ?? 0;
 }
 
-export function buildTimelineFromIntervals(
-  assetId: string,
-  intervals: Array<{ startSec: number; endSec: number }>,
-  options: { origin: 'system' | 'agent' | 'user'; reason: string; transcript: AxcutTranscript | null },
-): AxcutClip[] {
-  let cursor = 0;
-  return intervals.map((interval, index) => {
-    const duration = interval.endSec - interval.startSec;
-    const timelineStartSec = cursor;
-    const timelineEndSec = cursor + duration;
-    cursor = timelineEndSec;
-    return {
-      id: `clip_${index + 1}`,
-      assetId,
-      sourceStartSec: interval.startSec,
-      sourceEndSec: interval.endSec,
-      timelineStartSec,
-      timelineEndSec,
-      wordRefs: collectWordRefs(options.transcript, assetId, interval.startSec, interval.endSec),
-      origin: options.origin,
-      reason: options.reason,
-    };
-  });
+function documentTranscripts(document: AxcutDocument): AxcutTranscript[] {
+  return document.transcripts.length > 0
+    ? document.transcripts
+    : document.transcript ? [document.transcript] : [];
+}
+
+function transcriptForAsset(document: AxcutDocument, assetId: string): AxcutTranscript | null {
+  return documentTranscripts(document).find((transcript) => transcript.assetId === assetId) ?? null;
 }
 
 function collectWordRefs(
-  transcript: AxcutTranscript | AxcutTranscript[] | null,
+  transcripts: AxcutTranscript[] | AxcutTranscript | null,
   assetId: string,
   startSec: number,
   endSec: number,
 ): string[] {
-  const resolvedTranscript = Array.isArray(transcript)
-    ? transcript.find((item) => item.assetId === assetId) ?? null
-    : transcript;
-  if (!resolvedTranscript) {
+  const transcript = Array.isArray(transcripts)
+    ? transcripts.find((item) => item.assetId === assetId) ?? null
+    : transcripts;
+  if (!transcript) {
     return [];
   }
-  return resolvedTranscript.words
-    .filter((word) => (word.assetId ?? resolvedTranscript.assetId) === assetId && word.endSec > startSec && word.startSec < endSec)
+  return transcript.words
+    .filter((word) => (word.assetId ?? transcript.assetId) === assetId && word.endSec > startSec && word.startSec < endSec)
     .map((word) => word.id);
 }
 
-export function retimeClips(clips: AxcutClip[], transcript: AxcutTranscript | AxcutTranscript[] | null = null): AxcutClip[] {
+function buildTimelineFromIntervals(
+  assetId: string,
+  intervals: TimeInterval[],
+  options: { origin: OperationOrigin; reason: string; transcript: AxcutTranscript | null },
+): AxcutClip[] {
+  let cursor = 0;
+  return intervals.map((interval, index) => {
+    const duration = interval.endSec - interval.startSec;
+    const clip: AxcutClip = {
+      id: `clip_${index + 1}`,
+      assetId,
+      sourceStartSec: interval.startSec,
+      sourceEndSec: interval.endSec,
+      timelineStartSec: cursor,
+      timelineEndSec: cursor + duration,
+      wordRefs: collectWordRefs(options.transcript, assetId, interval.startSec, interval.endSec),
+      origin: options.origin,
+      reason: options.reason,
+    };
+    cursor = clip.timelineEndSec;
+    return clip;
+  });
+}
+
+function retimeClips(clips: AxcutClip[], transcripts: AxcutTranscript[]): AxcutClip[] {
   let cursor = 0;
   let generatedIndex = 1;
   const usedIds = new Set<string>();
@@ -109,24 +115,15 @@ export function retimeClips(clips: AxcutClip[], transcript: AxcutTranscript | Ax
         id,
         timelineStartSec: cursor,
         timelineEndSec: cursor + duration,
-        wordRefs: collectWordRefs(transcript, clip.assetId, clip.sourceStartSec, clip.sourceEndSec),
+        wordRefs: collectWordRefs(transcripts, clip.assetId, clip.sourceStartSec, clip.sourceEndSec),
       };
       cursor = next.timelineEndSec;
       return next;
     });
 }
 
-function documentTranscripts(document: AxcutDocument): AxcutTranscript[] {
-  return document.transcripts.length > 0
-    ? document.transcripts
-    : document.transcript ? [document.transcript] : [];
-}
-
-export function subtractInterval(
-  intervals: Array<{ startSec: number; endSec: number }>,
-  cut: { startSec: number; endSec: number },
-): Array<{ startSec: number; endSec: number }> {
-  const output: Array<{ startSec: number; endSec: number }> = [];
+function subtractInterval(intervals: TimeInterval[], cut: TimeInterval): TimeInterval[] {
+  const output: TimeInterval[] = [];
   for (const interval of intervals) {
     if (cut.endSec <= interval.startSec || cut.startSec >= interval.endSec) {
       output.push(interval);
@@ -142,53 +139,11 @@ export function subtractInterval(
   return output;
 }
 
-export function resolveWordRange(
-  document: AxcutDocument,
-  startWordId: string,
-  endWordId: string,
-): { assetId: string; startSec: number; endSec: number } {
-  const transcripts = documentTranscripts(document);
-  const candidates = transcripts.flatMap((transcript) => {
-    const start = transcript.words.find((word) => word.id === startWordId);
-    const end = transcript.words.find((word) => word.id === endWordId);
-    if (!start || !end) {
-      return [];
-    }
-    const assetId = start.assetId ?? transcript.assetId;
-    if ((end.assetId ?? transcript.assetId) !== assetId) {
-      return [];
-    }
-    return [{
-      assetId,
-      startSec: Math.min(start.startSec, end.startSec),
-      endSec: Math.max(start.endSec, end.endSec),
-    }];
-  });
-  if (candidates.length === 0) {
-    throw new Error('Unknown transcript word id in operation.');
-  }
-  const mountedAssetIds = new Set(document.timeline.clips.map((clip) => clip.assetId));
-  const mountedCandidates = candidates.filter((candidate) => mountedAssetIds.has(candidate.assetId));
-  const viableCandidates = mountedCandidates.length > 0 ? mountedCandidates : candidates;
-  if (viableCandidates.length > 1) {
-    throw new Error('Transcript word id range is ambiguous across multiple assets; use add_skip_range with assetId and timestamps.');
-  }
-  return viableCandidates[0]!;
-}
-
-function primaryAssetId(document: AxcutDocument): string {
-  const assetId = document.project.primaryAssetId ?? document.assets[0]?.id;
-  if (!assetId) {
-    throw new Error('Cannot update timeline without a primary asset.');
-  }
-  return assetId;
-}
-
 function applySourceCutToAsset(
   clips: AxcutClip[],
   assetId: string,
-  cut: { startSec: number; endSec: number },
-  origin: 'system' | 'agent' | 'user',
+  cut: TimeInterval,
+  origin: OperationOrigin,
   reason: string,
 ): AxcutClip[] {
   const output: AxcutClip[] = [];
@@ -197,24 +152,49 @@ function applySourceCutToAsset(
       output.push(clip);
       continue;
     }
-    if (cut.startSec > clip.sourceStartSec) {
-      output.push({ ...clip, sourceEndSec: cut.startSec, origin, reason });
-    }
-    if (cut.endSec < clip.sourceEndSec) {
-      output.push({ ...clip, sourceStartSec: cut.endSec, origin, reason });
+    const remaining = subtractInterval([{ startSec: clip.sourceStartSec, endSec: clip.sourceEndSec }], cut);
+    for (const interval of remaining) {
+      output.push({
+        ...clip,
+        sourceStartSec: interval.startSec,
+        sourceEndSec: interval.endSec,
+        origin,
+        reason,
+      });
     }
   }
   return output;
 }
 
+function resolveWordRange(
+  document: AxcutDocument,
+  startWordId: string,
+  endWordId: string,
+): { assetId: string; startSec: number; endSec: number } | null {
+  const words = documentTranscripts(document).flatMap((transcript) => transcript.words.map((word) => ({
+    ...word,
+    assetId: word.assetId ?? transcript.assetId,
+  })));
+  const start = words.find((word) => word.id === startWordId);
+  const end = words.find((word) => word.id === endWordId);
+  if (!start || !end || !start.assetId || start.assetId !== end.assetId) {
+    return null;
+  }
+  return {
+    assetId: start.assetId,
+    startSec: Math.min(start.startSec, end.startSec),
+    endSec: Math.max(start.endSec, end.endSec),
+  };
+}
+
 function addSkipRange(
   document: AxcutDocument,
   input: { assetId: string; startSec: number; endSec: number; reason: string },
-  origin: 'system' | 'agent' | 'user',
+  origin: OperationOrigin,
 ): AxcutDocument['timeline']['skipRanges'] {
   const asset = document.assets.find((item) => item.id === input.assetId);
   if (!asset) {
-    throw new Error(`Unknown asset ${input.assetId}.`);
+    return document.timeline.skipRanges;
   }
   const startSec = Math.max(0, Math.min(input.startSec, input.endSec));
   const assetDuration = asset.durationSec ?? Number.POSITIVE_INFINITY;
@@ -259,8 +239,8 @@ function updateSkipRange(
 function updateClipRange(
   document: AxcutDocument,
   input: { clipId: string; sourceStartSec: number; sourceEndSec: number; reason: string },
-  origin: 'system' | 'agent' | 'user',
-): AxcutClip[] {
+  origin: OperationOrigin,
+): AxcutClip[] | null {
   let found = false;
   const nextClips = document.timeline.clips.map((clip) => {
     if (clip.id !== input.clipId) {
@@ -279,21 +259,13 @@ function updateClipRange(
       reason: input.reason || clip.reason,
     };
   });
-  if (!found) {
-    throw new Error(`Unknown clip ${input.clipId}.`);
-  }
-  return retimeClips(nextClips, documentTranscripts(document));
+  return found ? retimeClips(nextClips, documentTranscripts(document)) : null;
 }
 
-function duplicateClip(
-  document: AxcutDocument,
-  clipId: string,
-  origin: 'system' | 'agent' | 'user',
-  reason: string,
-): AxcutClip[] {
+function duplicateClip(document: AxcutDocument, clipId: string, origin: OperationOrigin, reason: string): AxcutClip[] | null {
   const index = document.timeline.clips.findIndex((clip) => clip.id === clipId);
   if (index < 0) {
-    throw new Error(`Unknown clip ${clipId}.`);
+    return null;
   }
   const source = document.timeline.clips[index];
   const copy: AxcutClip = {
@@ -313,12 +285,12 @@ function moveClip(
   document: AxcutDocument,
   clipId: string,
   insertIndex: number,
-  origin: 'system' | 'agent' | 'user',
+  origin: OperationOrigin,
   reason: string,
-): AxcutClip[] {
+): AxcutClip[] | null {
   const index = document.timeline.clips.findIndex((clip) => clip.id === clipId);
   if (index < 0) {
-    throw new Error(`Unknown clip ${clipId}.`);
+    return null;
   }
   const movingClip = {
     ...document.timeline.clips[index],
@@ -334,15 +306,19 @@ function moveClip(
   ], documentTranscripts(document));
 }
 
-function buildFullAssetClip(document: AxcutDocument, operation: Extract<AxcutTimelineOperation, { type: 'insert_asset_clip' }>, origin: 'system' | 'agent' | 'user'): AxcutClip {
+function buildFullAssetClip(
+  document: AxcutDocument,
+  operation: Extract<AxcutTimelineOperation, { type: 'insert_asset_clip' }>,
+  origin: OperationOrigin,
+): AxcutClip | null {
   const asset = document.assets.find((item) => item.id === operation.assetId);
   if (!asset) {
-    throw new Error(`Unknown asset ${operation.assetId}.`);
+    return null;
   }
   const sourceStartSec = operation.sourceStartSec ?? 0;
   const sourceEndSec = operation.sourceEndSec ?? asset.durationSec;
   if (sourceEndSec === undefined || sourceEndSec <= sourceStartSec) {
-    throw new Error('Cannot insert an asset before media metadata is available.');
+    return null;
   }
   return {
     id: 'clip_pending',
@@ -371,9 +347,12 @@ function findInsertionIndex(clips: AxcutClip[], insertAtSec: number, mode: 'befo
 function insertAssetClip(
   document: AxcutDocument,
   operation: Extract<AxcutTimelineOperation, { type: 'insert_asset_clip' }>,
-  origin: 'system' | 'agent' | 'user',
-): AxcutClip[] {
+  origin: OperationOrigin,
+): AxcutClip[] | null {
   const inserted = buildFullAssetClip(document, operation, origin);
+  if (!inserted) {
+    return null;
+  }
   const clips = document.timeline.clips;
   if (operation.mode !== 'split' || clips.length === 0) {
     const mode = operation.mode === 'split' ? 'after' : operation.mode;
@@ -397,10 +376,10 @@ function insertAssetClip(
   ], documentTranscripts(document));
 }
 
-export function applyTimelineOperation(
+export function applyOptimisticTimelineOperation(
   document: AxcutDocument,
-  operation: AxcutOperation,
-  origin: 'system' | 'agent' | 'user' = operation.type === 'replace_timeline' ? 'agent' : 'user',
+  operation: AxcutTimelineOperation,
+  origin: OperationOrigin = operation.type === 'replace_timeline' ? 'agent' : 'user',
 ): AxcutDocument {
   const assetId = primaryAssetId(document);
   const duration = primaryAssetDuration(document);
@@ -409,20 +388,31 @@ export function applyTimelineOperation(
 
   switch (operation.type) {
     case 'replace_timeline':
+      if (!assetId) {
+        return document;
+      }
       nextClips = buildTimelineFromIntervals(assetId, normalizeIntervals(duration, operation.intervals), {
         origin,
         reason: operation.reason,
-        transcript: documentTranscripts(document).find((transcript) => transcript.assetId === assetId) ?? null,
+        transcript: transcriptForAsset(document, assetId),
       });
       break;
-    case 'drop_range':
+    case 'drop_range': {
+      const resolvedAssetId = operation.assetId ?? assetId;
+      if (!resolvedAssetId) {
+        return document;
+      }
       nextClips = retimeClips(
-        applySourceCutToAsset(nextClips, operation.assetId ?? assetId, { startSec: operation.startSec, endSec: operation.endSec }, origin, operation.reason),
+        applySourceCutToAsset(nextClips, resolvedAssetId, { startSec: operation.startSec, endSec: operation.endSec }, origin, operation.reason),
         documentTranscripts(document),
       );
       break;
+    }
     case 'drop_word_range': {
       const range = resolveWordRange(document, operation.startWordId, operation.endWordId);
+      if (!range) {
+        return document;
+      }
       nextSkipRanges = addSkipRange(document, { ...range, reason: operation.reason }, origin);
       nextClips = retimeClips(nextClips, documentTranscripts(document));
       break;
@@ -439,27 +429,50 @@ export function applyTimelineOperation(
       nextSkipRanges = document.timeline.skipRanges.filter((skip) => skip.id !== operation.skipId);
       nextClips = retimeClips(nextClips, documentTranscripts(document));
       break;
-    case 'update_clip_range':
-      nextClips = updateClipRange(document, operation, origin);
+    case 'update_clip_range': {
+      const updated = updateClipRange(document, operation, origin);
+      if (!updated) {
+        return document;
+      }
+      nextClips = updated;
       break;
-    case 'duplicate_clip':
-      nextClips = duplicateClip(document, operation.clipId, origin, operation.reason);
+    }
+    case 'duplicate_clip': {
+      const duplicated = duplicateClip(document, operation.clipId, origin, operation.reason);
+      if (!duplicated) {
+        return document;
+      }
+      nextClips = duplicated;
       break;
-    case 'move_clip':
-      nextClips = moveClip(document, operation.clipId, operation.insertIndex, origin, operation.reason);
+    }
+    case 'move_clip': {
+      const moved = moveClip(document, operation.clipId, operation.insertIndex, origin, operation.reason);
+      if (!moved) {
+        return document;
+      }
+      nextClips = moved;
       break;
+    }
     case 'restore_full_timeline':
+      if (!assetId) {
+        return document;
+      }
       nextClips = duration > 0
         ? buildTimelineFromIntervals(assetId, [{ startSec: 0, endSec: duration }], {
           origin,
           reason: operation.reason,
-          transcript: documentTranscripts(document).find((transcript) => transcript.assetId === assetId) ?? null,
+          transcript: transcriptForAsset(document, assetId),
         })
         : [];
       break;
-    case 'insert_asset_clip':
-      nextClips = insertAssetClip(document, operation, origin);
+    case 'insert_asset_clip': {
+      const inserted = insertAssetClip(document, operation, origin);
+      if (!inserted) {
+        return document;
+      }
+      nextClips = inserted;
       break;
+    }
   }
 
   return {

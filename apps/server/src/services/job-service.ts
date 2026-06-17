@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import type { AxcutTranscript } from '@axcut/schema';
+import { applySkipRangesToClips, type AxcutTranscript } from '@axcut/schema';
 
 import { createId } from '../lib/ids.js';
 import { projectArtifactsRoot } from '../lib/paths.js';
@@ -57,7 +57,6 @@ export class JobService {
       this.update(jobId, projectId, { status: 'running', progress: 0.15, message: 'Probing source media' });
       const probe = await this.worker.probe(asset.originalPath);
       this.documents.updateAsset(projectId, assetId, probe.data as never, 'Asset media metadata updated');
-      this.documents.ensureFullTimelineForAsset(projectId, assetId, 'Initial full-length timeline from media probe');
       this.events.emit(projectId, 'project.asset.updated', { assetId });
 
       const artifactsRoot = projectArtifactsRoot(projectId);
@@ -111,20 +110,45 @@ export class JobService {
   private async runExport(jobId: string, projectId: string, preset: string): Promise<void> {
     try {
       const document = this.documents.getSnapshot(projectId).document;
-      const asset = document.assets.find((item) => item.id === document.project.primaryAssetId) ?? document.assets[0];
+      const effectiveClips = applySkipRangesToClips(document.timeline.clips, document.timeline.skipRanges);
+      if (effectiveClips.length === 0) {
+        throw new Error('No timeline clips available for export.');
+      }
+      const firstClipAssetId = effectiveClips[0]?.assetId;
+      const asset = document.assets.find((item) => item.id === firstClipAssetId)
+        ?? document.assets.find((item) => item.id === document.project.primaryAssetId)
+        ?? document.assets[0];
       if (!asset) {
         throw new Error('No asset available for export.');
       }
-      const intervals = document.timeline.clips.map((clip) => ({ start: clip.sourceStartSec, end: clip.sourceEndSec }));
+      const clips = effectiveClips.map((clip) => {
+        const sourceAsset = document.assets.find((item) => item.id === clip.assetId);
+        if (!sourceAsset) {
+          throw new Error(`Unknown asset ${clip.assetId} in timeline.`);
+        }
+        return {
+          assetId: clip.assetId,
+          path: sourceAsset.originalPath,
+          start: clip.sourceStartSec,
+          end: clip.sourceEndSec,
+        };
+      });
+      const intervals = effectiveClips.map((clip) => ({ start: clip.sourceStartSec, end: clip.sourceEndSec }));
       const artifactsRoot = projectArtifactsRoot(projectId);
       fs.mkdirSync(artifactsRoot, { recursive: true });
       const intervalsPath = path.join(artifactsRoot, `${createId('intervals')}.json`);
+      const clipsPath = path.join(artifactsRoot, `${createId('clips')}.json`);
       const outputPath = path.join(artifactsRoot, `${createId('export')}.mp4`);
       fs.writeFileSync(intervalsPath, `${JSON.stringify(intervals, null, 2)}\n`, 'utf-8');
+      fs.writeFileSync(clipsPath, `${JSON.stringify(clips, null, 2)}\n`, 'utf-8');
 
       this.documents.updateExportState(projectId, { lastJobId: jobId, preset: preset as never });
       this.update(jobId, projectId, { status: 'running', progress: 0.3, message: 'Rendering export' });
-      await this.worker.exportVideo(asset.originalPath, intervalsPath, outputPath);
+      if (new Set(effectiveClips.map((clip) => clip.assetId)).size > 1) {
+        await this.worker.exportSequence(clipsPath, outputPath);
+      } else {
+        await this.worker.exportVideo(asset.originalPath, intervalsPath, outputPath);
+      }
       this.update(jobId, projectId, { status: 'completed', progress: 1, message: 'Export completed', resultJson: JSON.stringify({ outputPath }) });
       this.events.emit(projectId, 'job.completed', { jobId, kind: 'export', outputPath });
     } catch (error) {

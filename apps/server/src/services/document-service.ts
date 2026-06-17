@@ -6,6 +6,7 @@ import {
   createEmptyDocument,
   createProjectInputSchema,
   documentSchema,
+  updateProjectInputSchema,
   type AxcutAsset,
   type AxcutDocument,
   type AxcutOperation,
@@ -16,7 +17,7 @@ import {
 import { applyDocumentOperation, replaceSuggestions } from '../lib/document-operations.js';
 import { appendRevision, refreshProjectUpdatedAt } from '../lib/document-history.js';
 import { createId } from '../lib/ids.js';
-import { buildTimelineFromIntervals, normalizeIntervals } from '../lib/timeline.js';
+import { buildTimelineFromIntervals, normalizeIntervals, retimeClips } from '../lib/timeline.js';
 import { projectArtifactsRoot, projectDocumentPath, projectRoot } from '../lib/paths.js';
 import type { DatabaseService } from './database.js';
 
@@ -37,12 +38,19 @@ export class DocumentService {
     return document;
   }
 
+  updateProject(projectId: string, input: unknown): AxcutDocument {
+    const payload = updateProjectInputSchema.parse(input);
+    return this.mutateDocument(projectId, 'Project renamed', (current) => ({
+      ...current,
+      project: {
+        ...current.project,
+        title: payload.title,
+      },
+    }));
+  }
+
   getSnapshot(projectId: string, sessionId?: string): { document: AxcutDocument; messages: ReturnType<DatabaseService['listMessages']>; jobs: ReturnType<DatabaseService['listJobs']> } {
-    let document = this.readDocument(projectId);
-    const asset = document.assets.find((item) => item.id === document.project.primaryAssetId) ?? document.assets[0];
-    if (asset?.durationSec && document.timeline.clips.length === 0) {
-      document = this.ensureFullTimelineForAsset(projectId, asset.id, 'Initial full-length timeline from media metadata');
-    }
+    const document = this.readDocument(projectId);
     return {
       document,
       messages: this.db.listMessages(projectId, sessionId),
@@ -93,48 +101,21 @@ export class DocumentService {
     }));
   }
 
-  ensureFullTimelineForAsset(projectId: string, assetId: string, summary: string): AxcutDocument {
-    return this.mutateDocument(projectId, summary, (current) => {
-      if (current.timeline.clips.length > 0) {
-        return current;
-      }
-      const asset = current.assets.find((item) => item.id === assetId);
-      if (!asset?.durationSec) {
-        return current;
-      }
-      return {
-        ...current,
-        timeline: {
-          ...current.timeline,
-          clips: buildTimelineFromIntervals(assetId, [{ startSec: 0, endSec: asset.durationSec }], {
-            origin: 'system',
-            reason: summary,
-            transcript: current.transcript,
-          }),
-          gaps: [],
-        },
-        preview: {
-          ...current.preview,
-          revision: current.preview.revision + 1,
-        },
-      };
-    });
-  }
-
   updateTranscript(projectId: string, transcript: AxcutTranscript, summary: string): AxcutDocument {
     return this.mutateDocument(projectId, summary, (current) => {
-      const asset = current.assets.find((item) => item.id === transcript.assetId);
-      const fullIntervals = asset?.durationSec ? [{ startSec: 0, endSec: asset.durationSec }] : [];
+      const normalizedTranscript = normalizeTranscriptForAsset(transcript);
+      const transcripts = [
+        ...current.transcripts.filter((item) => item.assetId !== normalizedTranscript.assetId),
+        normalizedTranscript,
+      ].sort((left, right) => assetOrder(current, left.assetId) - assetOrder(current, right.assetId));
+      const mergedTranscript = mergeTranscripts(transcripts, current.project.primaryAssetId ?? current.assets[0]?.id);
       return {
         ...current,
-        transcript,
+        transcript: mergedTranscript,
+        transcripts,
         timeline: {
           ...current.timeline,
-          clips: buildTimelineFromIntervals(transcript.assetId, fullIntervals, {
-            origin: 'system',
-            reason: 'Initial full-length timeline from transcript import',
-            transcript,
-          }),
+          clips: retimeClips(current.timeline.clips, transcripts),
           gaps: [],
         },
       };
@@ -172,7 +153,7 @@ export class DocumentService {
           clips: buildTimelineFromIntervals(assetId, normalized, {
             origin: author,
             reason: summary,
-            transcript: current.transcript,
+            transcript: current.transcripts.find((transcript) => transcript.assetId === assetId) ?? null,
           }),
           gaps: [],
         },
@@ -250,4 +231,49 @@ export class DocumentService {
       void summary;
     }
   }
+}
+
+function scopedId(assetId: string, id: string): string {
+  return id.startsWith(`${assetId}:`) ? id : `${assetId}:${id}`;
+}
+
+function normalizeTranscriptForAsset(transcript: AxcutTranscript): AxcutTranscript {
+  const segmentIds = new Map(transcript.segments.map((segment) => [segment.id, scopedId(transcript.assetId, segment.id)]));
+  const wordIds = new Map(transcript.words.map((word) => [word.id, scopedId(transcript.assetId, word.id)]));
+  return {
+    ...transcript,
+    segments: transcript.segments.map((segment) => ({
+      ...segment,
+      id: scopedId(transcript.assetId, segment.id),
+      assetId: transcript.assetId,
+      wordIds: segment.wordIds.map((wordId) => wordIds.get(wordId) ?? scopedId(transcript.assetId, wordId)),
+    })),
+    words: transcript.words.map((word) => ({
+      ...word,
+      id: scopedId(transcript.assetId, word.id),
+      assetId: transcript.assetId,
+      segmentId: segmentIds.get(word.segmentId) ?? scopedId(transcript.assetId, word.segmentId),
+    })),
+  };
+}
+
+function mergeTranscripts(transcripts: AxcutTranscript[], primaryAssetId?: string): AxcutTranscript | null {
+  if (transcripts.length === 0) {
+    return null;
+  }
+  const primary = transcripts.find((item) => item.assetId === primaryAssetId) ?? transcripts[0];
+  const languages = [...new Set(transcripts.map((item) => item.language).filter(Boolean))];
+  return {
+    assetId: primary.assetId,
+    language: languages.length === 1 ? languages[0] : 'multi',
+    sourceDslPath: primary.sourceDslPath,
+    sourceJsonPath: primary.sourceJsonPath,
+    segments: transcripts.flatMap((item) => item.segments),
+    words: transcripts.flatMap((item) => item.words),
+  };
+}
+
+function assetOrder(document: AxcutDocument, assetId: string): number {
+  const index = document.assets.findIndex((asset) => asset.id === assetId);
+  return index < 0 ? Number.MAX_SAFE_INTEGER : index;
 }

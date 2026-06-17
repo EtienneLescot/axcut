@@ -26,6 +26,16 @@ function createDocument(): AxcutDocument {
         { id: 'w3', segmentId: 's1', startSec: 1.1, endSec: 1.5, text: 'continue' },
       ],
     },
+    transcripts: [{
+      assetId: 'asset_main',
+      language: 'en',
+      segments: [],
+      words: [
+        { id: 'w1', segmentId: 's1', startSec: 0.2, endSec: 0.5, text: 'okay' },
+        { id: 'w2', segmentId: 's1', startSec: 0.55, endSec: 0.8, text: 'so' },
+        { id: 'w3', segmentId: 's1', startSec: 1.1, endSec: 1.5, text: 'continue' },
+      ],
+    }],
     timeline: {
       clips: [{
         id: 'clip_1',
@@ -38,6 +48,7 @@ function createDocument(): AxcutDocument {
         origin: 'system',
         reason: '',
       }],
+      skipRanges: [],
       gaps: [],
       muteRanges: [],
       speedRanges: [],
