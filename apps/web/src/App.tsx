@@ -41,7 +41,8 @@ import { TimelinePane } from './components/TimelinePane.js';
 import { VirtualPreview } from './components/VirtualPreview.js';
 import { emptyLiveRunState, reduceLiveRunState, type LiveOperation, type LiveRunState, type ProjectStreamEvent } from './lib/live-run.js';
 import { applyOptimisticTimelineOperation } from './lib/optimistic-timeline.js';
-import { formatSeconds, locateVirtualPosition } from './lib/virtual-preview.js';
+import { startGlobalPointerDrag } from './lib/pointer-drag.js';
+import { formatSeconds, locateVirtualPosition, totalVirtualDuration } from './lib/virtual-preview.js';
 
 type ProjectSummary = {
   id: string;
@@ -258,6 +259,46 @@ function sourceToVirtualTime(clips: AxcutClip[], sourceTimeSec: number, assetId?
     cursor += clip.sourceEndSec - clip.sourceStartSec;
   }
   return cursor;
+}
+
+function virtualToTimelineTime(sourceClips: AxcutClip[], playbackClips: AxcutClip[], virtualTimeSec: number): number {
+  const position = locateVirtualPosition(playbackClips, virtualTimeSec);
+  if (!position) {
+    return 0;
+  }
+  const sourceClipId = structuralClipId(position.clip.id);
+  const sourceClip = sourceClips.find((clip) => (
+    clip.id === sourceClipId
+    || (
+      structuralClipId(clip.id) === sourceClipId
+      && clip.assetId === position.clip.assetId
+      && position.sourceTimeSec >= clip.sourceStartSec
+      && position.sourceTimeSec <= clip.sourceEndSec
+    )
+  ));
+  if (!sourceClip) {
+    return position.virtualTimeSec;
+  }
+  return sourceClip.timelineStartSec + clamp(
+    position.sourceTimeSec - sourceClip.sourceStartSec,
+    0,
+    sourceClip.sourceEndSec - sourceClip.sourceStartSec,
+  );
+}
+
+function timelineToVirtualTime(sourceClips: AxcutClip[], playbackClips: AxcutClip[], timelineTimeSec: number): number {
+  const clip = [...sourceClips]
+    .sort((a, b) => a.timelineStartSec - b.timelineStartSec)
+    .find((candidate) => timelineTimeSec >= candidate.timelineStartSec && timelineTimeSec <= candidate.timelineEndSec);
+  if (!clip) {
+    return timelineTimeSec <= 0 ? 0 : totalVirtualDuration(playbackClips);
+  }
+  const sourceTimeSec = clip.sourceStartSec + clamp(
+    timelineTimeSec - clip.timelineStartSec,
+    0,
+    clip.timelineEndSec - clip.timelineStartSec,
+  );
+  return sourceToVirtualTime(playbackClips, sourceTimeSec, clip.assetId, clip.id);
 }
 
 function structuralClipId(clipId: string): string {
@@ -738,16 +779,16 @@ export function App() {
       setChatPanelWidth(nextWidth);
     };
     const onMove = (moveEvent: PointerEvent) => update(moveEvent.clientX);
-    const onUp = () => {
+    const onEnd = () => {
       window.localStorage.setItem(CHAT_WIDTH_STORAGE_KEY, String(nextWidth));
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
       globalThis.document.body.classList.remove('resizing-chat');
     };
     globalThis.document.body.classList.add('resizing-chat');
     update(event.clientX);
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp, { once: true });
+    startGlobalPointerDrag(event, {
+      onMove,
+      onEnd,
+    });
   }, [chatPanelOpen, chatPanelWidth, transcriptPanelOpen, transcriptPanelWidth]);
 
   const startTimelineResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
@@ -767,16 +808,16 @@ export function App() {
       setTimelinePanelHeight(nextHeight);
     };
     const onMove = (moveEvent: PointerEvent) => update(moveEvent.clientY);
-    const onUp = () => {
+    const onEnd = () => {
       window.localStorage.setItem(TIMELINE_HEIGHT_STORAGE_KEY, String(nextHeight));
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
       globalThis.document.body.classList.remove('resizing-timeline');
     };
     globalThis.document.body.classList.add('resizing-timeline');
     update(event.clientY);
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp, { once: true });
+    startGlobalPointerDrag(event, {
+      onMove,
+      onEnd,
+    });
   }, [timelinePanelHeight, timelinePanelOpen]);
 
   const startTranscriptResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
@@ -797,16 +838,16 @@ export function App() {
       setTranscriptPanelWidth(nextWidth);
     };
     const onMove = (moveEvent: PointerEvent) => update(moveEvent.clientX);
-    const onUp = () => {
+    const onEnd = () => {
       window.localStorage.setItem(TRANSCRIPT_WIDTH_STORAGE_KEY, String(nextWidth));
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
       globalThis.document.body.classList.remove('resizing-transcript');
     };
     globalThis.document.body.classList.add('resizing-transcript');
     update(event.clientX);
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp, { once: true });
+    startGlobalPointerDrag(event, {
+      onMove,
+      onEnd,
+    });
   }, [chatPanelOpen, chatPanelWidth, transcriptPanelOpen, transcriptPanelWidth]);
 
   const sessionQuery = useQuery({
@@ -1527,21 +1568,16 @@ export function App() {
     if (!displayDocument || playbackClips.length === 0) {
       return 0;
     }
-    return virtualTimeSec;
-  }, [displayDocument, playbackClips.length, virtualTimeSec]);
+    return virtualToTimelineTime(displayDocument.timeline.clips, playbackClips, virtualTimeSec);
+  }, [displayDocument, playbackClips, virtualTimeSec]);
   const seekTimelineTime = useCallback((timelineTimeSec: number) => {
     if (!displayDocument) {
       setSeekTarget({ timeSec: 0, requestId: Date.now() });
       return;
     }
-    const position = locateVirtualPosition(playbackClips, timelineTimeSec);
-    if (!position) {
-      setVirtualTimeSec(0);
-      setSeekTarget({ timeSec: 0, requestId: Date.now() });
-      return;
-    }
-    setVirtualTimeSec(position.virtualTimeSec);
-    setSeekTarget({ timeSec: position.virtualTimeSec, requestId: Date.now() });
+    const nextVirtualTimeSec = timelineToVirtualTime(displayDocument.timeline.clips, playbackClips, timelineTimeSec);
+    setVirtualTimeSec(nextVirtualTimeSec);
+    setSeekTarget({ timeSec: nextVirtualTimeSec, requestId: Date.now() });
   }, [displayDocument, playbackClips]);
 
   return (
@@ -1936,7 +1972,6 @@ export function App() {
 
       <TimelinePane
         clips={displayDocument?.timeline.clips ?? []}
-        playbackClips={playbackClips}
         assets={displayDocument?.assets ?? []}
         videoSources={videoSources}
         previewRevision={displayDocument?.preview.revision ?? 0}

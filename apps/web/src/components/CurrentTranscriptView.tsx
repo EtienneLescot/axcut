@@ -42,6 +42,7 @@ type TranscriptClipProjection = {
 };
 
 const SILENCE_TOKEN_THRESHOLD_SEC = 0.5;
+const CUE_SCROLL_MARGIN_PX = 56;
 
 export function CurrentTranscriptView({ document, busy, cuePosition, onSeekSourceTime, onAddSkipRange, onRemoveSkipRange }: CurrentTranscriptViewProps) {
   const editorRef = useRef<HTMLDivElement | null>(null);
@@ -60,6 +61,10 @@ export function CurrentTranscriptView({ document, busy, cuePosition, onSeekSourc
     () => findCueWordId(words, cuePosition),
     [cuePosition, words],
   );
+
+  useLayoutEffect(() => {
+    scrollCueWordIntoView(editorRef.current, cueWordId);
+  }, [cueWordId]);
 
   useLayoutEffect(() => {
     const wordId = pendingCaretWordIdRef.current;
@@ -305,6 +310,28 @@ function TranscriptWord({
       {' '}
     </span>
   );
+}
+
+function scrollCueWordIntoView(editor: HTMLElement | null, cueWordId: string | null) {
+  if (!editor || !cueWordId) {
+    return;
+  }
+  const wordElement = editor.querySelector<HTMLElement>(`[data-word-id="${CSS.escape(cueWordId)}"]`);
+  if (!wordElement) {
+    return;
+  }
+  const editorRect = editor.getBoundingClientRect();
+  const wordRect = wordElement.getBoundingClientRect();
+  const visibleTop = editorRect.top + CUE_SCROLL_MARGIN_PX;
+  const visibleBottom = editorRect.bottom - CUE_SCROLL_MARGIN_PX;
+  if (wordRect.top >= visibleTop && wordRect.bottom <= visibleBottom) {
+    return;
+  }
+  if (wordRect.top < visibleTop) {
+    editor.scrollTop -= visibleTop - wordRect.top;
+    return;
+  }
+  editor.scrollTop += wordRect.bottom - visibleBottom;
 }
 
 function buildClipTranscriptProjections(document: AxcutDocument | null): TranscriptClipProjection[] {
