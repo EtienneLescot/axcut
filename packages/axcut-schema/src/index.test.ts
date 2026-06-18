@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { applySkipRangesToClips, createEmptyDocument, ensureDocument } from './index.js';
+import { applySkipRangesToClips, createEmptyDocument, ensureDocument, normalizeSkipRanges } from './index.js';
 
 test('createEmptyDocument produces a valid .axcut document', () => {
   const document = createEmptyDocument({
@@ -49,5 +49,27 @@ test('applySkipRangesToClips materializes non-destructive skips for playback', (
   })), [
     { sourceStartSec: 0, sourceEndSec: 3, timelineStartSec: 0, timelineEndSec: 3 },
     { sourceStartSec: 5, sourceEndSec: 10, timelineStartSec: 3, timelineEndSec: 8 },
+  ]);
+});
+
+test('normalizeSkipRanges merges touching and overlapping skips per source asset', () => {
+  const normalized = normalizeSkipRanges([
+    { id: 'skip_2', assetId: 'asset_1', startSec: 2, endSec: 3, reason: 'silence', origin: 'agent' },
+    { id: 'skip_1', assetId: 'asset_1', startSec: 1, endSec: 2, reason: 'blank', origin: 'user' },
+    { id: 'skip_3', assetId: 'asset_2', startSec: 2, endSec: 3, reason: 'other asset', origin: 'system' },
+    { id: 'skip_4', assetId: 'asset_1', startSec: 5, endSec: 6, reason: 'separate', origin: 'system' },
+  ]);
+
+  assert.deepEqual(normalized.map((skip) => ({
+    id: skip.id,
+    assetId: skip.assetId,
+    startSec: skip.startSec,
+    endSec: skip.endSec,
+    reason: skip.reason,
+    origin: skip.origin,
+  })), [
+    { id: 'skip_1', assetId: 'asset_1', startSec: 1, endSec: 3, reason: 'blank; silence', origin: 'user' },
+    { id: 'skip_4', assetId: 'asset_1', startSec: 5, endSec: 6, reason: 'separate', origin: 'system' },
+    { id: 'skip_3', assetId: 'asset_2', startSec: 2, endSec: 3, reason: 'other asset', origin: 'system' },
   ]);
 });

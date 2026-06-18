@@ -1,7 +1,7 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from 'react';
-import { Pencil, Scissors, Trash2, X } from 'lucide-react';
-import type { AxcutAsset, AxcutClip, AxcutTimeline } from '@axcut/schema';
+import { ChevronLeft, ChevronRight, Pencil, Scissors, Trash2, X } from 'lucide-react';
+import { normalizeSkipRanges, type AxcutAsset, type AxcutClip, type AxcutTimeline } from '@axcut/schema';
 
 import { VirtualPreview } from './VirtualPreview.js';
 import { formatSeconds, locateVirtualPosition, totalVirtualDuration } from '../lib/virtual-preview.js';
@@ -89,7 +89,17 @@ type ClipReorderState = {
   startClientY: number;
   currentClientX: number;
   currentClientY: number;
+  startLeftPx: number;
+  widthPx: number;
   insertIndex: number;
+  dragging: boolean;
+};
+
+type ProjectedClipLayout = {
+  timelineStartSec: number;
+  timelineEndSec: number;
+  leftPx: number;
+  widthPx: number;
   dragging: boolean;
 };
 
@@ -99,6 +109,20 @@ const MAX_PX_PER_SEC = 280;
 const MIN_SEGMENT_WIDTH_PX = 1;
 const RULER_HEIGHT_PX = 28;
 const CLIP_REORDER_THRESHOLD_PX = 6;
+const SKIP_CONTROL_RESIZE_WIDTH_PX = 25;
+const SKIP_CONTROL_REMOVE_WIDTH_PX = 31;
+const SKIP_CONTROL_GAP_PX = 3;
+const SKIP_CONTROLS_VIEWPORT_MARGIN_PX = 4;
+const SKIP_CONTROLS_HIDE_DELAY_MS = 220;
+
+function skipControlsHalfWidthPx(skip: Pick<TimelineSkipItem, 'canResizeStart' | 'canResizeEnd'>): number {
+  const controlCount = 1 + Number(skip.canResizeStart) + Number(skip.canResizeEnd);
+  const widthPx = SKIP_CONTROL_REMOVE_WIDTH_PX
+    + (skip.canResizeStart ? SKIP_CONTROL_RESIZE_WIDTH_PX : 0)
+    + (skip.canResizeEnd ? SKIP_CONTROL_RESIZE_WIDTH_PX : 0)
+    + Math.max(0, controlCount - 1) * SKIP_CONTROL_GAP_PX;
+  return widthPx / 2;
+}
 
 export function TimelinePane({
   clips,
@@ -125,7 +149,10 @@ export function TimelinePane({
   const navigatorDragRef = useRef<NavigatorDragState | null>(null);
   const clipReorderRef = useRef<ClipReorderState | null>(null);
   const resizeSequenceRef = useRef(0);
+  const skipControlsHideTimerRef = useRef<ReturnType<typeof globalThis.setTimeout> | null>(null);
   const [viewportWidthPx, setViewportWidthPx] = useState(0);
+  const [viewportLeftPx, setViewportLeftPx] = useState(0);
+  const [windowWidthPx, setWindowWidthPx] = useState(0);
   const [scrollLeftPx, setScrollLeftPx] = useState(0);
   const [zoom, setZoom] = useState(1);
   const [resizeState, setResizeState] = useState<ResizeState | null>(null);
@@ -138,6 +165,7 @@ export function TimelinePane({
   const [clipEditId, setClipEditId] = useState<string | null>(null);
   const [copiedClipId, setCopiedClipId] = useState<string | null>(null);
   const [clipReorderState, setClipReorderState] = useState<ClipReorderState | null>(null);
+  const [visibleSkipControlsId, setVisibleSkipControlsId] = useState<string | null>(null);
 
   const virtualDurationSec = totalVirtualDuration(clips);
   const activePosition = locateVirtualPosition(clips, currentTimeSec);
@@ -160,19 +188,15 @@ export function TimelinePane({
     width: `${Math.max(0, ((visibleEndSec - visibleStartSec) / Math.max(sourceDuration, MIN_SOURCE_DURATION_SEC)) * 100)}%`,
   }) as CSSProperties, [sourceDuration, visibleEndSec, visibleStartSec]);
 
+  const normalizedSkipRanges = useMemo(() => normalizeSkipRanges(skipRanges), [skipRanges]);
   const skipItems = useMemo(
-    () => buildTimelineSkipItems(clips, skipRanges, assetLabelById, sourceDuration, resizeState),
-    [assetLabelById, clips, resizeState, skipRanges, sourceDuration],
-  );
-  const timelineItems = useMemo(
-    () => buildTimelineItems(clips, skipRanges, assetLabelById, sourceDuration, resizeState),
-    [assetLabelById, clips, resizeState, skipRanges, sourceDuration],
+    () => buildTimelineSkipItems(clips, normalizedSkipRanges, assetLabelById, sourceDuration, resizeState),
+    [assetLabelById, clips, normalizedSkipRanges, resizeState, sourceDuration],
   );
   const rulerTicks = useMemo(() => buildRulerTicks(sourceDuration, pxPerSec), [pxPerSec, sourceDuration]);
   const playheadSourceSec = activePosition?.virtualTimeSec ?? null;
   const assetCount = useMemo(() => new Set(clips.map((clip) => clip.assetId)).size, [clips]);
   const orderedClips = useMemo(() => [...clips].sort((a, b) => a.timelineStartSec - b.timelineStartSec), [clips]);
-  const clipById = useMemo(() => new Map(clips.map((clip) => [clip.id, clip])), [clips]);
   const clipEditClip = useMemo(
     () => clips.find((clip) => clip.id === clipEditId) ?? null,
     [clipEditId, clips],
@@ -189,16 +213,48 @@ export function TimelinePane({
     if (!scrollElement) {
       return;
     }
-    const updateWidth = () => setViewportWidthPx(scrollElement.clientWidth);
-    updateWidth();
-    const observer = new ResizeObserver(updateWidth);
+    const updateMetrics = () => {
+      setViewportWidthPx(scrollElement.clientWidth);
+      setViewportLeftPx(scrollElement.getBoundingClientRect().left);
+      setWindowWidthPx(globalThis.window.innerWidth);
+    };
+    updateMetrics();
+    const observer = new ResizeObserver(updateMetrics);
     observer.observe(scrollElement);
-    return () => observer.disconnect();
+    globalThis.window.addEventListener('resize', updateMetrics);
+    return () => {
+      observer.disconnect();
+      globalThis.window.removeEventListener('resize', updateMetrics);
+    };
   }, []);
 
   useEffect(() => {
     resizeRef.current = resizeState;
   }, [resizeState]);
+
+  useEffect(() => () => {
+    if (skipControlsHideTimerRef.current) {
+      globalThis.clearTimeout(skipControlsHideTimerRef.current);
+    }
+  }, []);
+
+  const showSkipControls = useCallback((skipItemId: string) => {
+    if (skipControlsHideTimerRef.current) {
+      globalThis.clearTimeout(skipControlsHideTimerRef.current);
+      skipControlsHideTimerRef.current = null;
+    }
+    setVisibleSkipControlsId(skipItemId);
+  }, []);
+
+  const scheduleHideSkipControls = useCallback((skipItemId: string) => {
+    if (skipControlsHideTimerRef.current) {
+      globalThis.clearTimeout(skipControlsHideTimerRef.current);
+    }
+    skipControlsHideTimerRef.current = globalThis.setTimeout(() => {
+      setVisibleSkipControlsId((current) => (current === skipItemId ? null : current));
+      skipControlsHideTimerRef.current = null;
+    }, SKIP_CONTROLS_HIDE_DELAY_MS);
+  }, []);
 
   const sourceSecFromClientX = useCallback((clientX: number) => {
     const scrollElement = scrollRef.current;
@@ -209,8 +265,8 @@ export function TimelinePane({
     return clamp((scrollElement.scrollLeft + clientX - rect.left) / Math.max(pxPerSec, 0.001), 0, sourceDuration);
   }, [pxPerSec, sourceDuration]);
 
-  const insertionIndexFromClientX = useCallback((clientX: number, clipId: string) => {
-    const timelineSec = sourceSecFromClientX(clientX) ?? 0;
+  const insertionIndexFromClipCenter = useCallback((clipId: string, clipCenterPx: number) => {
+    const timelineSec = clamp(clipCenterPx / Math.max(pxPerSec, 0.001), 0, sourceDuration);
     const remainingClips = orderedClips.filter((clip) => clip.id !== clipId);
     for (let index = 0; index < remainingClips.length; index += 1) {
       const clip = remainingClips[index];
@@ -220,7 +276,7 @@ export function TimelinePane({
       }
     }
     return remainingClips.length;
-  }, [orderedClips, sourceSecFromClientX]);
+  }, [orderedClips, pxPerSec, sourceDuration]);
 
   const isReorderNoop = useCallback((clipId: string, insertIndex: number) => {
     const currentIds = orderedClips.map((clip) => clip.id);
@@ -249,6 +305,55 @@ export function TimelinePane({
         : remainingClips[clipReorderState.insertIndex].timelineStartSec;
     return boundarySec * pxPerSec;
   }, [clipReorderState, orderedClips, pxPerSec, virtualDurationSec]);
+
+  const projectedClipLayoutById = useMemo(() => {
+    const layout = new Map<string, ProjectedClipLayout>();
+    if (!clipReorderState?.dragging) {
+      for (const clip of clips) {
+        layout.set(clip.id, {
+          timelineStartSec: clip.timelineStartSec,
+          timelineEndSec: clip.timelineEndSec,
+          leftPx: clip.timelineStartSec * pxPerSec,
+          widthPx: Math.max(MIN_SEGMENT_WIDTH_PX, (clip.timelineEndSec - clip.timelineStartSec) * pxPerSec),
+          dragging: false,
+        });
+      }
+      return layout;
+    }
+
+    const movingClip = orderedClips.find((clip) => clip.id === clipReorderState.clipId);
+    if (!movingClip) {
+      return layout;
+    }
+    const remainingClips = orderedClips.filter((clip) => clip.id !== clipReorderState.clipId);
+    const projectedOrder = [
+      ...remainingClips.slice(0, clipReorderState.insertIndex),
+      movingClip,
+      ...remainingClips.slice(clipReorderState.insertIndex),
+    ];
+
+    let cursorSec = 0;
+    for (const clip of projectedOrder) {
+      const durationSec = Math.max(0, clip.sourceEndSec - clip.sourceStartSec);
+      const isDragging = clip.id === clipReorderState.clipId;
+      const widthPx = Math.max(MIN_SEGMENT_WIDTH_PX, durationSec * pxPerSec);
+      const dragLeftPx = clamp(
+        clipReorderState.startLeftPx + clipReorderState.currentClientX - clipReorderState.startClientX,
+        0,
+        Math.max(0, contentWidthPx - widthPx),
+      );
+      layout.set(clip.id, {
+        timelineStartSec: cursorSec,
+        timelineEndSec: cursorSec + durationSec,
+        leftPx: isDragging ? dragLeftPx : cursorSec * pxPerSec,
+        widthPx,
+        dragging: isDragging,
+      });
+      cursorSec += durationSec;
+    }
+
+    return layout;
+  }, [clipReorderState, clips, contentWidthPx, orderedClips, pxPerSec]);
 
   const seekSource = useCallback((virtualSec: number) => {
     const position = locateVirtualPosition(clips, virtualSec);
@@ -459,7 +564,7 @@ export function TimelinePane({
     globalThis.window.addEventListener('pointercancel', end, { once: true });
   }, [assetDurationById, busy, onPreviewSource, onUpdateSkipRange, pxPerSec, sourceDuration]);
 
-  const startClipReorder = useCallback((item: TimelineItem, event: ReactPointerEvent<HTMLElement>) => {
+  const startClipReorder = useCallback((item: { clipId: string }, event: ReactPointerEvent<HTMLElement>) => {
     if (pendingCutPlacement) {
       return;
     }
@@ -468,6 +573,12 @@ export function TimelinePane({
     }
     event.preventDefault();
     event.stopPropagation();
+    const movingClip = orderedClips.find((clip) => clip.id === item.clipId);
+    if (!movingClip) {
+      return;
+    }
+    const movingClipLeftPx = movingClip.timelineStartSec * pxPerSec;
+    const movingClipWidthPx = Math.max(MIN_SEGMENT_WIDTH_PX, (movingClip.timelineEndSec - movingClip.timelineStartSec) * pxPerSec);
     setSelectedClipId(item.clipId);
     const initialState: ClipReorderState = {
       clipId: item.clipId,
@@ -475,7 +586,9 @@ export function TimelinePane({
       startClientY: event.clientY,
       currentClientX: event.clientX,
       currentClientY: event.clientY,
-      insertIndex: insertionIndexFromClientX(event.clientX, item.clipId),
+      startLeftPx: movingClipLeftPx,
+      widthPx: movingClipWidthPx,
+      insertIndex: insertionIndexFromClipCenter(item.clipId, movingClipLeftPx + (movingClipWidthPx / 2)),
       dragging: false,
     };
     clipReorderRef.current = initialState;
@@ -489,13 +602,17 @@ export function TimelinePane({
       const deltaX = moveEvent.clientX - current.startClientX;
       const deltaY = moveEvent.clientY - current.startClientY;
       const dragging = current.dragging || Math.hypot(deltaX, deltaY) >= CLIP_REORDER_THRESHOLD_PX;
+      const clipCenterPx = current.startLeftPx + deltaX + (current.widthPx / 2);
       const nextState: ClipReorderState = {
         ...current,
         currentClientX: moveEvent.clientX,
         currentClientY: moveEvent.clientY,
-        insertIndex: insertionIndexFromClientX(moveEvent.clientX, current.clipId),
+        insertIndex: insertionIndexFromClipCenter(current.clipId, clipCenterPx),
         dragging,
       };
+      if (dragging) {
+        globalThis.document.body.classList.add('timeline-reordering');
+      }
       clipReorderRef.current = nextState;
       setClipReorderState(nextState);
     };
@@ -507,6 +624,7 @@ export function TimelinePane({
       }
       clipReorderRef.current = null;
       setClipReorderState(null);
+      globalThis.document.body.classList.remove('timeline-reordering');
       globalThis.window.removeEventListener('pointermove', move);
       globalThis.window.removeEventListener('pointerup', end);
       globalThis.window.removeEventListener('pointercancel', end);
@@ -515,7 +633,7 @@ export function TimelinePane({
     globalThis.window.addEventListener('pointermove', move);
     globalThis.window.addEventListener('pointerup', end, { once: true });
     globalThis.window.addEventListener('pointercancel', end, { once: true });
-  }, [busy, insertionIndexFromClientX, isReorderNoop, onMoveClip, pendingCutPlacement]);
+  }, [busy, insertionIndexFromClipCenter, isReorderNoop, onMoveClip, orderedClips, pendingCutPlacement, pxPerSec]);
 
   const startScrub = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     const target = event.target instanceof Element ? event.target : null;
@@ -810,149 +928,179 @@ export function TimelinePane({
                 const editing = clipEditId === clip.id;
                 const selected = selectedClipId === clip.id;
                 const reordering = clipReorderState?.clipId === clip.id && clipReorderState.dragging;
-                return (
-                  <Fragment key={`${clip.id}:frame`}>
-                    <button
-                      className={editing ? 'timeline-clip-edit-button active' : 'timeline-clip-edit-button'}
-                      type="button"
-                      style={{
-                        left: `${clip.timelineStartSec * pxPerSec}px`,
-                      }}
-                      onPointerDown={(event) => {
-                        event.stopPropagation();
-                      }}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setSelectedClipId(clip.id);
-                        setClipEditId(clip.id);
-                      }}
-                      disabled={busy}
-                      title="Edit clip source range"
-                      aria-pressed={editing}
-                      aria-label="Edit clip source range"
-                    >
-                      <Pencil size={12} strokeWidth={1.9} aria-hidden="true" />
-                    </button>
-                    <div
-                      className={[
-                        'timeline-clip-frame',
-                        selected ? 'selected' : '',
-                        editing ? 'editing' : '',
-                        reordering ? 'reordering' : '',
-                      ].filter(Boolean).join(' ')}
-                      style={{
-                        left: `${clip.timelineStartSec * pxPerSec}px`,
-                        width: `${Math.max(MIN_SEGMENT_WIDTH_PX, (clip.timelineEndSec - clip.timelineStartSec) * pxPerSec)}px`,
-                      }}
-                    />
-                  </Fragment>
-                );
-              })}
-              {timelineItems.map((item) => {
-                const style = timelineItemStyle(item, pxPerSec);
-                if (item.kind === 'skip') {
-                  const active = resizeState?.target === 'skip' && resizeState.itemId === item.skipId;
-                  const compact = (item.endSec - item.startSec) * pxPerSec < 18;
-                  const itemClip = clipById.get(item.clipId);
-                  const edgeStart = itemClip ? Math.abs(item.startSec - itemClip.timelineStartSec) < 0.001 : false;
-                  const edgeEnd = itemClip ? Math.abs(item.endSec - itemClip.timelineEndSec) < 0.001 : false;
-                  return (
-                    <div
-                      key={item.id}
-                      className={[
-                        'timeline-segment',
-                        'timeline-skip',
-                        active ? 'active' : '',
-                        compact ? 'compact' : '',
-                        edgeStart ? 'clip-edge-start' : '',
-                        edgeEnd ? 'clip-edge-end' : '',
-                      ].filter(Boolean).join(' ')}
-                      style={style}
-                      title={`Skip ${item.label ?? 'source'} ${formatSeconds(item.sourceStartSec ?? item.startSec)}-${formatSeconds(item.sourceEndSec ?? item.endSec)}${item.reason ? ` · ${item.reason}` : ''}`}
-                      onPointerDown={(event) => {
-                        startClipReorder(item, event);
-                      }}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        setSelectedClipId(item.clipId);
-                      }}
-                    >
-                      {item.canResizeStart ? (
-                        <button
-                          className="timeline-skip-handle start"
-                          type="button"
-                          onPointerDown={(event) => startResizeSkip(item, 'start', event)}
-                          disabled={busy || !onUpdateSkipRange}
-                          aria-label={`Adjust skip start at ${formatSeconds(item.sourceStartSec ?? item.startSec)}`}
-                          title="Adjust skip start"
-                        />
-                      ) : null}
-                      <div className="timeline-segment-label">
-                        <span>Skip</span>
-                        <small>{formatSeconds(item.startSec)}-{formatSeconds(item.endSec)}</small>
-                      </div>
-                      <button
-                        className="timeline-skip-delete"
-                        type="button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          onRemoveSkipRange?.(item.skipId);
-                        }}
-                        disabled={busy || !onRemoveSkipRange}
-                        title="Remove skip"
-                        aria-label={`Remove skip ${formatSeconds(item.startSec)}-${formatSeconds(item.endSec)}`}
-                      >
-                        <Trash2 size={12} strokeWidth={1.9} aria-hidden="true" />
-                      </button>
-                      {item.canResizeEnd ? (
-                        <button
-                          className="timeline-skip-handle end"
-                          type="button"
-                          onPointerDown={(event) => startResizeSkip(item, 'end', event)}
-                          disabled={busy || !onUpdateSkipRange}
-                          aria-label={`Adjust skip end at ${formatSeconds(item.sourceEndSec ?? item.endSec)}`}
-                          title="Adjust skip end"
-                        />
-                      ) : null}
-                    </div>
-                  );
-                }
-                const active = playheadSourceSec !== null && playheadSourceSec >= item.startSec && playheadSourceSec <= item.endSec;
-                const selected = selectedClipId === item.clipId;
-                const reordering = clipReorderState?.clipId === item.clipId && clipReorderState.dragging;
-                const itemClip = clipById.get(item.clipId);
-                const edgeStart = itemClip ? Math.abs(item.startSec - itemClip.timelineStartSec) < 0.001 : false;
-                const edgeEnd = itemClip ? Math.abs(item.endSec - itemClip.timelineEndSec) < 0.001 : false;
+                const projectedLayout = projectedClipLayoutById.get(clip.id);
+                const displayTimelineStartSec = projectedLayout?.timelineStartSec ?? clip.timelineStartSec;
+                const displayTimelineEndSec = projectedLayout?.timelineEndSec ?? clip.timelineEndSec;
+                const clipWidthPx = projectedLayout?.widthPx ?? Math.max(MIN_SEGMENT_WIDTH_PX, (clip.timelineEndSec - clip.timelineStartSec) * pxPerSec);
+                const clipLeftPx = projectedLayout?.leftPx ?? clip.timelineStartSec * pxPerSec;
+                const clipRightPx = clipLeftPx + clipWidthPx;
+                const hasJoinedPrev = clips.some((candidate) => {
+                  if (candidate.id === clip.id) {
+                    return false;
+                  }
+                  const candidateLayout = projectedClipLayoutById.get(candidate.id);
+                  const candidateLeftPx = candidateLayout?.leftPx ?? candidate.timelineStartSec * pxPerSec;
+                  const candidateWidthPx = candidateLayout?.widthPx ?? Math.max(MIN_SEGMENT_WIDTH_PX, (candidate.timelineEndSec - candidate.timelineStartSec) * pxPerSec);
+                  return Math.abs((candidateLeftPx + candidateWidthPx) - clipLeftPx) <= 1.5;
+                });
+                const hasJoinedNext = clips.some((candidate) => {
+                  if (candidate.id === clip.id) {
+                    return false;
+                  }
+                  const candidateLayout = projectedClipLayoutById.get(candidate.id);
+                  const candidateLeftPx = candidateLayout?.leftPx ?? candidate.timelineStartSec * pxPerSec;
+                  return Math.abs(candidateLeftPx - clipRightPx) <= 1.5;
+                });
+                const clipSkips = skipItems.filter((skip) => skip.clipId === clip.id);
                 return (
                   <div
-                    key={item.id}
+                    key={`${clip.id}:frame`}
                     className={[
-                      'timeline-segment',
-                      'timeline-kept',
-                      active ? 'active' : '',
+                      'timeline-clip-frame',
                       selected ? 'selected' : '',
+                      editing ? 'editing' : '',
                       reordering ? 'reordering' : '',
-                      edgeStart ? 'clip-edge-start' : '',
-                      edgeEnd ? 'clip-edge-end' : '',
+                      projectedLayout?.dragging ? 'dragging' : '',
+                      hasJoinedPrev ? 'joined-prev' : '',
+                      hasJoinedNext ? 'joined-next' : '',
                     ].filter(Boolean).join(' ')}
-                    style={style}
-                    title={`${item.label ?? 'Clip'} · timeline ${formatSeconds(item.startSec)}-${formatSeconds(item.endSec)}`}
+                    style={{
+                      left: `${hasJoinedPrev ? clipLeftPx - 1 : clipLeftPx}px`,
+                      width: `${hasJoinedPrev ? clipWidthPx + 1 : clipWidthPx}px`,
+                    }}
+                    title={`${assetLabelById.get(clip.assetId) ?? clip.assetId} · timeline ${formatSeconds(displayTimelineStartSec)}-${formatSeconds(displayTimelineEndSec)}`}
                     onPointerDown={(event) => {
-                      startClipReorder(item, event);
+                      startClipReorder({ clipId: clip.id }, event);
                     }}
                     onClick={(event) => {
                       event.stopPropagation();
-                      setSelectedClipId(item.clipId);
+                      setSelectedClipId(clip.id);
                     }}
                   >
-                    <div className="timeline-segment-label">
-                      <span>{item.label ?? 'Clip'}</span>
-                      <small>
-                        {formatSeconds(item.startSec)}-{formatSeconds(item.endSec)}
-                        {item.sourceStartSec !== undefined && item.sourceEndSec !== undefined
-                          ? ` · source ${formatSeconds(item.sourceStartSec)}-${formatSeconds(item.sourceEndSec)}`
-                        : ''}
-                      </small>
+                    <div className="timeline-clip-surface">
+                      <div className="timeline-clip-skip-row" aria-label={`${clipSkips.length} skips in clip`}>
+                        {clipSkips.map((skip) => {
+                          const active = resizeState?.target === 'skip' && resizeState.itemId === skip.skipId;
+                          const controlsVisible = visibleSkipControlsId === skip.id;
+                          const compact = (skip.endSec - skip.startSec) * pxPerSec < 18;
+                          const skipLeftPx = (skip.startSec - clip.timelineStartSec) * pxPerSec;
+                          const skipActualWidthPx = Math.max(MIN_SEGMENT_WIDTH_PX, (skip.endSec - skip.startSec) * pxPerSec);
+                          const skipHitWidthPx = Math.max(3, skipActualWidthPx);
+                          const skipCenterPx = ((skip.startSec + skip.endSec) / 2) * pxPerSec;
+                          const controlsHalfWidthPx = skipControlsHalfWidthPx(skip);
+                          const skipScreenCenterPx = viewportLeftPx + skipCenterPx - scrollLeftPx;
+                          const visibleLeftPx = SKIP_CONTROLS_VIEWPORT_MARGIN_PX;
+                          const visibleRightPx = Math.max(visibleLeftPx, windowWidthPx - SKIP_CONTROLS_VIEWPORT_MARGIN_PX);
+                          const controlsShiftPx = windowWidthPx <= 0 ? 0 : skipScreenCenterPx - controlsHalfWidthPx < visibleLeftPx
+                            ? visibleLeftPx - (skipScreenCenterPx - controlsHalfWidthPx)
+                            : skipScreenCenterPx + controlsHalfWidthPx > visibleRightPx
+                              ? visibleRightPx - (skipScreenCenterPx + controlsHalfWidthPx)
+                              : 0;
+                          const clipEdgeStart = Math.abs(skip.startSec - clip.timelineStartSec) < 0.001;
+                          const clipEdgeEnd = Math.abs(skip.endSec - clip.timelineEndSec) < 0.001;
+                          return (
+                            <div
+                              key={skip.id}
+                              className={[
+                                'timeline-skip-strip',
+                                active ? 'active' : '',
+                                controlsVisible ? 'controls-visible' : '',
+                                compact ? 'compact' : '',
+                                clipEdgeStart ? 'clip-edge-start' : '',
+                                clipEdgeEnd ? 'clip-edge-end' : '',
+                              ].filter(Boolean).join(' ')}
+                              style={{
+                                left: `${skipLeftPx}px`,
+                                width: `${skipHitWidthPx}px`,
+                                '--skip-visual-width-px': `${skipActualWidthPx}px`,
+                                '--skip-controls-shift-px': `${controlsShiftPx}px`,
+                              } as CSSProperties}
+                              title={`Skip ${skip.label ?? 'source'} ${formatSeconds(skip.sourceStartSec ?? skip.startSec)}-${formatSeconds(skip.sourceEndSec ?? skip.endSec)}${skip.reason ? ` · ${skip.reason}` : ''}`}
+                              onPointerDown={(event) => {
+                                startClipReorder({ clipId: clip.id }, event);
+                              }}
+                              onPointerEnter={() => showSkipControls(skip.id)}
+                              onPointerLeave={() => scheduleHideSkipControls(skip.id)}
+                            >
+                              <div
+                                className="timeline-skip-hover-controls"
+                                aria-label="Skip controls"
+                                onPointerEnter={() => showSkipControls(skip.id)}
+                                onPointerLeave={() => scheduleHideSkipControls(skip.id)}
+                              >
+                                {skip.canResizeStart ? (
+                                  <button
+                                    className="timeline-skip-control timeline-skip-resize-start"
+                                    type="button"
+                                    onPointerDown={(event) => startResizeSkip(skip, 'start', event)}
+                                    disabled={busy || !onUpdateSkipRange}
+                                    aria-label={`Adjust skip start at ${formatSeconds(skip.sourceStartSec ?? skip.startSec)}`}
+                                    title="Adjust skip start"
+                                  >
+                                    <ChevronLeft size={15} strokeWidth={2.2} aria-hidden="true" />
+                                  </button>
+                                ) : null}
+                                <button
+                                  className="timeline-skip-control timeline-skip-remove"
+                                  type="button"
+                                  onPointerDown={(event) => {
+                                    event.stopPropagation();
+                                  }}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    onRemoveSkipRange?.(skip.skipId);
+                                  }}
+                                  disabled={busy || !onRemoveSkipRange}
+                                  title="Remove skip"
+                                  aria-label={`Remove skip ${formatSeconds(skip.startSec)}-${formatSeconds(skip.endSec)}`}
+                                >
+                                  <Trash2 size={15} strokeWidth={2.1} aria-hidden="true" />
+                                </button>
+                                {skip.canResizeEnd ? (
+                                  <button
+                                    className="timeline-skip-control timeline-skip-resize-end"
+                                    type="button"
+                                    onPointerDown={(event) => startResizeSkip(skip, 'end', event)}
+                                    disabled={busy || !onUpdateSkipRange}
+                                    aria-label={`Adjust skip end at ${formatSeconds(skip.sourceEndSec ?? skip.endSec)}`}
+                                    title="Adjust skip end"
+                                  >
+                                    <ChevronRight size={15} strokeWidth={2.2} aria-hidden="true" />
+                                  </button>
+                                ) : null}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <div className="timeline-clip-body">
+                        <button
+                          className={editing ? 'timeline-clip-edit-button active' : 'timeline-clip-edit-button'}
+                          type="button"
+                          onPointerDown={(event) => {
+                            event.stopPropagation();
+                          }}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setSelectedClipId(clip.id);
+                            setClipEditId(clip.id);
+                          }}
+                          disabled={busy}
+                          title="Edit clip source range"
+                          aria-pressed={editing}
+                          aria-label="Edit clip source range"
+                        >
+                          <Pencil size={18} strokeWidth={1.9} aria-hidden="true" />
+                        </button>
+                        <div className="timeline-clip-body-text">
+                          <span>{assetLabelById.get(clip.assetId) ?? 'Clip'}</span>
+                          <small>
+                            {formatSeconds(displayTimelineStartSec)} - {formatSeconds(displayTimelineEndSec)}
+                            {' · source '}
+                            {formatSeconds(clip.sourceStartSec)}-{formatSeconds(clip.sourceEndSec)}
+                          </small>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 );
@@ -1315,14 +1463,6 @@ function buildTimelineItems(
   }
 
   return items.sort((a, b) => a.startSec - b.startSec || (a.kind === 'kept' ? -1 : 1));
-}
-
-function timelineItemStyle(item: { startSec: number; endSec: number }, pxPerSec: number): CSSProperties {
-  return {
-    left: `${item.startSec * pxPerSec}px`,
-    width: `${Math.max(MIN_SEGMENT_WIDTH_PX, (item.endSec - item.startSec) * pxPerSec)}px`,
-    minWidth: `${MIN_SEGMENT_WIDTH_PX}px`,
-  };
 }
 
 function buildRulerTicks(durationSec: number, pxPerSec: number): Array<{ timeSec: number; major: boolean }> {

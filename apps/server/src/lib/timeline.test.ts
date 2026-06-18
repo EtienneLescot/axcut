@@ -151,6 +151,57 @@ test('applyTimelineOperation updates a skip range without changing clip bounds',
   assert.deepEqual(updated.timeline.skipRanges.map((skip) => [skip.id, skip.startSec, skip.endSec]), [['skip_1', 1.5, 3]]);
 });
 
+test('applyTimelineOperation merges touching skip ranges in the timeline DSL', () => {
+  const first = applyTimelineOperation(createDocument(), {
+    type: 'add_skip_range',
+    assetId: 'asset_main',
+    startSec: 1,
+    endSec: 2,
+    reason: 'blank',
+  });
+
+  const second = applyTimelineOperation(first, {
+    type: 'add_skip_range',
+    assetId: 'asset_main',
+    startSec: 2,
+    endSec: 3,
+    reason: 'silence',
+  });
+
+  assert.deepEqual(second.timeline.skipRanges.map((skip) => [skip.id, skip.assetId, skip.startSec, skip.endSec, skip.reason]), [
+    ['skip_1', 'asset_main', 1, 3, 'blank; silence'],
+  ]);
+});
+
+test('applyTimelineOperation merges a resized skip into its neighbor', () => {
+  const first = applyTimelineOperation(createDocument(), {
+    type: 'add_skip_range',
+    assetId: 'asset_main',
+    startSec: 1,
+    endSec: 2,
+    reason: 'blank',
+  });
+  const second = applyTimelineOperation(first, {
+    type: 'add_skip_range',
+    assetId: 'asset_main',
+    startSec: 3,
+    endSec: 4,
+    reason: 'hesitation',
+  });
+
+  const updated = applyTimelineOperation(second, {
+    type: 'update_skip_range',
+    skipId: 'skip_1',
+    startSec: 1,
+    endSec: 3,
+    reason: 'extended blank',
+  });
+
+  assert.deepEqual(updated.timeline.skipRanges.map((skip) => [skip.id, skip.startSec, skip.endSec, skip.reason]), [
+    ['skip_1', 1, 4, 'extended blank; hesitation'],
+  ]);
+});
+
 test('applyTimelineOperation updates clip bounds and retimes the timeline', () => {
   const document = createDocument();
 

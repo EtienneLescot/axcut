@@ -334,13 +334,57 @@ export function ensureDocument(value: unknown): AxcutDocument {
   return documentSchema.parse(value);
 }
 
+const SKIP_MERGE_EPSILON_SEC = 0.001;
+
+function mergeReasons(left: string, right: string): string {
+  const parts = [left, right]
+    .map((reason) => reason.trim())
+    .filter(Boolean);
+  return Array.from(new Set(parts)).join('; ');
+}
+
+function mergeOrigins(left: AxcutSkipRange['origin'], right: AxcutSkipRange['origin']): AxcutSkipRange['origin'] {
+  const rank: Record<AxcutSkipRange['origin'], number> = {
+    system: 0,
+    agent: 1,
+    user: 2,
+  };
+  return rank[right] > rank[left] ? right : left;
+}
+
+export function normalizeSkipRanges(skipRanges: AxcutSkipRange[]): AxcutSkipRange[] {
+  const sorted = skipRanges
+    .filter((skip) => skip.endSec > skip.startSec)
+    .map((skip) => ({ ...skip }))
+    .sort((left, right) => (
+      left.assetId.localeCompare(right.assetId)
+      || left.startSec - right.startSec
+      || left.endSec - right.endSec
+      || left.id.localeCompare(right.id)
+    ));
+
+  const merged: AxcutSkipRange[] = [];
+  for (const skip of sorted) {
+    const previous = merged.at(-1);
+    if (!previous || previous.assetId !== skip.assetId || skip.startSec > previous.endSec + SKIP_MERGE_EPSILON_SEC) {
+      merged.push(skip);
+      continue;
+    }
+    previous.endSec = Math.max(previous.endSec, skip.endSec);
+    previous.reason = mergeReasons(previous.reason, skip.reason);
+    previous.origin = mergeOrigins(previous.origin, skip.origin);
+  }
+  return merged;
+}
+
 export function applySkipRangesToClips(clips: AxcutClip[], skipRanges: AxcutSkipRange[]): AxcutClip[] {
   let cursor = 0;
   let sequence = 1;
   const materialized: AxcutClip[] = [];
+  const normalizedSkipRanges = normalizeSkipRanges(skipRanges);
 
   for (const clip of [...clips].sort((a, b) => a.timelineStartSec - b.timelineStartSec)) {
-    const skips = skipRanges
+    const skips = normalizedSkipRanges
       .filter((skip) => skip.assetId === clip.assetId && skip.endSec > clip.sourceStartSec && skip.startSec < clip.sourceEndSec)
       .sort((a, b) => a.startSec - b.startSec);
     let segments = [{ startSec: clip.sourceStartSec, endSec: clip.sourceEndSec }];

@@ -104,6 +104,28 @@ test('applyOptimisticTimelineOperation adds transcript skips without removing so
   assert.deepEqual(next.timeline.skipRanges.map((skip) => [skip.assetId, skip.startSec, skip.endSec]), [['asset_a', 0.3, 0.6]]);
 });
 
+test('applyOptimisticTimelineOperation merges touching skips immediately', () => {
+  const first = applyOptimisticTimelineOperation(createDocument(), {
+    type: 'add_skip_range',
+    assetId: 'asset_a',
+    startSec: 0.3,
+    endSec: 0.6,
+    reason: 'Skip hesitation.',
+  });
+
+  const second = applyOptimisticTimelineOperation(first, {
+    type: 'add_skip_range',
+    assetId: 'asset_a',
+    startSec: 0.6,
+    endSec: 0.9,
+    reason: 'Skip silence.',
+  });
+
+  assert.deepEqual(second.timeline.skipRanges.map((skip) => [skip.id, skip.assetId, skip.startSec, skip.endSec, skip.reason]), [
+    ['skip_1', 'asset_a', 0.3, 0.9, 'Skip hesitation.; Skip silence.'],
+  ]);
+});
+
 test('applyOptimisticTimelineOperation can split a clip and insert another source', () => {
   const next = applyOptimisticTimelineOperation(createDocument(), {
     type: 'insert_asset_clip',
