@@ -1527,31 +1527,21 @@ export function App() {
     if (!displayDocument || playbackClips.length === 0) {
       return 0;
     }
-    const position = locateVirtualPosition(playbackClips, virtualTimeSec);
-    if (!position) {
-      return 0;
-    }
-    return sourceToVirtualTime(
-      displayDocument.timeline.clips,
-      position.sourceTimeSec,
-      position.clip.assetId,
-      structuralClipId(position.clip.id),
-    );
-  }, [displayDocument, playbackClips, virtualTimeSec]);
+    return virtualTimeSec;
+  }, [displayDocument, playbackClips.length, virtualTimeSec]);
   const seekTimelineTime = useCallback((timelineTimeSec: number) => {
     if (!displayDocument) {
       setSeekTarget({ timeSec: 0, requestId: Date.now() });
       return;
     }
-    const position = locateVirtualPosition(displayDocument.timeline.clips, timelineTimeSec);
+    const position = locateVirtualPosition(playbackClips, timelineTimeSec);
     if (!position) {
       setVirtualTimeSec(0);
       setSeekTarget({ timeSec: 0, requestId: Date.now() });
       return;
     }
-    const nextVirtualTimeSec = sourceToVirtualTime(playbackClips, position.sourceTimeSec, position.clip.assetId, position.clip.id);
-    setVirtualTimeSec(nextVirtualTimeSec);
-    setSeekTarget({ timeSec: nextVirtualTimeSec, requestId: Date.now() });
+    setVirtualTimeSec(position.virtualTimeSec);
+    setSeekTarget({ timeSec: position.virtualTimeSec, requestId: Date.now() });
   }, [displayDocument, playbackClips]);
 
   return (
@@ -1946,6 +1936,7 @@ export function App() {
 
       <TimelinePane
         clips={displayDocument?.timeline.clips ?? []}
+        playbackClips={playbackClips}
         assets={displayDocument?.assets ?? []}
         videoSources={videoSources}
         previewRevision={displayDocument?.preview.revision ?? 0}
