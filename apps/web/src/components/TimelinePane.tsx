@@ -4,13 +4,13 @@ import { ChevronLeft, ChevronRight, Pencil, Scissors, Trash2, X } from 'lucide-r
 import { normalizeSkipRanges, type AxcutAsset, type AxcutClip, type AxcutTimeline } from '@axcut/schema';
 
 import { VirtualPreview } from './VirtualPreview.js';
+import { startGlobalPointerDrag } from '../lib/pointer-drag.js';
 import { formatSeconds, locateVirtualPosition, totalVirtualDuration } from '../lib/virtual-preview.js';
 
 type VideoSource = { assetId: string; src: string; label: string };
 
 type TimelinePaneProps = {
   clips: AxcutClip[];
-  playbackClips?: AxcutClip[];
   assets: AxcutAsset[];
   videoSources?: VideoSource[];
   previewRevision?: number;
@@ -116,7 +116,7 @@ const MIN_CUT_DURATION_SEC = 0.1;
 const MIN_SOURCE_DURATION_SEC = 0.001;
 const MAX_PX_PER_SEC = 280;
 const MIN_SEGMENT_WIDTH_PX = 1;
-const RULER_HEIGHT_PX = 28;
+const RULER_HEIGHT_PX = 24;
 const CLIP_REORDER_THRESHOLD_PX = 6;
 const SKIP_CONTROL_RESIZE_WIDTH_PX = 25;
 const SKIP_CONTROL_REMOVE_WIDTH_PX = 31;
@@ -135,7 +135,6 @@ function skipControlsHalfWidthPx(skip: Pick<TimelineSkipItem, 'canResizeStart' |
 
 export function TimelinePane({
   clips,
-  playbackClips,
   assets,
   videoSources = [],
   previewRevision = 0,
@@ -179,13 +178,12 @@ export function TimelinePane({
 
   const normalizedSkipRanges = useMemo(() => normalizeSkipRanges(skipRanges), [skipRanges]);
   const clipTimelineProjections = useMemo(
-    () => projectClipsToPlaybackTimeline(clips, normalizedSkipRanges, resizeState),
+    () => projectClipsToSourceTimeline(clips, normalizedSkipRanges, resizeState),
     [clips, normalizedSkipRanges, resizeState],
   );
   const clipTimelineById = clipTimelineProjections.byId;
-  const timelineClips = playbackClips ?? clips;
   const virtualDurationSec = clipTimelineProjections.durationSec;
-  const activePosition = locateVirtualPosition(timelineClips, currentTimeSec);
+  const activePosition = locateVirtualPosition(clips, currentTimeSec);
   const assetLabelById = useMemo(() => new Map(assets.map((asset) => [asset.id, asset.label])), [assets]);
   const assetDurationById = useMemo(() => new Map(assets.map((asset) => [asset.id, asset.durationSec ?? virtualDurationSec])), [assets, virtualDurationSec]);
   const sourceDuration = useMemo(
@@ -210,7 +208,7 @@ export function TimelinePane({
     [assetLabelById, clipTimelineProjections.items, resizeState, sourceDuration],
   );
   const rulerTicks = useMemo(() => buildRulerTicks(sourceDuration, pxPerSec), [pxPerSec, sourceDuration]);
-  const playheadSourceSec = timelineClips.length > 0 ? clamp(currentTimeSec, 0, sourceDuration) : null;
+  const playheadSourceSec = clips.length > 0 ? clamp(currentTimeSec, 0, sourceDuration) : null;
   const assetCount = useMemo(() => new Set(clips.map((clip) => clip.assetId)).size, [clips]);
   const orderedClips = useMemo(() => [...clips].sort((a, b) => a.timelineStartSec - b.timelineStartSec), [clips]);
   const clipEditClip = useMemo(
@@ -380,14 +378,14 @@ export function TimelinePane({
   }, [clipReorderState, clipTimelineById, clips, contentWidthPx, orderedClips, pxPerSec]);
 
   const seekSource = useCallback((virtualSec: number) => {
-    const position = locateVirtualPosition(timelineClips, virtualSec);
+    const position = locateVirtualPosition(clips, virtualSec);
     if (!position) {
       onSeek(0);
       return;
     }
     onPreviewSource(position.sourceTimeSec, position.clip.assetId);
     onSeek(position.virtualTimeSec);
-  }, [onPreviewSource, onSeek, timelineClips]);
+  }, [clips, onPreviewSource, onSeek]);
 
   const seekClientX = useCallback((clientX: number) => {
     const virtualSec = sourceSecFromClientX(clientX);
@@ -550,9 +548,6 @@ export function TimelinePane({
     };
     const end = () => {
       const current = resizeRef.current;
-      globalThis.window.removeEventListener('pointermove', move);
-      globalThis.window.removeEventListener('pointerup', end);
-      globalThis.window.removeEventListener('pointercancel', end);
       if (!current || current.id !== id) {
         resizeRef.current = null;
         setResizeState((state) => (state?.id === id ? null : state));
@@ -578,9 +573,10 @@ export function TimelinePane({
       clearResizeState();
     };
 
-    globalThis.window.addEventListener('pointermove', move);
-    globalThis.window.addEventListener('pointerup', end, { once: true });
-    globalThis.window.addEventListener('pointercancel', end, { once: true });
+    startGlobalPointerDrag(event, {
+      onMove: move,
+      onEnd: end,
+    });
   }, [assetDurationById, busy, onPreviewSource, onUpdateSkipRange, pxPerSec, sourceDuration]);
 
   const startClipReorder = useCallback((item: { clipId: string }, event: ReactPointerEvent<HTMLElement>) => {
@@ -644,14 +640,12 @@ export function TimelinePane({
       clipReorderRef.current = null;
       setClipReorderState(null);
       globalThis.document.body.classList.remove('timeline-reordering');
-      globalThis.window.removeEventListener('pointermove', move);
-      globalThis.window.removeEventListener('pointerup', end);
-      globalThis.window.removeEventListener('pointercancel', end);
     };
 
-    globalThis.window.addEventListener('pointermove', move);
-    globalThis.window.addEventListener('pointerup', end, { once: true });
-    globalThis.window.addEventListener('pointercancel', end, { once: true });
+    startGlobalPointerDrag(event, {
+      onMove: move,
+      onEnd: end,
+    });
   }, [busy, insertionIndexFromClipCenter, isReorderNoop, onMoveClip, orderedClips, pendingCutPlacement, pxPerSec]);
 
   const startScrub = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
@@ -673,14 +667,12 @@ export function TimelinePane({
     const end = () => {
       setScrubbing(false);
       globalThis.document.body.classList.remove('timeline-scrubbing');
-      globalThis.window.removeEventListener('pointermove', move);
-      globalThis.window.removeEventListener('pointerup', end);
-      globalThis.window.removeEventListener('pointercancel', end);
     };
 
-    globalThis.window.addEventListener('pointermove', move);
-    globalThis.window.addEventListener('pointerup', end, { once: true });
-    globalThis.window.addEventListener('pointercancel', end, { once: true });
+    startGlobalPointerDrag(event, {
+      onMove: move,
+      onEnd: end,
+    });
   }, [clips.length, seekClientX]);
 
   const startPan = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
@@ -712,14 +704,12 @@ export function TimelinePane({
       panRef.current = null;
       setPanning(false);
       globalThis.document.body.classList.remove('timeline-panning');
-      globalThis.window.removeEventListener('pointermove', move);
-      globalThis.window.removeEventListener('pointerup', end);
-      globalThis.window.removeEventListener('pointercancel', end);
     };
 
-    globalThis.window.addEventListener('pointermove', move);
-    globalThis.window.addEventListener('pointerup', end, { once: true });
-    globalThis.window.addEventListener('pointercancel', end, { once: true });
+    startGlobalPointerDrag(event, {
+      onMove: move,
+      onEnd: end,
+    });
   }, [busy, pxPerSec, sourceDuration, visibleDurationSec, visibleStartSec]);
 
   const handleTimelinePointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
@@ -832,14 +822,12 @@ export function TimelinePane({
       navigatorDragRef.current = null;
       setNavigatorDragging(false);
       globalThis.document.body.classList.remove('timeline-navigating');
-      globalThis.window.removeEventListener('pointermove', move);
-      globalThis.window.removeEventListener('pointerup', end);
-      globalThis.window.removeEventListener('pointercancel', end);
     };
 
-    globalThis.window.addEventListener('pointermove', move);
-    globalThis.window.addEventListener('pointerup', end, { once: true });
-    globalThis.window.addEventListener('pointercancel', end, { once: true });
+    startGlobalPointerDrag(event, {
+      onMove: move,
+      onEnd: end,
+    });
   }, [busy, clips.length, setVisibleWindow, sourceDuration, viewportWidthPx, visibleEndSec, visibleStartSec]);
 
   return (
@@ -1263,14 +1251,12 @@ function ClipEditDialog({
     const end = () => {
       dragRef.current = null;
       setActiveEdge(null);
-      globalThis.window.removeEventListener('pointermove', move);
-      globalThis.window.removeEventListener('pointerup', end);
-      globalThis.window.removeEventListener('pointercancel', end);
     };
 
-    globalThis.window.addEventListener('pointermove', move);
-    globalThis.window.addEventListener('pointerup', end, { once: true });
-    globalThis.window.addEventListener('pointercancel', end, { once: true });
+    startGlobalPointerDrag(event, {
+      onMove: move,
+      onEnd: end,
+    });
   }, [busy, draftEndSec, draftStartSec, sourceDurationSec]);
 
   const applyChanges = useCallback(() => {
@@ -1415,8 +1401,8 @@ function buildTimelineItems(
       if (sourceEndSec <= sourceStartSec) {
         return;
       }
-      const startSec = clamp(projection.timelineStartSec + sourceToProjectedClipOffset(clip, visibleSkips, sourceStartSec), 0, durationSec);
-      const endSec = clamp(projection.timelineStartSec + sourceToProjectedClipOffset(clip, visibleSkips, sourceEndSec), 0, durationSec);
+      const startSec = clamp(sourceToClipTimelineSec(projection, sourceStartSec), 0, durationSec);
+      const endSec = clamp(sourceToClipTimelineSec(projection, sourceEndSec), 0, durationSec);
       if (endSec <= startSec) {
         return;
       }
@@ -1440,8 +1426,8 @@ function buildTimelineItems(
       const sourceStartSec = Math.max(clip.sourceStartSec, skip.startSec, cursorSourceSec);
       const sourceEndSec = Math.min(clip.sourceEndSec, skip.endSec);
       pushKept(cursorSourceSec, sourceStartSec);
-      const startSec = clamp(projection.timelineStartSec + sourceToProjectedClipOffset(clip, visibleSkips, sourceStartSec), 0, durationSec);
-      const endSec = clamp(startSec + Math.max(MIN_CUT_DURATION_SEC, sourceEndSec - sourceStartSec), 0, durationSec);
+      const startSec = clamp(sourceToClipTimelineSec(projection, sourceStartSec), 0, durationSec);
+      const endSec = clamp(sourceToClipTimelineSec(projection, sourceEndSec), 0, durationSec);
       if (endSec > startSec) {
         items.push({
           kind: 'skip',
@@ -1468,14 +1454,14 @@ function buildTimelineItems(
   return items.sort((a, b) => a.startSec - b.startSec || (a.kind === 'kept' ? -1 : 1));
 }
 
-function projectClipsToPlaybackTimeline(
+function projectClipsToSourceTimeline(
   clips: AxcutClip[],
   skipRanges: AxcutTimeline['skipRanges'],
   resizeState: ResizeState | null,
 ): { items: ClipTimelineProjection[]; byId: Map<string, ClipTimelineProjection>; durationSec: number } {
   const items: ClipTimelineProjection[] = [];
   const byId = new Map<string, ClipTimelineProjection>();
-  let cursorSec = 0;
+  let durationSec = 0;
 
   const visibleClips = [...clips]
     .sort((a, b) => a.timelineStartSec - b.timelineStartSec)
@@ -1498,50 +1484,35 @@ function projectClipsToPlaybackTimeline(
         : skip)
       .filter((skip) => skip.endSec > clip.sourceStartSec && skip.startSec < clip.sourceEndSec)
       .sort((a, b) => a.startSec - b.startSec || a.endSec - b.endSec);
-    const durationSec = Math.max(0, sourceToProjectedClipOffset(clip, visibleSkips, clip.sourceEndSec));
+    const clipDurationSec = Math.max(0, clip.sourceEndSec - clip.sourceStartSec);
+    const timelineStartSec = clip.timelineStartSec;
     const projection = {
       clip,
       visibleSkips,
-      timelineStartSec: cursorSec,
-      timelineEndSec: cursorSec + durationSec,
-      durationSec,
+      timelineStartSec,
+      timelineEndSec: timelineStartSec + clipDurationSec,
+      durationSec: clipDurationSec,
     };
     items.push(projection);
     byId.set(clip.id, projection);
-    cursorSec += durationSec;
+    durationSec = Math.max(durationSec, projection.timelineEndSec);
   }
 
-  return { items, byId, durationSec: cursorSec };
+  return { items, byId, durationSec };
 }
 
-function sourceToProjectedClipOffset(
-  clip: AxcutClip,
-  visibleSkips: AxcutTimeline['skipRanges'],
+function sourceToClipTimelineSec(
+  projection: ClipTimelineProjection,
   sourceSec: number,
 ): number {
+  const { clip } = projection;
   const boundedSourceSec = clamp(sourceSec, clip.sourceStartSec, clip.sourceEndSec);
-  let outputOffsetSec = 0;
-  let cursorSourceSec = clip.sourceStartSec;
-
-  for (const skip of visibleSkips) {
-    const skipStartSec = clamp(skip.startSec, clip.sourceStartSec, clip.sourceEndSec);
-    const skipEndSec = clamp(skip.endSec, clip.sourceStartSec, clip.sourceEndSec);
-    if (boundedSourceSec <= skipStartSec) {
-      return outputOffsetSec + Math.max(0, boundedSourceSec - cursorSourceSec);
-    }
-    outputOffsetSec += Math.max(0, skipStartSec - cursorSourceSec);
-    cursorSourceSec = Math.max(cursorSourceSec, skipEndSec);
-    if (boundedSourceSec <= cursorSourceSec) {
-      return outputOffsetSec;
-    }
-  }
-
-  return outputOffsetSec + Math.max(0, boundedSourceSec - cursorSourceSec);
+  return projection.timelineStartSec + Math.max(0, boundedSourceSec - clip.sourceStartSec);
 }
 
 function buildRulerTicks(durationSec: number, pxPerSec: number): Array<{ timeSec: number; major: boolean }> {
   const majorStepSec = chooseTickStep(90 / Math.max(pxPerSec, 0.001));
-  const minorStepSec = majorStepSec / 5;
+  const minorStepSec = majorStepSec / 4;
   const ticks: Array<{ timeSec: number; major: boolean }> = [];
   for (let timeSec = 0; timeSec <= durationSec + minorStepSec / 2; timeSec += minorStepSec) {
     const rounded = Number(timeSec.toFixed(4));
