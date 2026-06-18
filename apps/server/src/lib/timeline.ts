@@ -1,4 +1,4 @@
-import type { AxcutClip, AxcutDocument, AxcutOperation, AxcutTimelineOperation, AxcutTranscript } from '@axcut/schema';
+import { normalizeSkipRanges, type AxcutClip, type AxcutDocument, type AxcutOperation, type AxcutTimelineOperation, type AxcutTranscript } from '@axcut/schema';
 
 function byStart(a: { startSec: number }, b: { startSec: number }): number {
   return a.startSec - b.startSec;
@@ -222,7 +222,7 @@ function addSkipRange(
   if (endSec <= startSec) {
     return document.timeline.skipRanges;
   }
-  return [
+  return normalizeSkipRanges([
     ...document.timeline.skipRanges,
     {
       id: `skip_${document.timeline.skipRanges.length + 1}`,
@@ -232,14 +232,14 @@ function addSkipRange(
       reason: input.reason,
       origin,
     },
-  ];
+  ]);
 }
 
 function updateSkipRange(
   document: AxcutDocument,
   input: { skipId: string; startSec: number; endSec: number; reason: string },
 ): AxcutDocument['timeline']['skipRanges'] {
-  return document.timeline.skipRanges.map((skip) => {
+  return normalizeSkipRanges(document.timeline.skipRanges.map((skip) => {
     if (skip.id !== input.skipId) {
       return skip;
     }
@@ -253,7 +253,7 @@ function updateSkipRange(
       endSec,
       reason: input.reason || skip.reason,
     };
-  }).filter((skip) => skip.endSec > skip.startSec);
+  }).filter((skip) => skip.endSec > skip.startSec));
 }
 
 function updateClipRange(
@@ -436,7 +436,7 @@ export function applyTimelineOperation(
       nextClips = retimeClips(nextClips, documentTranscripts(document));
       break;
     case 'remove_skip_range':
-      nextSkipRanges = document.timeline.skipRanges.filter((skip) => skip.id !== operation.skipId);
+      nextSkipRanges = normalizeSkipRanges(document.timeline.skipRanges.filter((skip) => skip.id !== operation.skipId));
       nextClips = retimeClips(nextClips, documentTranscripts(document));
       break;
     case 'update_clip_range':
@@ -467,7 +467,7 @@ export function applyTimelineOperation(
     timeline: {
       ...document.timeline,
       clips: nextClips,
-      skipRanges: nextSkipRanges,
+      skipRanges: normalizeSkipRanges(nextSkipRanges),
       gaps: [],
     },
     preview: {

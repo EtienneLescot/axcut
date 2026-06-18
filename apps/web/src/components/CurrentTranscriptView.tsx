@@ -1,6 +1,6 @@
 import { useCallback, useLayoutEffect, useMemo, useRef } from 'react';
 import type { ClipboardEvent as ReactClipboardEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from 'react';
-import type { AxcutAsset, AxcutClip, AxcutDocument, AxcutTranscript, AxcutWord } from '@axcut/schema';
+import { normalizeSkipRanges, type AxcutAsset, type AxcutClip, type AxcutDocument, type AxcutTranscript, type AxcutWord } from '@axcut/schema';
 import { Trash2 } from 'lucide-react';
 
 import { formatSeconds, selectWordRange } from '../lib/virtual-preview.js';
@@ -312,6 +312,7 @@ function buildClipTranscriptProjections(document: AxcutDocument | null): Transcr
     return [];
   }
   const clips = [...document.timeline.clips].sort((a, b) => a.timelineStartSec - b.timelineStartSec);
+  const normalizedSkipRanges = normalizeSkipRanges(document.timeline.skipRanges);
   return clips.map((clip) => {
     const transcript = document.transcripts.find((item) => item.assetId === clip.assetId)
       ?? (document.transcript?.assetId === clip.assetId ? document.transcript : null);
@@ -325,7 +326,7 @@ function buildClipTranscriptProjections(document: AxcutDocument | null): Transcr
         keptWordIds: new Set<string>(),
       };
     }
-    const clipSkips = document.timeline.skipRanges.filter((skip) => (
+    const clipSkips = normalizedSkipRanges.filter((skip) => (
       skip.assetId === clip.assetId
       && skip.endSec > clip.sourceStartSec
       && skip.startSec < clip.sourceEndSec
