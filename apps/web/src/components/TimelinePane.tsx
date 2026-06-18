@@ -117,6 +117,8 @@ const MIN_SOURCE_DURATION_SEC = 0.001;
 const MAX_PX_PER_SEC = 280;
 const MIN_SEGMENT_WIDTH_PX = 1;
 const RULER_HEIGHT_PX = 24;
+const TIMELINE_START_GUTTER_PX = 6;
+const TIMELINE_END_GUTTER_PX = 6;
 const CLIP_REORDER_THRESHOLD_PX = 6;
 const SKIP_CONTROL_RESIZE_WIDTH_PX = 25;
 const SKIP_CONTROL_REMOVE_WIDTH_PX = 31;
@@ -190,12 +192,13 @@ export function TimelinePane({
     () => Math.max(virtualDurationSec, MIN_SOURCE_DURATION_SEC),
     [virtualDurationSec],
   );
+  const timelineUsableWidthPx = Math.max(1, viewportWidthPx - TIMELINE_START_GUTTER_PX - TIMELINE_END_GUTTER_PX);
   const fitPxPerSec = useMemo(() => (
-    Math.max(0.001, viewportWidthPx / Math.max(sourceDuration, MIN_SOURCE_DURATION_SEC))
-  ), [sourceDuration, viewportWidthPx]);
+    Math.max(0.001, timelineUsableWidthPx / Math.max(sourceDuration, MIN_SOURCE_DURATION_SEC))
+  ), [sourceDuration, timelineUsableWidthPx]);
   const pxPerSec = clamp(fitPxPerSec * zoom, fitPxPerSec, MAX_PX_PER_SEC);
-  const contentWidthPx = Math.max(viewportWidthPx, sourceDuration * pxPerSec);
-  const visibleDurationSec = clamp(viewportWidthPx / Math.max(pxPerSec, 0.001), 0, sourceDuration);
+  const contentWidthPx = Math.max(viewportWidthPx, (sourceDuration * pxPerSec) + TIMELINE_START_GUTTER_PX + TIMELINE_END_GUTTER_PX);
+  const visibleDurationSec = clamp(timelineUsableWidthPx / Math.max(pxPerSec, 0.001), 0, sourceDuration);
   const visibleEndSec = clamp(visibleStartSec + visibleDurationSec, 0, sourceDuration);
   const canvasOffsetPx = visibleStartSec * pxPerSec;
   const navigatorWindowStyle = useMemo(() => ({
@@ -281,11 +284,11 @@ export function TimelinePane({
       return null;
     }
     const rect = scrollElement.getBoundingClientRect();
-    return clamp(visibleStartSec + ((clientX - rect.left) / Math.max(pxPerSec, 0.001)), 0, sourceDuration);
+    return clamp(visibleStartSec + ((clientX - rect.left - TIMELINE_START_GUTTER_PX) / Math.max(pxPerSec, 0.001)), 0, sourceDuration);
   }, [pxPerSec, sourceDuration, visibleStartSec]);
 
   const insertionIndexFromClipCenter = useCallback((clipId: string, clipCenterPx: number) => {
-    const timelineSec = clamp(clipCenterPx / Math.max(pxPerSec, 0.001), 0, sourceDuration);
+    const timelineSec = clamp((clipCenterPx - TIMELINE_START_GUTTER_PX) / Math.max(pxPerSec, 0.001), 0, sourceDuration);
     const remainingClips = orderedClips.filter((clip) => clip.id !== clipId);
     for (let index = 0; index < remainingClips.length; index += 1) {
       const clip = remainingClips[index];
@@ -322,7 +325,7 @@ export function TimelinePane({
       : clipReorderState.insertIndex >= remainingClips.length
         ? virtualDurationSec
         : remainingClips[clipReorderState.insertIndex].timelineStartSec;
-    return boundarySec * pxPerSec;
+    return TIMELINE_START_GUTTER_PX + (boundarySec * pxPerSec);
   }, [clipReorderState, orderedClips, pxPerSec, virtualDurationSec]);
 
   const projectedClipLayoutById = useMemo(() => {
@@ -335,7 +338,7 @@ export function TimelinePane({
         layout.set(clip.id, {
           timelineStartSec,
           timelineEndSec,
-          leftPx: timelineStartSec * pxPerSec,
+          leftPx: TIMELINE_START_GUTTER_PX + (timelineStartSec * pxPerSec),
           widthPx: Math.max(MIN_SEGMENT_WIDTH_PX, (timelineEndSec - timelineStartSec) * pxPerSec),
           dragging: false,
         });
@@ -361,13 +364,13 @@ export function TimelinePane({
       const widthPx = Math.max(MIN_SEGMENT_WIDTH_PX, durationSec * pxPerSec);
       const dragLeftPx = clamp(
         clipReorderState.startLeftPx + clipReorderState.currentClientX - clipReorderState.startClientX,
-        0,
-        Math.max(0, contentWidthPx - widthPx),
+        TIMELINE_START_GUTTER_PX,
+        Math.max(TIMELINE_START_GUTTER_PX, contentWidthPx - TIMELINE_END_GUTTER_PX - widthPx),
       );
       layout.set(clip.id, {
         timelineStartSec: cursorSec,
         timelineEndSec: cursorSec + durationSec,
-        leftPx: isDragging ? dragLeftPx : cursorSec * pxPerSec,
+        leftPx: isDragging ? dragLeftPx : TIMELINE_START_GUTTER_PX + (cursorSec * pxPerSec),
         widthPx,
         dragging: isDragging,
       });
@@ -406,27 +409,28 @@ export function TimelinePane({
     const anchorOffsetPx = anchorClientX === undefined
       ? rect.width / 2
       : clamp(anchorClientX - rect.left, 0, rect.width);
-    const sourceAtAnchor = visibleStartSec + (anchorOffsetPx / Math.max(pxPerSec, 0.001));
+    const timelineAnchorOffsetPx = clamp(anchorOffsetPx - TIMELINE_START_GUTTER_PX, 0, timelineUsableWidthPx);
+    const sourceAtAnchor = visibleStartSec + (timelineAnchorOffsetPx / Math.max(pxPerSec, 0.001));
     const nextPxPerSec = clamp(fitPxPerSec * boundedZoom, fitPxPerSec, MAX_PX_PER_SEC);
     setZoom(boundedZoom);
-    const nextVisibleDurationSec = clamp(viewportWidthPx / Math.max(nextPxPerSec, 0.001), 0, sourceDuration);
+    const nextVisibleDurationSec = clamp(timelineUsableWidthPx / Math.max(nextPxPerSec, 0.001), 0, sourceDuration);
     const maxVisibleStartSec = Math.max(0, sourceDuration - nextVisibleDurationSec);
-    setVisibleStartSec(clamp(sourceAtAnchor - (anchorOffsetPx / Math.max(nextPxPerSec, 0.001)), 0, maxVisibleStartSec));
-  }, [fitPxPerSec, pxPerSec, sourceDuration, viewportWidthPx, visibleStartSec]);
+    setVisibleStartSec(clamp(sourceAtAnchor - (timelineAnchorOffsetPx / Math.max(nextPxPerSec, 0.001)), 0, maxVisibleStartSec));
+  }, [fitPxPerSec, pxPerSec, sourceDuration, timelineUsableWidthPx, visibleStartSec]);
 
   const setVisibleWindow = useCallback((startSec: number, endSec: number) => {
     const scrollElement = scrollRef.current;
     if (!scrollElement || viewportWidthPx <= 0) {
       return;
     }
-    const minVisibleDurationSec = Math.min(sourceDuration, Math.max(MIN_CUT_DURATION_SEC, viewportWidthPx / MAX_PX_PER_SEC));
+    const minVisibleDurationSec = Math.min(sourceDuration, Math.max(MIN_CUT_DURATION_SEC, timelineUsableWidthPx / MAX_PX_PER_SEC));
     const visibleDuration = clamp(endSec - startSec, minVisibleDurationSec, sourceDuration);
     const visibleStart = clamp(startSec, 0, Math.max(0, sourceDuration - visibleDuration));
-    const nextPxPerSec = viewportWidthPx / Math.max(visibleDuration, MIN_SOURCE_DURATION_SEC);
+    const nextPxPerSec = timelineUsableWidthPx / Math.max(visibleDuration, MIN_SOURCE_DURATION_SEC);
     const nextZoom = clamp(nextPxPerSec / Math.max(fitPxPerSec, 0.001), 1, MAX_PX_PER_SEC / Math.max(fitPxPerSec, 0.001));
     setZoom(nextZoom);
     setVisibleStartSec(visibleStart);
-  }, [fitPxPerSec, sourceDuration, viewportWidthPx]);
+  }, [fitPxPerSec, sourceDuration, timelineUsableWidthPx, viewportWidthPx]);
 
   const addCut = useCallback((centerSec: number) => {
     if (busy || sourceDuration <= MIN_SOURCE_DURATION_SEC) {
@@ -592,7 +596,7 @@ export function TimelinePane({
     if (!movingClip) {
       return;
     }
-    const movingClipLeftPx = movingClip.timelineStartSec * pxPerSec;
+    const movingClipLeftPx = TIMELINE_START_GUTTER_PX + (movingClip.timelineStartSec * pxPerSec);
     const movingClipWidthPx = Math.max(MIN_SEGMENT_WIDTH_PX, (movingClip.timelineEndSec - movingClip.timelineStartSec) * pxPerSec);
     setSelectedClipId(item.clipId);
     const initialState: ClipReorderState = {
@@ -802,7 +806,7 @@ export function TimelinePane({
       }
       const deltaSec = ((moveEvent.clientX - current.startClientX) / current.overviewWidthPx) * sourceDuration;
       const currentDuration = current.startVisibleEndSec - current.startVisibleStartSec;
-      const minVisibleDurationSec = Math.min(sourceDuration, Math.max(MIN_CUT_DURATION_SEC, viewportWidthPx / MAX_PX_PER_SEC));
+      const minVisibleDurationSec = Math.min(sourceDuration, Math.max(MIN_CUT_DURATION_SEC, timelineUsableWidthPx / MAX_PX_PER_SEC));
       if (current.mode === 'move') {
         const nextStartSec = clamp(current.startVisibleStartSec + deltaSec, 0, Math.max(0, sourceDuration - currentDuration));
         setVisibleWindow(nextStartSec, nextStartSec + currentDuration);
@@ -828,7 +832,7 @@ export function TimelinePane({
       onMove: move,
       onEnd: end,
     });
-  }, [busy, clips.length, setVisibleWindow, sourceDuration, viewportWidthPx, visibleEndSec, visibleStartSec]);
+  }, [busy, clips.length, setVisibleWindow, sourceDuration, timelineUsableWidthPx, visibleEndSec, visibleStartSec]);
 
   return (
     <>
@@ -896,7 +900,7 @@ export function TimelinePane({
                 <div
                   key={`${tick.timeSec}-${tick.major ? 'major' : 'minor'}`}
                   className={tick.major ? 'timeline-tick major' : 'timeline-tick'}
-                  style={{ left: `${Math.min(tick.timeSec * pxPerSec, Math.max(0, contentWidthPx - 1))}px` }}
+                  style={{ left: `${Math.min(TIMELINE_START_GUTTER_PX + (tick.timeSec * pxPerSec), Math.max(0, contentWidthPx - 1))}px` }}
                 >
                   {tick.major ? <span>{formatSeconds(tick.timeSec)}</span> : null}
                 </div>
@@ -924,7 +928,7 @@ export function TimelinePane({
                   const candidateProjection = clipTimelineById.get(candidate.id);
                   const candidateStartSec = candidateProjection?.timelineStartSec ?? candidate.timelineStartSec;
                   const candidateEndSec = candidateProjection?.timelineEndSec ?? candidate.timelineEndSec;
-                  const candidateLeftPx = candidateLayout?.leftPx ?? candidateStartSec * pxPerSec;
+                  const candidateLeftPx = candidateLayout?.leftPx ?? TIMELINE_START_GUTTER_PX + (candidateStartSec * pxPerSec);
                   const candidateWidthPx = candidateLayout?.widthPx ?? Math.max(MIN_SEGMENT_WIDTH_PX, (candidateEndSec - candidateStartSec) * pxPerSec);
                   return Math.abs((candidateLeftPx + candidateWidthPx) - clipLeftPx) <= 1.5;
                 });
@@ -934,7 +938,7 @@ export function TimelinePane({
                   }
                   const candidateLayout = projectedClipLayoutById.get(candidate.id);
                   const candidateProjection = clipTimelineById.get(candidate.id);
-                  const candidateLeftPx = candidateLayout?.leftPx ?? (candidateProjection?.timelineStartSec ?? candidate.timelineStartSec) * pxPerSec;
+                  const candidateLeftPx = candidateLayout?.leftPx ?? TIMELINE_START_GUTTER_PX + ((candidateProjection?.timelineStartSec ?? candidate.timelineStartSec) * pxPerSec);
                   return Math.abs(candidateLeftPx - clipRightPx) <= 1.5;
                 });
                 const clipSkips = skipItems.filter((skip) => skip.clipId === clip.id);
@@ -974,7 +978,7 @@ export function TimelinePane({
                           const skipHitWidthPx = Math.max(3, skipActualWidthPx);
                           const skipCenterPx = ((skip.startSec + skip.endSec) / 2) * pxPerSec;
                           const controlsHalfWidthPx = skipControlsHalfWidthPx(skip);
-                          const skipScreenCenterPx = viewportLeftPx + skipCenterPx - canvasOffsetPx;
+                          const skipScreenCenterPx = viewportLeftPx + TIMELINE_START_GUTTER_PX + skipCenterPx - canvasOffsetPx;
                           const visibleLeftPx = SKIP_CONTROLS_VIEWPORT_MARGIN_PX;
                           const visibleRightPx = Math.max(visibleLeftPx, windowWidthPx - SKIP_CONTROLS_VIEWPORT_MARGIN_PX);
                           const controlsShiftPx = windowWidthPx <= 0 ? 0 : skipScreenCenterPx - controlsHalfWidthPx < visibleLeftPx
@@ -1092,10 +1096,10 @@ export function TimelinePane({
                 );
               })}
               {playheadSourceSec !== null ? (
-                <div className="timeline-playhead" style={{ left: `${playheadSourceSec * pxPerSec}px` }} aria-hidden="true" />
+                <div className="timeline-playhead" style={{ left: `${TIMELINE_START_GUTTER_PX + (playheadSourceSec * pxPerSec)}px` }} aria-hidden="true" />
               ) : null}
               {pendingCutPlacement && pendingCutPreviewSec !== null ? (
-                <div className="timeline-placement-marker" style={{ left: `${pendingCutPreviewSec * pxPerSec}px` }} aria-hidden="true" />
+                <div className="timeline-placement-marker" style={{ left: `${TIMELINE_START_GUTTER_PX + (pendingCutPreviewSec * pxPerSec)}px` }} aria-hidden="true" />
               ) : null}
               {clipReorderState?.dragging && reorderMarkerLeftPx !== null ? (
                 <div className="timeline-reorder-marker" style={{ left: `${reorderMarkerLeftPx}px` }} aria-hidden="true" />
